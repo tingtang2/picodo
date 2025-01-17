@@ -8,9 +8,10 @@
 
 # Training
 
-Picodo requires a pretokenized dataset for training following the same format as [nanoGPT](https://github.com/karpathy/nanoGPT/tree/master/data/openwebtext). This speeds up training and simplifies the codebase. I prepared a pretokenized sample of 2.5B tokens from fineweb-edu here [fineweb_edu_gpt2_train](https://pub-e8bbdcbe8f6243b2a9933704a9b1d8bc.r2.dev/datasets/fineweb_edu_gpt2_train.bin), [fineweb_edu_gpt2_val](https://pub-e8bbdcbe8f6243b2a9933704a9b1d8bc.r2.dev/datasets/fineweb_edu_gpt2_val.bin)
+Picodo requires a pretokenized dataset for training following the same format as [nanoGPT](https://github.com/karpathy/nanoGPT/tree/master/data/openwebtext). This speeds up training and simplifies the codebase. I prepared a pretokenized sample of 2.5B tokens from fineweb-edu here: [train.bin](https://pub-e8bbdcbe8f6243b2a9933704a9b1d8bc.r2.dev/datasets/fineweb_edu_gpt2_train.bin), [valid.bin](https://pub-e8bbdcbe8f6243b2a9933704a9b1d8bc.r2.dev/datasets/fineweb_edu_gpt2_val.bin).
 
 The simplest way to use this codebase is using the provided [Colab notebook](https://colab.research.google.com/github/martin-marek/picodo/blob/main/train_colab.ipynb), which automatically installs requirements, downloads the dataset, and starts training a model.
+
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/martin-marek/picodo/blob/main/train_colab.ipynb)
 
 To run this codebase using bash, simply set the [config name](configs) and any overrides:
