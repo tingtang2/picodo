@@ -3,6 +3,7 @@
 - Picodo has <200 SLOC
 - can run on GPUs, TPUs, Google Colab, or even locally on a Mac
 - achieves 64% MFU on TPU v2-8 when training GPT2-small (124M)
+- supports Fully Sharded Data Parallel (FSDP) parallelism
 - uses the [new Flax NNX Api](https://flax.readthedocs.io/en/v0.8.3/experimental/nnx/nnx_basics.html)
 - uses [Hydra](https://github.com/facebookresearch/hydra) for experiment management
 - uses [Weights & Biases](https://github.com/facebookresearch/hydra) for experiment tracking
