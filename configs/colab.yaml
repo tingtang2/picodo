@@ -2,5 +2,5 @@ defaults:
   - default
   - _self_
 
-ds_path_train: '/content/fineweb_edu_gpt2_2.5B/train.bin'
-ds_path_valid: '/content/fineweb_edu_gpt2_2.5B/val.bin'
+ds_path_train: '/content/fineweb_edu_gpt2_train.bin'
+ds_path_valid: '/content/fineweb_edu_gpt2_val.bin'
