@@ -38,7 +38,7 @@ def train_and_evaluate(c: DictConfig):
   # optimizer
   lr_schedule = optax.schedules.warmup_cosine_decay_schedule(c.opt.init_lr, c.opt.peak_lr, c.opt.warmup_steps, num_train_steps)
   lr_schedule_cpu = jax.jit(lr_schedule, backend='cpu') # for logging only
-  tx = optax.adamw(lr_schedule, weight_decay=c.opt.weight_decay)
+  tx = optax.adamw(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
   state = nnx.Optimizer(model, tx)
 
   # start wandb

@@ -9,7 +9,7 @@ num_tokens_valid: 1_024
 eval_every_steps: 10
 ds_path_train: '/Users/martin/datasets/fineweb_edu_gpt2_2.5B/train.bin'
 ds_path_valid: '/Users/martin/datasets/fineweb_edu_gpt2_2.5B/val.bin'
-# wandb_mode: 'offline'
+wandb_mode: 'offline'
 
 model:
   D: 32
