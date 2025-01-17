@@ -16,7 +16,7 @@ Picodo requires a pretokenized dataset for training following the same format as
 
 The simplest way to use this codebase is by using the provided [Colab notebook](https://colab.research.google.com/github/martin-marek/picodo/blob/main/train_colab.ipynb), which automatically installs requirements, downloads the dataset, and starts training a model.
 
-To run this codebase using bash, simply set the [config name](configs) and any overrides:
+To train a model using bash, simply set the [config name](configs) and any overrides:
 ```bash
 python main.py -cn colab opt.peak_lr=0.004
 ```
