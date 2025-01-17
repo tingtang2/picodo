@@ -1,0 +1,31 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+seed: 0
+batch_size_train: 64
+batch_size_valid: 128
+num_tokens_train: null
+num_tokens_valid: null
+eval_every_steps: 100
+ds_path_train: null
+ds_path_valid: null
+wandb_project: 'picodo'
+wandb_mode: 'online'
+
+model: # GPT2-small (124M params)
+  D: 768  # model/embed dim  = qkv dim
+  H: 12  # num attention heads
+  L: 768  # max context/sequence length
+  N: 12  # number of transformer block layers
+  V: 50257  # vocab size -> must match dataset tokenizer!
+  F: 3072  # FF inner dimension
+  fsdp_enabled: true
+  dtype: 'bfloat16'
+
+opt:
+  init_lr: 0.0001
+  peak_lr: 0.002
+  warmup_steps: 1000
+  weight_decay: 0.1
