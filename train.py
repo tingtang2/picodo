@@ -12,6 +12,30 @@ from jax.sharding import PartitionSpec as P
 from omegaconf.dictconfig import DictConfig
 
 
+@nnx.jit
+def loss_fn(model, batch):
+  x, y, weights = data.get_in_out(batch)
+  logits = model(x)
+  losses = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+  mean_loss = jnp.sum(losses * weights) / weights.sum()
+  return mean_loss
+
+
+@nnx.jit
+def train_step(optimizer, batch):
+  loss, grads = nnx.value_and_grad(loss_fn)(optimizer.model, batch)
+  optimizer.update(grads) # in-place update
+  return {'train_loss': loss}
+
+
+def eval_step(model, dataset):
+  loss = 0
+  for batch in dataset:
+    loss += loss_fn(model, batch)
+  mean_loss = loss / len(dataset)
+  return {'eval_loss': mean_loss}
+
+
 def train_and_evaluate(c: DictConfig):
 
   # datastes
@@ -32,45 +56,18 @@ def train_and_evaluate(c: DictConfig):
   mesh = Mesh(mesh_utils.create_device_mesh((jax.device_count(),)), ('data',))
   model = model_lib.create_sharded_model(c.model, mesh, c.seed)
   data_sharding = NamedSharding(mesh, P('data')) # data parallelism
-  n_params = utils.get_num_model_params(model)
-  print(f'{n_params=:_}')
+  ds_valid = jnp.stack([get_batch_valid(i) for i in range(num_valid_steps)])
+  with mesh: ds_valid = jax.device_put(ds_valid, NamedSharding(mesh, P(None, 'data')))
 
   # optimizer
   lr_schedule = optax.schedules.warmup_cosine_decay_schedule(c.opt.init_lr, c.opt.peak_lr, c.opt.warmup_steps, num_train_steps)
   lr_schedule_cpu = jax.jit(lr_schedule, backend='cpu') # for logging only
   tx = optax.adamw(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
-  state = nnx.Optimizer(model, tx)
+  optimizer = nnx.Optimizer(model, tx)
 
   # start wandb
   if c.wandb_project is not None:
     wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode)
-
-  # loss function
-  @nnx.jit
-  def loss_fn(model, batch):
-    x, y, weights = data.get_in_out(batch)
-    logits = model(x)
-    losses = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
-    mean_loss = jnp.sum(losses * weights) / weights.sum()
-    return mean_loss
-
-  # training step
-  @nnx.jit
-  def train_step(state, batch):
-    state.model.train()
-    loss, grads = nnx.value_and_grad(loss_fn)(state.model, batch)
-    state.update(grads) # in-place update
-    return {'train_loss': loss}
-
-  # eval step
-  def eval_model(state):
-    model.eval()
-    loss = 0
-    for step in range(num_valid_steps):
-      batch = jax.device_put(get_batch_valid(step), data_sharding)
-      loss += loss_fn(state.model, batch)
-    mean_loss = loss / num_valid_steps
-    return {'eval_loss': mean_loss}
 
   # training loop
   # note: metrics for each steps are processed only after asynchronously dispatching the next step
@@ -82,7 +79,7 @@ def train_and_evaluate(c: DictConfig):
 
       # training step
       batch = jax.device_put(get_batch_train(step), data_sharding)
-      train_metrics = train_step(state, batch)
+      train_metrics = train_step(optimizer, batch)
 
       # async logging
       if pending_train_metrics is not None:
@@ -96,7 +93,7 @@ def train_and_evaluate(c: DictConfig):
 
       # eval step
       if ((step+1) % c.eval_every_steps == 0) or ((step+1) == num_train_steps):
-        pending_eval_metrics = eval_model(state)
+        pending_eval_metrics = eval_step(optimizer.model, ds_valid)
 
     wandb.log(pending_train_metrics, step)
     wandb.log(pending_eval_metrics, step)
