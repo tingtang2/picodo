@@ -5,8 +5,8 @@ defaults:
 batch_size_train: 8
 batch_size_valid: 8
 num_tokens_train: 100_000
-num_tokens_valid: 1_024
-eval_every_steps: 10
+num_tokens_valid: 2_048
+eval_every_steps: 20
 ds_path_train: '/Users/martin/datasets/fineweb_edu_gpt2_2.5B/train.bin'
 ds_path_valid: '/Users/martin/datasets/fineweb_edu_gpt2_2.5B/val.bin'
 wandb_mode: 'offline'
