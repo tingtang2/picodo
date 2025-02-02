@@ -56,8 +56,7 @@ def train_and_evaluate(c: DictConfig):
   mesh = Mesh(mesh_utils.create_device_mesh((jax.device_count(),)), ('data',))
   model = model_lib.create_sharded_model(c.model, mesh, c.seed)
   data_sharding = NamedSharding(mesh, P('data')) # data parallelism
-  ds_valid = jnp.stack([get_batch_valid(i) for i in range(num_valid_steps)])
-  with mesh: ds_valid = jax.device_put(ds_valid, NamedSharding(mesh, P(None, 'data')))
+  with mesh: ds_valid = jnp.stack([jax.device_put(get_batch_valid(i), data_sharding) for i in range(num_valid_steps)])
 
   # optimizer
   lr_schedule = optax.schedules.warmup_cosine_decay_schedule(c.opt.init_lr, c.opt.peak_lr, c.opt.warmup_steps, num_train_steps)
