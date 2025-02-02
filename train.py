@@ -84,17 +84,19 @@ def train_and_evaluate(c: DictConfig):
       batch = jax.device_put(get_batch_train(step), data_sharding)
       train_metrics = train_step(state, batch)
 
-      # eval step
-      if pending_eval_metrics is not None:
-        wandb.log(pending_eval_metrics, step)
-        pending_eval_metrics = None
-      if ((step+1) % c.eval_every_steps == 0) or ((step+1) == num_train_steps):
-        pending_eval_metrics = eval_model(state)
-
-      # log previous step's metrics
+      # async logging
       if pending_train_metrics is not None:
         pending_train_metrics |= dict(learning_rate=lr_schedule_cpu(step), train_tokens_seen=step*tokens_per_train_step)
         pbar.set_postfix_str(f'loss={pending_train_metrics["train_loss"]:.2f}')
-        wandb.log(pending_train_metrics, step)
+        wandb.log(pending_train_metrics, step-1)
       pending_train_metrics = train_metrics
+      if pending_eval_metrics is not None:
+        wandb.log(pending_eval_metrics, step-1)
+        pending_eval_metrics = None
+
+      # eval step
+      if ((step+1) % c.eval_every_steps == 0) or ((step+1) == num_train_steps):
+        pending_eval_metrics = eval_model(state)
+
+    wandb.log(pending_train_metrics, step)
     wandb.log(pending_eval_metrics, step)
