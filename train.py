@@ -25,7 +25,8 @@ def loss_fn(model, batch):
 def train_step(optimizer, batch):
   loss, grads = nnx.value_and_grad(loss_fn)(optimizer.model, batch)
   optimizer.update(grads) # in-place update
-  return {'train_loss': loss}
+  lr = optimizer.opt_state.hyperparams['learning_rate'].value
+  return {'train_loss': loss, 'learning_rate': lr}
 
 
 def eval_step(model, dataset):
@@ -60,8 +61,7 @@ def train_and_evaluate(c: DictConfig):
 
   # optimizer
   lr_schedule = optax.schedules.warmup_cosine_decay_schedule(c.opt.init_lr, c.opt.peak_lr, c.opt.warmup_steps, num_train_steps)
-  lr_schedule_cpu = jax.jit(lr_schedule, backend='cpu') # for logging only
-  tx = optax.adamw(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
+  tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
   optimizer = nnx.Optimizer(model, tx)
 
   # start wandb
@@ -79,10 +79,10 @@ def train_and_evaluate(c: DictConfig):
       # training step
       batch = jax.device_put(get_batch_train(step), data_sharding)
       train_metrics = train_step(optimizer, batch)
+      train_metrics |= {'train_tokens_seen': (step+1)*tokens_per_train_step}
 
       # async logging
       if pending_train_metrics is not None:
-        pending_train_metrics |= dict(learning_rate=lr_schedule_cpu(step), train_tokens_seen=step*tokens_per_train_step)
         pbar.set_postfix_str(f'loss={pending_train_metrics["train_loss"]:.2f}')
         wandb.log(pending_train_metrics, step-1)
       pending_train_metrics = train_metrics
