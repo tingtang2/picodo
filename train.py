@@ -4,6 +4,7 @@ import optax
 import wandb
 import data, utils
 import model as model_lib
+from functools import partial
 from flax import nnx
 from tqdm.auto import tqdm
 from jax.experimental import mesh_utils
@@ -20,20 +21,22 @@ def loss_fn(model, batch):
     return mean_loss
 
 
-@nnx.jit
-def train_step(optimizer, batch):
+@partial(jax.jit, static_argnames='opt_graphdef')
+def train_step(opt_graphdef, opt_state, batch):
+    optimizer = nnx.merge(opt_graphdef, opt_state)
     loss, grads = nnx.value_and_grad(loss_fn)(optimizer.model, batch)
-    optimizer.update(grads) # in-place update
+    optimizer.update(grads)
+    opt_state = nnx.state(optimizer)
     lr = optimizer.opt_state.hyperparams['learning_rate'].value
-    return {'train_loss': loss, 'learning_rate': lr}
+    metrics = {'train_loss': loss, 'learning_rate': lr}
+    return opt_state, metrics
 
 
-def eval_step(model, dataset):
-    loss = 0
-    for batch in dataset:
-        loss += loss_fn(model, batch)
-    mean_loss = loss / len(dataset)
-    return {'eval_loss': mean_loss}
+@partial(jax.jit, static_argnames='model_graphdef')
+def eval_step(model_graphdef, model_state, dataset):
+    model = nnx.merge(model_graphdef, model_state)
+    losses = jax.lax.map(partial(loss_fn, model), dataset)
+    return {'eval_loss': losses.mean()}
 
 
 def train_and_evaluate(c: DictConfig):
@@ -71,13 +74,15 @@ def train_and_evaluate(c: DictConfig):
     # note: metrics for each steps are processed only after asynchronously dispatching the next step
     pending_train_metrics = None
     pending_eval_metrics = None
-    pbar = tqdm(range(num_train_steps))
+    model_graphdef = nnx.graphdef(model)
+    opt_graphdef, opt_state = nnx.split(optimizer)
     with mesh:
+        pbar = tqdm(range(num_train_steps))
         for step in pbar:
 
             # training step
             batch = jax.device_put(get_batch_train(step), data_sharding)
-            train_metrics = train_step(optimizer, batch)
+            opt_state, train_metrics = train_step(opt_graphdef, opt_state, batch)
             train_metrics |= {'train_tokens_seen': (step+1)*tokens_per_train_step}
 
             # async logging
@@ -91,7 +96,7 @@ def train_and_evaluate(c: DictConfig):
 
             # eval step
             if ((step+1) % c.eval_every_steps == 0) or ((step+1) == num_train_steps):
-                pending_eval_metrics = eval_step(optimizer.model, ds_valid)
+                pending_eval_metrics = eval_step(model_graphdef, opt_state.model, ds_valid)
 
         wandb.log(pending_train_metrics, step)
         wandb.log(pending_eval_metrics, step)
