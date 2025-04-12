@@ -26,7 +26,7 @@ model: # GPT2-small (124M params)
 
 opt:
   peak_lr: 0.004
-  warmup_steps: 3000
+  warmup_frac: 0.05
   b1: 0.9
   b2: 0.98
   weight_decay: 0.1
