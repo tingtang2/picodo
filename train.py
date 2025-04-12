@@ -62,7 +62,7 @@ def train_and_evaluate(c: DictConfig):
     with mesh: ds_valid = jnp.stack([jax.device_put(get_batch_valid(i), data_sharding) for i in range(num_valid_steps)])
 
     # optimizer
-    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(c.opt.init_lr, c.opt.peak_lr, c.opt.warmup_steps, num_train_steps)
+    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, c.opt.warmup_steps, num_train_steps)
     tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
     optimizer = nnx.Optimizer(model, tx)
 
