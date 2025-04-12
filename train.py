@@ -12,7 +12,6 @@ from jax.sharding import PartitionSpec as P
 from omegaconf.dictconfig import DictConfig
 
 
-@nnx.jit
 def loss_fn(model, batch):
   x, y, weights = data.get_in_out(batch)
   logits = model(x)
