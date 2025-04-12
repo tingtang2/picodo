@@ -5,8 +5,8 @@ from omegaconf import DictConfig
 
 @hydra.main(version_base=None, config_path='configs', config_name='local')
 def main(c: DictConfig):
-  train.train_and_evaluate(c)
+    train.train_and_evaluate(c)
 
 
 if __name__ == '__main__':
-  main()
+    main()
