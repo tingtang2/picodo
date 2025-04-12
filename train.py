@@ -16,7 +16,7 @@ from omegaconf.dictconfig import DictConfig
 def loss_fn(model, batch):
     x, y, weights = data.get_in_out(batch)
     logits = model(x)
-    losses = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits, y)
     mean_loss = jnp.sum(losses * weights) / weights.sum()
     return mean_loss
 
