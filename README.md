@@ -2,8 +2,8 @@
 
 - Picodo has <200 SLOC
 - can run on GPUs, TPUs, Google Colab, or even locally on a Mac
-- achieves 64% MFU on TPU v2-8 when training GPT2-small (124M)
-- supports Fully Sharded Data Parallel (FSDP) parallelism
+- achieves 62% MFU on TPU v2-8 when training GPT2-small (124M) in bf16
+- supports FSDP (Fully Sharded Data Parallel) training
 - uses the [new Flax NNX Api](https://flax.readthedocs.io/en/v0.8.3/experimental/nnx/nnx_basics.html)
 - uses [Hydra](https://github.com/facebookresearch/hydra) for experiment management
 - uses [Weights & Biases](https://github.com/facebookresearch/hydra) for experiment tracking
@@ -26,7 +26,7 @@ You can also run `main.py` directly, which uses the `local.yaml` config by defau
 # Inspiration
 
 This repository was originally a fork of [deepmind/NanoDO](https://github.com/google-deepmind/nanodo) but it no longer shares any lines of code. Some notable changes:
-- NanoDO has ~1800 SLOC while Picodo only has ~200 SLOC
+- NanoDO has [~1800 SLOC](https://codetabs.com/count-loc/count-loc-online.html) while Picodo only has ~200 SLOC
 - Picodo doens't rely on [grain](https://github.com/google/grain) for data loading so it can run locally on a Mac
 - Picodo uses the [new Flax NNX Api](https://flax.readthedocs.io/en/v0.8.3/experimental/nnx/nnx_basics.html)
 - Picodo uses Hydra and Weights & Biases instead of Google's ConfigDict / Tensorboard
