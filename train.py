@@ -53,13 +53,15 @@ def train_and_evaluate(c: DictConfig):
     num_train_steps = c.num_tokens_train // tokens_per_train_step
     num_valid_steps = c.num_tokens_valid // tokens_per_valid_step
 
-    # model
+    # sharding
     # all devices are aligned across a single mesh axis called 'data'
     # we use FSDP to shard data, model, and optimzier parameters across this axis
     mesh = Mesh(mesh_utils.create_device_mesh((jax.device_count(),)), ('data',))
-    model = model_lib.create_sharded_model(c.model, mesh, c.seed)
     data_sharding = NamedSharding(mesh, P('data')) # data parallelism
     with mesh: ds_valid = jnp.stack([jax.device_put(get_batch_valid(i), data_sharding) for i in range(num_valid_steps)])
+
+    # model
+    model = model_lib.create_sharded_model(c.model, mesh, c.seed)
 
     # optimizer
     warmup_steps = int(c.opt.warmup_frac * num_train_steps)
