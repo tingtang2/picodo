@@ -24,7 +24,8 @@ model:
   V: null # vocab size -> must match dataset tokenizer!
   activ_dtype: 'float32'
   remat: false # gradient rematerialization (chekpointing)
-
+  use_flash_attn: true
+  
 opt:
   batch_size: 32
   microbatch_size: ${opt.batch_size}

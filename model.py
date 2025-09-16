@@ -6,6 +6,7 @@ from flax import nnx
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel, splash_attention_mask
 from omegaconf.dictconfig import DictConfig
 from rope import apply_rope
 
@@ -58,6 +59,11 @@ class MultiHeadAttention(nnx.Module):
         self.out_proj = nnx.Einsum('BTnh,nhD->BTD', (c.N, c.H, c.D),  kernel_init=out_proj_init, dtype=c.activ_dtype, rngs=rngs)
         self.query_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
         self.key_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
+        if c.use_flash_attn and jax.devices()[0].platform == 'tpu' and (c.H % 128 != 0):
+            warnings.warn('cannot use flash attention because `model.H` is not a multiple of 128.')
+        c.use_flash_attn &= jax.devices()[0].platform == 'tpu'
+        c.use_flash_attn &= (c.H % 128 == 0)
+        self.attention = partial(tpu_causal_flash_attention, mesh=mesh) if c.use_flash_attn else partial(jax.nn.dot_product_attention, is_causal=True)
 
     def __call__(self, x): # [B, T, D]
         B, T, D = x.shape
@@ -75,11 +81,53 @@ class MultiHeadAttention(nnx.Module):
         k = apply_rope(k, position[None])
 
         # attention
-        out = jax.nn.dot_product_attention(q, k, v, is_causal=True) # [B, T, N, H]
+        out = self.attention(q, k, v) # [B, T, N, H]
 
         # output projection followed by contraction back to original dims
         out = self.out_proj(out) # [B, T, D]
         return out
+
+
+def tpu_causal_flash_attention(q, k, v, mesh):
+    """
+    TPU Flash Attention.
+    https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/splash_attention/splash_attention_kernel.py
+    https://github.com/AI-Hypercomputer/maxtext/blob/9ea52118535e970096c164460dbbfa478d157066/MaxText/layers/attentions.py#L562
+    """
+    B, T, N, H = q.shape
+    assert H >= 128, 'TPU flash attention reqruies head dim. to be a multiple of 128'
+
+    # scale query
+    q /= jnp.sqrt(H)
+
+    # kernel block sizes
+    # https://github.com/AI-Hypercomputer/maxtext/blob/afcdf47f8b7c1e1864fa81012a873590c5408122/MaxText/configs/base.yml#L644
+    block_sizes = splash_attention_kernel.BlockSizes(
+        block_q=512,
+        block_kv=512,
+        block_kv_compute=128,
+        block_q_dkv=512,
+        block_kv_dkv=512,
+        block_kv_dkv_compute=128,
+        block_q_dq=512,
+        block_kv_dq=512,
+    )
+
+    sharding = P('data', None, 'model', None)
+    @partial(shard_map, mesh=mesh, in_specs=(sharding, sharding, sharding), out_specs=sharding, check_rep=False)
+    def attention(q, k, v):
+        _, _, n, _ = q.shape
+        causal_mask = splash_attention_mask.CausalMask(shape=(T, T))
+        multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(causal_mask,) * n)
+        splash_kernel = splash_attention_kernel.make_splash_mha(mask=multi_head_mask, head_shards=1, q_seq_shards=1, block_sizes=block_sizes)
+        out = jax.vmap(splash_kernel)(
+            q.swapaxes(1, 2),
+            k.swapaxes(1, 2),
+            v.swapaxes(1, 2)
+        ).swapaxes(1, 2) # [B, T, N, H]
+        return out
+
+    return attention(q, k, v)
 
 
 class MLP(nnx.Module):
