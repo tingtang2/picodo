@@ -5,3 +5,4 @@ outputs
 wandb
 private
 deprecated
+debug.py
