@@ -1,35 +1,45 @@
+import os
 import jax
 import numpy as np
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding
 
 
-def make_ds_loader(ds_path, seq_len, batch_size):
-    """note: we assume that the dataset on the disk is already shuffled!"""
+def load_ds(key, mesh, ds_path, seq_len, batch_size, n_tokens_valid, n_tokens_train=None):
 
-    # get num. tokens
+    # get dataset size
+    print('getting dataset size...')
+    ds_path = os.path.expanduser(ds_path)
     data = np.memmap(ds_path, dtype=np.uint16, mode='r')
-    n_tokens = len(data)
+    n_tokens_dataset = len(data)
+    n_seq_dataset = n_tokens_dataset // seq_len
 
-    def get_batch(idx):
+    # if n_tokens_train is None, use full dataset
+    if n_tokens_train is not None: assert n_tokens_train + n_tokens_valid <= n_tokens_dataset
+    if n_tokens_train is None: n_tokens_train = n_tokens_dataset - n_tokens_valid
 
-        # read dataset
-        # using np.memmap for each batch to avoid memory leak
-        data = np.memmap(ds_path, dtype=np.uint16, mode='r')
+    # get num. of train. and valid. batches
+    n_batch_train = n_tokens_train // (batch_size * seq_len)
+    n_batch_valid = n_tokens_valid // (batch_size * seq_len)
+    n_batch = n_batch_train + n_batch_valid
 
-        # get batch
-        start_idx = batch_size*seq_len*idx + seq_len*np.arange(batch_size)
-        token_idx = start_idx[:, None] + np.arange(seq_len)[None, :] # [batch, sequence]
-        batch = data[token_idx]
+    # memmap data
+    print('reading data...')
+    data = np.memmap(ds_path, dtype=np.uint16, shape=[n_batch, batch_size, seq_len], mode='r')
+    
+    # load data onto jax devices, sharded across batch dimension
+    sharding = jax.sharding.NamedSharding(mesh, P(None, 'data', 'model'))
+    callback = lambda index: data[index]
+    data = jax.make_array_from_callback(data.shape, sharding, callback)
 
-        return batch
+    # shuffle batches
+    print('shuffling data...')
+    data = jax.random.permutation(key, data, axis=0)
 
-    return get_batch, n_tokens
-
-
-def get_in_out(batch: jax.Array, pad_id: int = 0):
-  """Returns input, output, and weights for a batch of examples."""
-  # Assumes input of the form <BOS> <IDs> <EOS> for eval.
-  x = batch # [B, L]
-  y = jnp.pad(x[:, 1:], ((0, 0), (0, 1)), constant_values=pad_id) # shift x by 1 along L axis
-  weights = jnp.where(y != pad_id, 1, 0).astype(jnp.float32)
-  return x, y, weights
+    # split data
+    print('splitting data...')
+    data_train = data[:n_batch_train]
+    data_valid = data[n_batch_train:]
+    
+    return data_train, data_valid

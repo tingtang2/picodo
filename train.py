@@ -1,105 +1,137 @@
+import math
 import jax
 import jax.numpy as jnp
 import optax
 import wandb
-import data, utils
-import model as model_lib
 from functools import partial
 from flax import nnx
+from optax import tree_utils as otu
 from tqdm.auto import tqdm
-from jax.experimental import mesh_utils
-from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
 from omegaconf.dictconfig import DictConfig
+import data, utils
+import model as model_lib
 
 
-def loss_fn(model, batch):
-    x, y, weights = data.get_in_out(batch)
-    logits = model(x)
-    losses = optax.softmax_cross_entropy_with_integer_labels(logits, y)
-    mean_loss = jnp.sum(losses * weights) / weights.sum()
-    return mean_loss
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def loss_fn(model_state, model_graphdef, x): # [B, T]
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis=1)
+    loss_mask = jnp.ones(x.shape, dtype=bool).at[:, -1].set(False)
+    logits = model(x) # [B, T, V]
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits, y) # [B, T]
+    return (losses * loss_mask).sum() / loss_mask.sum()
 
 
-@partial(jax.jit, static_argnames='opt_graphdef')
-def train_step(opt_graphdef, opt_state, batch):
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
+def train_step(opt_state, opt_graphdef, model_graphdef, batch):
+
+    # compute grads from a single micro-batch
+    if batch.ndim == 2:
+        loss, grads = jax.value_and_grad(loss_fn)(opt_state.model, model_graphdef, batch)
+    
+    # compute grads from multiple micro-batches (using gradient accumulation)
+    if batch.ndim == 3:
+        loss = 0
+        grads = otu.tree_zeros_like(opt_state.model, dtype=jnp.float32)
+        def step_fn(i , args):
+            loss, grads = args
+            batch_loss, batch_grads = jax.value_and_grad(loss_fn)(opt_state.model, model_graphdef, batch[i])
+            loss = (i*loss + batch_loss) / (i+1)
+            grads = jax.tree.map(lambda m, g: (i*m + g) / (i+1), grads, batch_grads)
+            return loss, grads
+        loss, grads = jax.lax.fori_loop(0, len(batch), step_fn, (loss, grads))
+        
+    # optimizer step
     optimizer = nnx.merge(opt_graphdef, opt_state)
-    loss, grads = nnx.value_and_grad(loss_fn)(optimizer.model, batch)
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
-    lr = optimizer.opt_state.hyperparams['learning_rate'].value
-    metrics = {'train_loss': loss, 'learning_rate': lr}
-    return opt_state, metrics
+    return opt_state, loss
 
 
-@partial(jax.jit, static_argnames='model_graphdef')
-def eval_step(model_graphdef, model_state, dataset):
-    model = nnx.merge(model_graphdef, model_state)
-    losses = jax.lax.map(partial(loss_fn, model), dataset)
-    return {'eval_loss': losses.mean()}
+def eval_step(model_state, model_graphdef, dataset):
+    loss = 0
+    for batch in dataset:
+        loss += loss_fn(model_state, model_graphdef, batch)
+    return loss / len(dataset)
 
 
 def train_and_evaluate(c: DictConfig):
 
-    # datastes
-    get_batch_train, ds_train_size = data.make_ds_loader(c.ds_path_train, c.model.L, c.batch_size_train)
-    get_batch_valid, ds_valid_size = data.make_ds_loader(c.ds_path_valid, c.model.L, c.batch_size_valid)
-
-    # get number of training/validation steps
-    c.num_tokens_train = c.num_tokens_train or ds_train_size
-    c.num_tokens_valid = c.num_tokens_valid or ds_valid_size
-    tokens_per_train_step = c.batch_size_train * c.model.L
-    tokens_per_valid_step = c.batch_size_valid * c.model.L
-    num_train_steps = c.num_tokens_train // tokens_per_train_step
-    num_valid_steps = c.num_tokens_valid // tokens_per_valid_step
+    # get model and dataset rng seed
+    key = jax.random.key(c.seed)
+    key, key_model, key_dataset = jax.random.split(key, 3)
 
     # sharding
-    # all devices are aligned across a single mesh axis called 'data'
-    # we use FSDP to shard data, model, and optimzier parameters across this axis
-    mesh = Mesh(mesh_utils.create_device_mesh((jax.device_count(),)), ('data',))
-    data_sharding = NamedSharding(mesh, P('data')) # data parallelism
-    with mesh: ds_valid = jnp.stack([jax.device_put(get_batch_valid(i), data_sharding) for i in range(num_valid_steps)])
+    num_fsdp_devices = jax.device_count() // c.num_tp_devices
+    mesh = jax.make_mesh((num_fsdp_devices, c.num_tp_devices), ('data', 'model'))
+    print('sharding mesh:', ', '.join(f'{k}={v}' for k, v in mesh.shape.items()))
 
     # model
-    model = model_lib.create_sharded_model(c.model, mesh, c.seed)
+    print('initializing model...')
+    c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count()) # round V up to enable sharding
+    model = model_lib.create_sharded_model(c.model, mesh, key_model)
+    model_graphdef = nnx.graphdef(model)
+
+    # get num. model parameters
+    n_params = {
+        'n_param_nonembed': 12 * c.model.L * c.model.D**2,
+        'n_param_embed': c.model.D * c.model.V,
+        'n_param_actual': utils.get_num_model_params(model),
+    }
+    for k, v in n_params.items():
+        print(f'{k}={v:_}')
+
+    # dataset
+    if (c.num_tokens_train is None) and (c.tokens_params_ratio is not None):
+        c.num_tokens_train = c.tokens_params_ratio * (n_params['n_param_nonembed'] + n_params['n_param_embed'])
+    ds_train, ds_valid = data.load_ds(key_dataset, mesh, c.ds_path, c.model.T, c.opt.microbatch_size, c.num_tokens_valid, c.num_tokens_train)
+    if (c.num_tokens_train is None): c.num_tokens_train = ds_train.size
 
     # optimizer
-    warmup_steps = int(c.opt.warmup_frac * num_train_steps)
-    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_train_steps)
+    num_opt_steps = len(ds_train) // c.opt.grad_acc_steps
+    warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
+    tokens_per_opt_step = c.opt.batch_size * c.model.T
+    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
     tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
     optimizer = nnx.Optimizer(model, tx)
+    opt_graphdef, opt_state = nnx.split(optimizer)
 
     # start wandb
-    if c.wandb_project is not None:
-        wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode)
+    if jax.process_index() == 0:
+        wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode, name=c.run_name)
+        wandb.summary.update(n_params)
 
     # training loop
-    # note: metrics for each steps are processed only after asynchronously dispatching the next step
-    pending_train_metrics = None
-    pending_eval_metrics = None
-    model_graphdef = nnx.graphdef(model)
-    opt_graphdef, opt_state = nnx.split(optimizer)
+    train_loss_sum, train_loss_num = jnp.zeros([]), 0
     with mesh:
-        pbar = tqdm(range(num_train_steps))
+
+        pbar = range(num_opt_steps)
+        if jax.process_index() == 0: pbar = tqdm(pbar)
         for step in pbar:
 
+            # get batch
+            if c.opt.grad_acc_steps == 1:
+                batch = ds_train[step] # [batch_size, T]
+            if c.opt.grad_acc_steps > 1:
+                batch = ds_train[step*c.opt.grad_acc_steps:(step+1)*c.opt.grad_acc_steps] # [grad_acc_steps, micro_batch_size, T]
+
             # training step
-            batch = jax.device_put(get_batch_train(step), data_sharding)
-            opt_state, train_metrics = train_step(opt_graphdef, opt_state, batch)
-            train_metrics |= {'train_tokens_seen': (step+1)*tokens_per_train_step}
+            opt_state, batch_loss = train_step(opt_state, opt_graphdef, model_graphdef, batch)
 
-            # async logging
-            if pending_train_metrics is not None:
-                pbar.set_postfix_str(f'loss={pending_train_metrics["train_loss"]:.2f}')
-                wandb.log(pending_train_metrics, step-1)
-            pending_train_metrics = train_metrics
-            if pending_eval_metrics is not None:
-                wandb.log(pending_eval_metrics, step-1)
-                pending_eval_metrics = None
+            # logging
+            train_loss_sum += batch_loss
+            train_loss_num += 1
+            if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
+                metrics = {}
+                metrics['train_loss'] = train_loss_sum / train_loss_num
+                metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+                if jax.process_index() == 0:
+                    wandb.log(metrics, step)
+                    pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
+                train_loss_sum, train_loss_num = jnp.zeros([]), 0
 
-            # eval step
-            if ((step+1) % c.eval_every_steps == 0) or ((step+1) == num_train_steps):
-                pending_eval_metrics = eval_step(model_graphdef, opt_state.model, ds_valid)
-
-        wandb.log(pending_train_metrics, step)
-        wandb.log(pending_eval_metrics, step)
+        # eval at end of training
+        eval_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
+        if jax.process_index() == 0:
+            wandb.log({'eval_loss': eval_loss}, step)
+            wandb.finish()
