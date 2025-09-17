@@ -105,10 +105,10 @@ def tpu_causal_flash_attention(q, k, v, mesh):
     block_sizes = splash_attention_kernel.BlockSizes(
         block_q=512,
         block_kv=512,
-        block_kv_compute=128,
+        block_kv_compute=min(H, 256),
         block_q_dkv=512,
         block_kv_dkv=512,
-        block_kv_dkv_compute=128,
+        block_kv_dkv_compute=min(H, 256),
         block_q_dq=512,
         block_kv_dq=512,
     )
