@@ -49,7 +49,7 @@ def train_step(opt_state, opt_graphdef, model_graphdef, batch):
 
 
 def eval_step(model_state, model_graphdef, dataset):
-    loss = 0
+    loss = jnp.zeros([], dtype=jnp.float32)
     for batch in dataset:
         loss += loss_fn(model_state, model_graphdef, batch)
     return loss / len(dataset)
