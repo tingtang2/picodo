@@ -22,16 +22,16 @@ model:
   N: ${floordiv:${model.D}, ${model.H}} # num. attention heads
   T: null # context/sequence length
   V: null # vocab size -> must match dataset tokenizer!
-  activ_dtype: 'float32'
+  activ_dtype: 'bfloat16'
   remat: false # gradient rematerialization (chekpointing)
   use_flash_attn: true
   
 opt:
-  batch_size: 32
+  batch_size: 8
   microbatch_size: ${opt.batch_size}
   grad_acc_steps: ${floordiv:${opt.batch_size}, ${opt.microbatch_size}}
-  peak_lr: 0.004
+  peak_lr: 0.002
   warmup_frac: 0.05
   b1: 0.9
-  b2: 0.98
-  weight_decay: 0.1
+  b2: 0.999
+  weight_decay: 0.02
