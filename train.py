@@ -18,7 +18,7 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     y = jnp.roll(x, -1, axis=1)
     loss_mask = jnp.ones(x.shape, dtype=bool).at[:, -1].set(False)
     logits = model(x) # [B, T, V]
-    losses = optax.softmax_cross_entropy_with_integer_labels(logits, y) # [B, T]
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
     return (losses * loss_mask).sum() / loss_mask.sum()
 
 
