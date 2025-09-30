@@ -9,8 +9,6 @@
 - uses [Hydra](https://github.com/facebookresearch/hydra) for experiment management
 - uses [Weights & Biases](https://github.com/facebookresearch/hydra) for experiment tracking
 
-<img src="https://github.com/martin-marek/picodo/blob/main/figures/loss.jpg" width="500">
-
 # Training
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/martin-marek/picodo/blob/main/train_colab.ipynb)
@@ -25,6 +23,8 @@ python main.py +model=gpt2s +dataset=fw_gpt2 opt.batch_size=8
 ```
 
 You can also run `train.py` directly, which uses the `base.yaml` config by default.
+
+<img src="https://github.com/martin-marek/picodo/blob/main/figures/loss.jpg" width="500">
 
 # Inspiration
 
