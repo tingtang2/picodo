@@ -64,12 +64,13 @@ def train_and_evaluate(c: DictConfig):
     # sharding
     num_fsdp_devices = jax.device_count() // c.num_tp_devices
     mesh = jax.make_mesh((num_fsdp_devices, c.num_tp_devices), ('data', 'model'))
+    jax.set_mesh(mesh)
     print('sharding mesh:', ', '.join(f'{k}={v}' for k, v in mesh.shape.items()))
 
     # model
     print('initializing model...')
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count()) # round V up to enable sharding
-    model = model_lib.create_sharded_model(c.model, mesh, key_model)
+    model = model_lib.create_sharded_model(c.model, key_model)
     model_graphdef = nnx.graphdef(model)
 
     # get num. model parameters
@@ -93,7 +94,7 @@ def train_and_evaluate(c: DictConfig):
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
     tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
-    optimizer = nnx.Optimizer(model, tx)
+    optimizer = nnx.ModelAndOptimizer(model, tx)
     opt_graphdef, opt_state = nnx.split(optimizer)
 
     # start wandb
@@ -103,35 +104,34 @@ def train_and_evaluate(c: DictConfig):
 
     # training loop
     train_loss_sum, train_loss_num = jnp.zeros([]), 0
-    with mesh:
 
-        pbar = range(num_opt_steps)
-        if jax.process_index() == 0: pbar = tqdm(pbar)
-        for step in pbar:
+    pbar = range(num_opt_steps)
+    if jax.process_index() == 0: pbar = tqdm(pbar)
+    for step in pbar:
 
-            # get batch
-            if c.opt.grad_acc_steps == 1:
-                batch = ds_train[step] # [batch_size, T]
-            if c.opt.grad_acc_steps > 1:
-                batch = ds_train[step*c.opt.grad_acc_steps:(step+1)*c.opt.grad_acc_steps] # [grad_acc_steps, micro_batch_size, T]
+        # get batch
+        if c.opt.grad_acc_steps == 1:
+            batch = ds_train[step] # [batch_size, T]
+        if c.opt.grad_acc_steps > 1:
+            batch = ds_train[step*c.opt.grad_acc_steps:(step+1)*c.opt.grad_acc_steps] # [grad_acc_steps, micro_batch_size, T]
 
-            # training step
-            opt_state, batch_loss = train_step(opt_state, opt_graphdef, model_graphdef, batch)
+        # training step
+        opt_state, batch_loss = train_step(opt_state, opt_graphdef, model_graphdef, batch)
 
-            # logging
-            train_loss_sum += batch_loss
-            train_loss_num += 1
-            if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
-                metrics = {}
-                metrics['train_loss'] = train_loss_sum / train_loss_num
-                metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-                if jax.process_index() == 0:
-                    wandb.log(metrics, step)
-                    pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
-                train_loss_sum, train_loss_num = jnp.zeros([]), 0
+        # logging
+        train_loss_sum += batch_loss
+        train_loss_num += 1
+        if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
+            metrics = {}
+            metrics['train_loss'] = train_loss_sum / train_loss_num
+            metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+            if jax.process_index() == 0:
+                wandb.log(metrics, step)
+                pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
+            train_loss_sum, train_loss_num = jnp.zeros([]), 0
 
-        # eval at end of training
-        eval_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
-        if jax.process_index() == 0:
-            wandb.log({'eval_loss': eval_loss}, step)
-            wandb.finish()
+    # eval at end of training
+    eval_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
+    if jax.process_index() == 0:
+        wandb.log({'eval_loss': eval_loss}, step)
+        wandb.finish()
