@@ -19,7 +19,8 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     loss_mask = jnp.ones(x.shape, dtype=bool).at[:, -1].set(False)
     logits = model(x) # [B, T, V]
     losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
-    return (losses * loss_mask).sum() / loss_mask.sum()
+    losses = losses.at[:, -1].set(0)
+    return losses.mean()
 
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
