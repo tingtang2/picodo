@@ -27,8 +27,6 @@ model:
   
 opt:
   batch_size: 8
-  microbatch_size: ${opt.batch_size}
-  grad_acc_steps: ${floordiv:${opt.batch_size}, ${opt.microbatch_size}}
   peak_lr: 0.002
   warmup_frac: 0.05
   b1: 0.9

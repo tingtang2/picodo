@@ -25,24 +25,7 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step(opt_state, opt_graphdef, model_graphdef, batch):
-
-    # compute grads from a single micro-batch
-    if batch.ndim == 2:
-        loss, grads = jax.value_and_grad(loss_fn)(opt_state.model, model_graphdef, batch)
-    
-    # compute grads from multiple micro-batches (using gradient accumulation)
-    if batch.ndim == 3:
-        loss = 0
-        grads = otu.tree_zeros_like(opt_state.model, dtype=jnp.float32)
-        def step_fn(i , args):
-            loss, grads = args
-            batch_loss, batch_grads = jax.value_and_grad(loss_fn)(opt_state.model, model_graphdef, batch[i])
-            loss = (i*loss + batch_loss) / (i+1)
-            grads = jax.tree.map(lambda m, g: (i*m + g) / (i+1), grads, batch_grads)
-            return loss, grads
-        loss, grads = jax.lax.fori_loop(0, len(batch), step_fn, (loss, grads))
-        
-    # optimizer step
+    loss, grads = jax.value_and_grad(loss_fn)(opt_state.model, model_graphdef, batch)
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
@@ -86,11 +69,11 @@ def train_and_evaluate(c: DictConfig):
     # dataset
     if (c.num_tokens_train is None) and (c.tokens_params_ratio is not None):
         c.num_tokens_train = c.tokens_params_ratio * (n_params['n_param_nonembed'] + n_params['n_param_embed'])
-    ds_train, ds_valid = data.load_ds(key_dataset, mesh, c.ds_path, c.model.T, c.opt.microbatch_size, c.num_tokens_valid, c.num_tokens_train)
+    ds_train, ds_valid = data.load_ds(key_dataset, mesh, c.ds_path, c.model.T, c.opt.batch_size, c.num_tokens_valid, c.num_tokens_train)
     if (c.num_tokens_train is None): c.num_tokens_train = ds_train.size
 
     # optimizer
-    num_opt_steps = len(ds_train) // c.opt.grad_acc_steps
+    num_opt_steps = len(ds_train)
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
@@ -110,14 +93,8 @@ def train_and_evaluate(c: DictConfig):
     if jax.process_index() == 0: pbar = tqdm(pbar)
     for step in pbar:
 
-        # get batch
-        if c.opt.grad_acc_steps == 1:
-            batch = ds_train[step] # [batch_size, T]
-        if c.opt.grad_acc_steps > 1:
-            batch = ds_train[step*c.opt.grad_acc_steps:(step+1)*c.opt.grad_acc_steps] # [grad_acc_steps, micro_batch_size, T]
-
         # training step
-        opt_state, batch_loss = train_step(opt_state, opt_graphdef, model_graphdef, batch)
+        opt_state, batch_loss = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
         train_loss_sum += batch_loss
