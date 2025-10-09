@@ -12,22 +12,19 @@ from rope import apply_rope
 
 class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
-        embed_in_init = sharded_init('embedding_in')
-        embed_out_init = sharded_init('embedding_out')
-        self.token_embed_in = nnx.Embed(num_embeddings=c.V, features=c.D, embedding_init=embed_in_init, dtype=c.activ_dtype, rngs=rngs)
-        self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, embedding_init=embed_out_init, dtype=c.activ_dtype, rngs=rngs)
+        self.token_embed_in = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
+        self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
         self.blocks = nnx.List(TransformerBlock(c, rngs) for _ in range(c.L))
         self.out_ln = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
-        self.remat = c.remat
         
     def __call__(self, x): # [B, S]
 
         # token embedding
         h = self.token_embed_in(x) # [B, T, D]
-        
+
         # transformer blocks
         for block in self.blocks:
-            h = jax.remat(block)(h) if self.remat else block(h)
+            h = block(h)
 
         # project back to vocabulary
         h = self.out_ln(h)
@@ -50,10 +47,8 @@ class TransformerBlock(nnx.Module):
 class MultiHeadAttention(nnx.Module):
     """Causal attention layer."""
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
-        qkv_proj_init = sharded_init('attn_qkv_proj')
-        out_proj_init = sharded_init('attn_out_proj')
-        self.qkv_proj = nnx.Einsum('BTd,SNdH->SBTNH', (3, c.N, c.D, c.H), kernel_init=qkv_proj_init, dtype=c.activ_dtype, rngs=rngs)
-        self.out_proj = nnx.Einsum('BTnh,nhD->BTD', (c.N, c.H, c.D),  kernel_init=out_proj_init, dtype=c.activ_dtype, rngs=rngs)
+        self.qkv_proj = nnx.Einsum('BTd,SNdH->SBTNH', (3, c.N, c.D, c.H), dtype=c.activ_dtype, rngs=rngs)
+        self.out_proj = nnx.Einsum('BTnh,nhD->BTD', (c.N, c.H, c.D), dtype=c.activ_dtype, rngs=rngs)
         self.query_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
         self.key_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
         if c.use_flash_attn and jax.devices()[0].platform == 'tpu' and (c.H % 128 != 0):
@@ -131,42 +126,15 @@ def tpu_causal_flash_attention(q, k, v):
 class MLP(nnx.Module):
     """Multilayer perceptron."""
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
-        fc1_init = sharded_init('mlp_fc1')
-        fc2_init = sharded_init('mlp_fc2')
-        self.fc1 = nnx.Linear(in_features=c.D, out_features=c.F, kernel_init=fc1_init, use_bias=False, dtype=c.activ_dtype, rngs=rngs)
-        self.fc2 = nnx.Linear(in_features=c.F, out_features=c.D, kernel_init=fc2_init, use_bias=False, dtype=c.activ_dtype, rngs=rngs)
+        self.up_proj = nnx.Linear(in_features=c.D, out_features=c.F, use_bias=False, dtype=c.activ_dtype, rngs=rngs)
+        self.down_proj = nnx.Linear(in_features=c.F, out_features=c.D, use_bias=False, dtype=c.activ_dtype, rngs=rngs)
         
     def __call__(self, x): # [B, T, D]
-        h = jax.nn.gelu(self.fc1(x)) # [B, T, F]
-        return self.fc2(h) # [B, T, D]
-
-
-def sharded_init(layer_type: str):
-    """Initialize weights with optional sharding."""
-    kernel_init = jax.nn.initializers.xavier_uniform()
-    embed_init = jax.nn.initializers.variance_scaling(1.0, 'fan_in', 'normal', out_axis=0)
-    match layer_type:
-        case 'embedding_in': # [V, D]
-            return nnx.with_partitioning(embed_init, ('data', 'model'))
-        case 'embedding_out': # [V, D]
-            return nnx.with_partitioning(embed_init, ('model', 'data'))
-        case 'attn_qkv_proj': # [3, N, D, H]
-            return nnx.with_partitioning(kernel_init, (None, 'model', 'data', None))
-        case 'attn_out_proj': # [N, H, D]
-            return nnx.with_partitioning(kernel_init, ('model', None, 'data'))
-        case 'mlp_fc1': # [D, F]
-            return nnx.with_partitioning(kernel_init, ('data', 'model'))
-        case 'mlp_fc2': # [F, D]
-            return nnx.with_partitioning(kernel_init, ('model', 'data'))
-        case _:
-            raise ValueError(f'unrecognized layer type: {layer_type}')
+        h = jax.nn.gelu(self.up_proj(x)) # [B, T, F]
+        return self.down_proj(h) # [B, T, D]
 
 
 def create_sharded_model(c: DictConfig, key):
-    """
-    initialize sharded model without putting it on a single device
-    https://flax.readthedocs.io/en/latest/guides/flax_gspmd.html
-    """
     seed = int(jax.random.randint(key, [1], 0, 1_000_000)[0])
 
     @nnx.jit
@@ -174,9 +142,19 @@ def create_sharded_model(c: DictConfig, key):
         rngs = nnx.Rngs(seed)
         model = TransformerDecoder(c, rngs=rngs) # unsharded at this moment
         state = nnx.state(model) # the model's state, a pure pytree
-        pspecs = nnx.get_partition_spec(state) # get annotations from state
-        sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-        nnx.update(model, sharded_state) # the model is sharded now
+
+        def add_sharding(path, v):
+            key = jax.tree_util.keystr(path, simple=True, separator='/')
+            if 'token_embed_in' in key: pspec = P('data', 'model')
+            if 'up_proj' in key: pspec = P('data', 'model')
+            if 'down_proj' in key: pspec = P('model', 'data')
+            if 'qkv_proj' in key: pspec = P(None, 'model', 'data', None)
+            if 'out_proj' in key: pspec = P('model', None, 'data')
+            if 'token_embed_out' in key: pspec = P('model', 'data')
+            return jax.lax.with_sharding_constraint(v, pspec)
+        state = jax.tree.map_with_path(add_sharding, state)
+        nnx.update(model, state) # the model is sharded now
+        
         return model
 
     model = initialize_sharded_model()
