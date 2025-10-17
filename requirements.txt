@@ -1,0 +1,8 @@
+fire 
+hydra-core 
+wandb 
+jax[tpu] 
+flax==0.12.0
+jax-smi
+tqdm
+huggingface_hub
