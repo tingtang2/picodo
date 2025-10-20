@@ -1,0 +1,45 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+seed: 0
+ds_path: null
+tokens_params_ratio: 20 # chinchilla scaling
+num_tokens_train: null
+log_every_tokens: 1_000_000
+eval_every_steps: 100
+num_tokens_valid: 20_000_000
+wandb_project: 'picodo-loss-spikes'
+wandb_mode: 'disabled'
+run_name: null
+num_tp_devices: 1 # optional tensor parallelism
+
+model:
+  D: null # model/embed/qkv dim
+  L: null # num. block layers
+  H: 128 # head dimension
+  F: ${mul:4, ${model.D}} # FF inner dimension = 4 x embed dim.
+  N: ${floordiv:${model.D}, ${model.H}} # num. attention heads
+  T: null # context/sequence length
+  V: null # vocab size -> must match dataset tokenizer!
+  activ_dtype: 'bfloat16'
+  use_flash_attn: true
+  
+opt:
+  batch_size: 256
+  peak_lr: 0.01
+  warmup_frac: 0.05
+  b1: 0.9
+  b2: 0.95
+  weight_decay: 1e-4
+  clip_by_global_norm: 1.0
+
+checkpoint:
+  turn_on: True
+  workdir: ""
+  checkpoint_every_steps: 2000
+  # Path to the checkpoint to be restored. Note than new checkpoints will be
+  # saved to the new workdir.
+  checkpoint_restore_dir: None
+  max_to_keep: 100

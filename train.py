@@ -6,6 +6,7 @@ import wandb
 from functools import partial
 from flax import nnx
 from optax import tree_utils as otu
+import optax
 from tqdm.auto import tqdm
 from omegaconf.dictconfig import DictConfig
 import data, utils
@@ -78,6 +79,10 @@ def train_and_evaluate(c: DictConfig):
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
     tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
+    clip_by_global_norm = c.opt.clip_by_global_norm
+    if clip_by_global_norm:
+        tx = optax.chain(
+            optax.clip_by_global_norm(clip_by_global_norm), tx)
     optimizer = nnx.ModelAndOptimizer(model, tx)
     opt_graphdef, opt_state = nnx.split(optimizer)
 
@@ -107,6 +112,16 @@ def train_and_evaluate(c: DictConfig):
                 wandb.log(metrics, step)
                 pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
             train_loss_sum, train_loss_num = jnp.zeros([]), 0
+        
+        # eval and checkpointing
+        if step % c.eval_every_steps == 0:
+            metrics = {}
+            metrics['eval_loss'] = eval_step(opt_state.model, model_graphdef, ds_valid)
+            metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+            if jax.process_index() == 0:
+                wandb.log(metrics, step)
+        # if step % c.checkpoint_every_steps == 0:
+        #     _checkpoint()
 
     # eval at end of training
     eval_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
