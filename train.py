@@ -177,6 +177,6 @@ def train_and_evaluate(c: DictConfig):
             'step': step + 1})))
         
         ckpt_mngr.wait_until_finished() 
-        if jax.process.index() == 0:
+        if jax.process_index() == 0:
             print(f'Saved final checkpoint at step {num_opt_steps} to {ckpt_mngr.directory}')
         ckpt_mngr.close()
