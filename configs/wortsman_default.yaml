@@ -39,7 +39,4 @@ checkpoint:
   turn_on: True
   workdir: ""
   checkpoint_every_steps: 2000
-  # Path to the checkpoint to be restored. Note than new checkpoints will be
-  # saved to the new workdir.
-  checkpoint_restore_dir: None
   max_to_keep: 100
