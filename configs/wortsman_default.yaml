@@ -41,7 +41,7 @@ checkpoint:
   workdir: ""
   checkpoint_every_steps: 2000
   max_to_keep: 100
-  start: null # pick a specific checkpoint to start off from
+  start_step: null # pick a specific checkpoint to start off from
 
 diagnostics:
   end_step: null # to specific end step
