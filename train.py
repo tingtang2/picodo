@@ -110,7 +110,7 @@ def train_and_evaluate(c: DictConfig):
         )
         
         print(f'Checking for existing checkpoints in: {ckpt_dir}')
-        latest_step = ckpt_mngr.latest_step()
+        latest_step = c.checkpoint.start if c.checkpoint.start else ckpt_mngr.latest_step()
 
         if latest_step is not None:
             print(f'Restoring checkpoint from step {latest_step} in {ckpt_dir}...')

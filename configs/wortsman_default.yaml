@@ -37,7 +37,12 @@ opt:
   clip_by_global_norm: 1.0
 
 checkpoint:
-  turn_on: True
+  turn_on: true
   workdir: ""
   checkpoint_every_steps: 2000
   max_to_keep: 100
+  start: null # pick a specific checkpoint to start off from
+
+diagnostics:
+  end_step: null # to specific end step
+  save_top_token_ids: false
