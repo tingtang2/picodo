@@ -180,7 +180,7 @@ def train_and_evaluate(c: DictConfig):
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
             k_top = 3 if c.diagnostics.save_top_token_ids else 0
-            eval_loss, top_eval_data, all_losses = eval_step(opt_state.model, model_graphdef, ds_valid, k_top_batches=k_top)
+            eval_loss, all_losses, top_eval_data = eval_step(opt_state.model, model_graphdef, ds_valid, k_top_batches=k_top)
             
             metrics = {}
             metrics['eval_loss'] = eval_loss
@@ -196,11 +196,6 @@ def train_and_evaluate(c: DictConfig):
                 step > 300
             )
             
-            if c.checkpoint.start is not None:
-                conditions_met &= (step >= c.checkpoint.start)
-            if c.diagnostics.end_step is not None:
-                conditions_met &= (step <= c.diagnostics.end_step)
-
             if conditions_met and jax.process_index() == 0:
                 print(f'Step {step}: eval_loss {eval_loss:.4f} > 7, saving top 3 eval batches to {ckpt_dir}...')
                 
@@ -240,10 +235,21 @@ def train_and_evaluate(c: DictConfig):
         sys.exit(1)
 
     # eval at end of training
-    eval_loss, top_eval_data, all_losses = eval_step(opt_state.model, model_graphdef, ds_valid)
+    eval_loss, all_losses, top_eval_data = eval_step(opt_state.model, model_graphdef, ds_valid)
     if jax.process_index() == 0:
-        wandb.log({'eval_loss': eval_loss, 'eval_loss_histogram': wandb.Histogram(all_losses)}, step)
+        wandb.log({'eval_loss': eval_loss, 'eval_loss_histogram': wandb.Histogram(all_losses)})
         wandb.finish()
+        if ckpt_dir:
+            diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
+            os.makedirs(diagnostics_dir, exist_ok=True)
+            
+            hist_path = os.path.join(diagnostics_dir, f'all_eval_losses_step_{num_opt_steps}.npy')
+            try:
+                np.save(hist_path, np.array(all_losses))
+                print(f'Saved diagnostic files to {diagnostics_dir} for step {num_opt_steps}')
+                
+            except Exception as e:
+                print(f'Error saving diagnostic files for step {num_opt_steps}: {e}')
 
     # final checkpoint
     if c.checkpoint.turn_on:
