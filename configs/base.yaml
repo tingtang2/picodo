@@ -24,6 +24,7 @@ model:
   V: null # vocab size -> must match dataset tokenizer!
   activ_dtype: 'bfloat16'
   use_flash_attn: true
+  use_qk_norm: true
   
 opt:
   batch_size: 8
