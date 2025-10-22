@@ -19,6 +19,7 @@ import numpy as np
 import sys
 
 
+
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def loss_fn(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
@@ -26,17 +27,24 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     loss_mask = jnp.ones(x.shape, dtype=bool).at[:, -1].set(False)
     logits = model(x) # [B, T, V]
     losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
-    losses = losses.at[:, -1].set(0)
-    return losses.mean()
-
+    losses = losses.at[:, -1].set(0) #
+    
+    per_sequence_loss = losses.mean(axis=1)
+    mean_loss = per_sequence_loss.mean()
+    
+    return mean_loss, per_sequence_loss
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step(opt_state, opt_graphdef, model_graphdef, batch):
-    loss, grads = jax.value_and_grad(loss_fn)(opt_state.model, model_graphdef, batch)
+    # Use has_aux=True to get the per_sequence_loss
+    (loss, per_sequence_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
-    return opt_state, loss
+    
+    # Return the per_sequence_loss as well
+    return opt_state, loss, per_sequence_loss
 
 
 def eval_step(model_state, model_graphdef, dataset, k_top_batches=0):
@@ -45,7 +53,7 @@ def eval_step(model_state, model_graphdef, dataset, k_top_batches=0):
     all_losses = []
     
     for batch in dataset:
-        batch_loss = loss_fn(model_state, model_graphdef, batch)
+        batch_loss, per_sequence_loss = loss_fn(model_state, model_graphdef, batch)
         all_losses.append(batch_loss)
         loss_sum += batch_loss
 
@@ -162,7 +170,7 @@ def train_and_evaluate(c: DictConfig):
     for step in pbar:
 
         # training step
-        opt_state, batch_loss = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        opt_state, batch_loss, per_sequence_loss = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
         train_loss_sum += batch_loss
@@ -210,15 +218,20 @@ def train_and_evaluate(c: DictConfig):
                         losses.append(float(loss))
                         batches_data.append(np.array(batch))
                         
+                    current_batch = ds_train[step]
                     loss_path = os.path.join(diagnostics_dir, f'top_3_eval_losses_step_{step}.npy')
                     batches_path = os.path.join(diagnostics_dir, f'top_3_eval_batches_step_{step}.npy')
                     hist_path = os.path.join(diagnostics_dir, f'all_eval_losses_step_{step}.npy')
+                    train_seq_loss_path = os.path.join(diagnostics_dir, f'per_seq_losses_{step}.npy')
+                    train_batch_path = os.path.join(diagnostics_dir, f'train_batch_seq_{step}.npy')
                     
                     # Save the files
                     try:
                         np.save(loss_path, np.array(losses))
                         np.save(batches_path, np.stack(batches_data))
                         np.save(hist_path, np.array(all_losses))
+                        np.save(train_seq_loss_path, np.array(per_sequence_loss))
+                        np.save(train_batch_path, np.array(current_batch))
                         print(f'Saved diagnostic files to {diagnostics_dir} for step {step}')
                         
                     except Exception as e:
