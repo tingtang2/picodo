@@ -186,9 +186,6 @@ def train_and_evaluate(c: DictConfig):
             
             # diagnostics
             if c.diagnostics.save_raw_losses:
-                if eval_loss > 7 and step > 300 and jax.process_index() == 0:
-                    print(f'Step {step}: eval_loss {eval_loss:.4f} > 7, saving raw losses to {ckpt_dir}...')
-                
                 if ckpt_dir:
                     diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
                     os.makedirs(diagnostics_dir, exist_ok=True)
