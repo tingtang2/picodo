@@ -39,24 +39,24 @@ def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    # Return the per_sequence_loss as well
     return opt_state, loss, raw_loss
 
 
 def eval_step(model_state, model_graphdef, dataset):
     loss_sum = jnp.zeros([], dtype=jnp.float32)
+    raw_losses = []
     
     for batch in dataset:
         batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
+        raw_losses.append(raw_loss)
 
     mean_loss = loss_sum / len(dataset)
     
-    return mean_loss
+    return mean_loss, raw_losses
 
 
 def train_and_evaluate(c: DictConfig):
-
     # get model and dataset rng seed
     key = jax.random.key(c.seed)
     key, key_model, key_dataset = jax.random.split(key, 3)
@@ -137,6 +137,12 @@ def train_and_evaluate(c: DictConfig):
 
     model = nnx.merge(model_graphdef, opt_state.model)
 
+    if c.diagnostics.save_raw_losses:
+        if ckpt_dir:
+            diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
+            os.makedirs(diagnostics_dir, exist_ok=True)
+            utils.save_to_numpy(save_dir=diagnostics_dir, name='val_dataset', data=ds_valid)
+
     # start wandb
     if jax.process_index() == 0:
         wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode, name=c.run_name)
@@ -153,7 +159,7 @@ def train_and_evaluate(c: DictConfig):
     for step in pbar:
 
         # training step
-        opt_state, batch_loss, raw_loss = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        opt_state, batch_loss, train_raw_loss = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
         train_loss_sum += batch_loss
@@ -170,8 +176,7 @@ def train_and_evaluate(c: DictConfig):
         
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
-            eval_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
-            
+            eval_loss, eval_raw_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
             metrics = {}
             metrics['eval_loss'] = eval_loss
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
@@ -179,45 +184,21 @@ def train_and_evaluate(c: DictConfig):
                 # metrics['eval_loss_histogram'] = wandb.Histogram(all_losses)
                 wandb.log(metrics, step)
             
-            # # diagnostics
-            # conditions_met = (
-            #     c.diagnostics.save_top_token_ids and
-            #     eval_loss > 7 and
-            #     step > 300
-            # )
-            
-            # if conditions_met and jax.process_index() == 0:
-            #     print(f'Step {step}: eval_loss {eval_loss:.4f} > 7, saving top 3 eval batches to {ckpt_dir}...')
+            # diagnostics
+            if c.diagnostics.save_raw_losses:
+                if eval_loss > 7 and step > 300 and jax.process_index() == 0:
+                    print(f'Step {step}: eval_loss {eval_loss:.4f} > 7, saving raw losses to {ckpt_dir}...')
                 
-            #     if ckpt_dir:
-            #         diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
-            #         os.makedirs(diagnostics_dir, exist_ok=True)
+                if ckpt_dir:
+                    diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
+                    os.makedirs(diagnostics_dir, exist_ok=True)
                     
-            #         losses = []
-            #         batches_data = []
+                    current_batch = ds_train[step]
                     
-            #         for loss, batch in top_eval_data:
-            #             losses.append(float(loss))
-            #             batches_data.append(np.array(batch))
-                        
-            #         current_batch = ds_train[step]
-            #         loss_path = os.path.join(diagnostics_dir, f'top_3_eval_losses_step_{step}.npy')
-            #         batches_path = os.path.join(diagnostics_dir, f'top_3_eval_batches_step_{step}.npy')
-            #         hist_path = os.path.join(diagnostics_dir, f'all_eval_losses_step_{step}.npy')
-            #         train_seq_loss_path = os.path.join(diagnostics_dir, f'per_seq_losses_{step}.npy')
-            #         train_batch_path = os.path.join(diagnostics_dir, f'train_batch_seq_{step}.npy')
-                    
-            #         # Save the files
-            #         try:
-            #             np.save(loss_path, np.array(losses))
-            #             np.save(batches_path, np.stack(batches_data))
-            #             np.save(hist_path, np.array(all_losses))
-            #             np.save(train_seq_loss_path, np.array(per_sequence_loss))
-            #             np.save(train_batch_path, np.array(current_batch))
-            #             print(f'Saved diagnostic files to {diagnostics_dir} for step {step}')
-                        
-            #         except Exception as e:
-            #             print(f'Error saving diagnostic files for step {step}: {e}')
+                    # save diagnostic data
+                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_batch_tokens_step_{step}.npy', data=current_batch)
+                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss)
+                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
 
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
             ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
@@ -230,26 +211,22 @@ def train_and_evaluate(c: DictConfig):
         sys.exit(1)
 
     # eval at end of training
-    eval_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
+    eval_loss, eval_raw_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
     if jax.process_index() == 0:
         wandb.log({'eval_loss': eval_loss})
         wandb.finish()
-        if ckpt_dir:
-            diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
-            os.makedirs(diagnostics_dir, exist_ok=True)
-            
-            # hist_path = os.path.join(diagnostics_dir, f'all_eval_losses_step_{num_opt_steps}.npy')
-            # try:
-            #     np.save(hist_path, np.array(all_losses))
-            #     print(f'Saved diagnostic files to {diagnostics_dir} for step {num_opt_steps}')
+        if c.diagnostics.save_raw_losses:
+            if ckpt_dir:
+                diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
+                os.makedirs(diagnostics_dir, exist_ok=True)
                 
-            # except Exception as e:
-            #     print(f'Error saving diagnostic files for step {num_opt_steps}: {e}')
-
+                # save diagnostic data
+                utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{num_opt_steps}.npy', data=eval_raw_loss)
+            
     # final checkpoint
-    if c.checkpoint.turn_on:
-        ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
-            'step': step + 1})))
+    if c.checkpoint.turn_on and not c.c.diagnostics.save_raw_losses:
+        ckpt_mngr.save(num_opt_steps, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
+            'step': num_opt_steps + 1})))
         
         ckpt_mngr.wait_until_finished() 
         if jax.process_index() == 0:

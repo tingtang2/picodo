@@ -45,4 +45,4 @@ checkpoint:
 
 diagnostics:
   end_step: null # to specific end step
-  save_top_token_ids: false
+  save_raw_losses: false
