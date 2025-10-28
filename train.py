@@ -221,7 +221,7 @@ def train_and_evaluate(c: DictConfig):
                 utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{num_opt_steps}.npy', data=eval_raw_loss)
             
     # final checkpoint
-    if c.checkpoint.turn_on and not c.c.diagnostics.save_raw_losses:
+    if c.checkpoint.turn_on and not c.diagnostics.save_raw_losses:
         ckpt_mngr.save(num_opt_steps, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
             'step': num_opt_steps + 1})))
         
