@@ -176,7 +176,7 @@ def train_and_evaluate(c: DictConfig):
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
                 pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
-            train_loss_sum, train_loss_num = jnp.zeros([]), 0
+            train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
