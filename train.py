@@ -149,7 +149,7 @@ def train_and_evaluate(c: DictConfig):
         wandb.summary.update(n_params)
 
     # training loop
-    train_loss_sum, train_loss_num = jnp.zeros([]), 0
+    train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
@@ -163,10 +163,14 @@ def train_and_evaluate(c: DictConfig):
 
         # logging
         train_loss_sum += batch_loss
+        train_med_loss_sum += jnp.median(train_raw_loss)
+        train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
         train_loss_num += 1
         if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
             metrics = {}
             metrics['train_loss'] = train_loss_sum / train_loss_num
+            metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
+            metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             metrics['lr'] = lr_schedule(step)
             if jax.process_index() == 0:
@@ -177,8 +181,11 @@ def train_and_evaluate(c: DictConfig):
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
             eval_loss, eval_raw_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
+            flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
             metrics = {}
             metrics['eval_loss'] = eval_loss
+            metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
+            metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             if jax.process_index() == 0:
                 # metrics['eval_loss_histogram'] = wandb.Histogram(all_losses)

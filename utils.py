@@ -24,5 +24,10 @@ def get_num_model_params(model: nnx.Module):
 
 def save_to_numpy(save_dir: str, name: str, data):
     path = os.path.join(save_dir, name)
-    
     np.save(path, np.array(data))
+    
+
+def compute_lower_90th_percentile_mean(x):
+    k = int(0.9 * x.size)
+    top_90th = jnp.partition(x.flatten(), k)[:k]
+    return top_90th.mean()
