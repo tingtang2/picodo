@@ -46,7 +46,8 @@ def eval_step(model_state, model_graphdef, dataset):
     loss_sum = jnp.zeros([], dtype=jnp.float32)
     raw_losses = []
     
-    for batch in dataset:
+    for i in range(len(dataset)):
+        batch = dataset[i]
         batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
