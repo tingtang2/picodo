@@ -8,7 +8,7 @@ ds_path: null
 tokens_params_ratio: 20 # chinchilla scaling
 num_tokens_train: null
 log_every_tokens: 1_000_000
-eval_every_steps: 2000
+eval_every_steps: 6000
 num_tokens_valid: 20_000_000
 wandb_project: 'picodo-loss-spikes'
 wandb_mode: 'disabled'
@@ -29,7 +29,7 @@ model:
   
 opt:
   batch_size: 256
-  peak_lr: 0.01
+  peak_lr: 0.1
   warmup_frac: 0.05
   b1: 0.9
   b2: 0.95
@@ -39,7 +39,7 @@ opt:
 checkpoint:
   turn_on: true
   workdir: ""
-  checkpoint_every_steps: 2000
+  checkpoint_every_steps: 10000
   max_to_keep: 100
   start_step: null # pick a specific checkpoint to start off from
 

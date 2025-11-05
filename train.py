@@ -191,6 +191,20 @@ def train_and_evaluate(c: DictConfig):
             metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             metrics['lr'] = lr_schedule(step)
+
+            # compute per-layer grad norms
+            grad_norms = compute_grad_norms_per_layer(grads)
+            metrics['grad_norm_mean'] = np.mean(list(grad_norms.values()))
+            #for name, val in grad_norms.items():
+            #    metrics[f'grad_norm_{name}'] = val  # log per-layer norms
+
+            for i, (name, val) in enumerate(sorted(grad_norms.items())):
+                if i >= 4:
+                    break
+                short_name = name.replace("['", "").replace("']", "").replace("/", ".")
+                metrics[f'grad_norm/{short_name}'] = float(val)
+
+
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
                 pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
