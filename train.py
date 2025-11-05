@@ -16,6 +16,8 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy
 import os
 import numpy as np
 import sys
+from jax.sharding import Mesh
+
 
 
 
@@ -34,13 +36,26 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
 def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     # Use has_aux=True to get the raw losses
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+
+    grad_norm = jnp.sqrt(sum(jnp.vdot(g, g) for g in jax.tree_util.tree_leaves(grads)))
     
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss
+    return opt_state, loss, raw_loss, grads, grad_norm
 
+def compute_grad_norms_per_layer(grads):
+    norms = {}
+
+    def traverse(path, leaf):
+        # path is a tuple of keys showing where we are in the pytree
+        name = '/'.join(str(p) for p in path)
+        norms[name] = jnp.sqrt(jnp.vdot(leaf, leaf))
+
+    # walk through the tree
+    jax.tree_util.tree_map_with_path(traverse, grads)
+    return norms
 
 def eval_step(model_state, model_graphdef, dataset):
     loss_sum = jnp.zeros([], dtype=jnp.float32)
@@ -64,6 +79,9 @@ def train_and_evaluate(c: DictConfig):
     # sharding
     num_fsdp_devices = jax.device_count() // c.num_tp_devices
     mesh = jax.make_mesh((num_fsdp_devices, c.num_tp_devices), ('data', 'model'))
+    mesh = Mesh(mesh.devices, mesh.axis_names)
+    
+    #change this back 
     jax.set_mesh(mesh)
     print('sharding mesh:', ', '.join(f'{k}={v}' for k, v in mesh.shape.items()))
 
@@ -159,7 +177,7 @@ def train_and_evaluate(c: DictConfig):
     for step in pbar:
 
         # training step
-        opt_state, batch_loss, train_raw_loss = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        opt_state, batch_loss, train_raw_loss, grads, grad_norm = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
         train_loss_sum += batch_loss
@@ -203,6 +221,15 @@ def train_and_evaluate(c: DictConfig):
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_batch_tokens_step_{step}.npy', data=current_batch)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
+
+                    #save the grad norms
+                    grad_norms = compute_grad_norms_per_layer(grads)
+                    utils.save_to_numpy(
+                        save_dir=diagnostics_dir,
+                        name=f'grad_norms_step_{step}.npy',
+                        data=grad_norms,
+                    )
+
 
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
             ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({

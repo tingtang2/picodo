@@ -8,7 +8,7 @@ ds_path: null
 tokens_params_ratio: 20 # chinchilla scaling
 num_tokens_train: null
 log_every_tokens: 1_000_000
-eval_every_steps: 100
+eval_every_steps: 2000
 num_tokens_valid: 20_000_000
 wandb_project: 'picodo-loss-spikes'
 wandb_mode: 'disabled'
@@ -44,5 +44,8 @@ checkpoint:
   start_step: null # pick a specific checkpoint to start off from
 
 diagnostics:
+  turn_on: true
   end_step: null # to specific end step
-  save_raw_losses: false
+  save_top_token_ids: true
+  save_raw_losses: true   # <<< ADD THIS LINE
+
