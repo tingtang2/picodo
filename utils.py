@@ -31,3 +31,8 @@ def compute_lower_90th_percentile_mean(x):
     k = int(0.9 * x.size)
     top_90th = jnp.partition(x.flatten(), k)[:k]
     return top_90th.mean()
+
+
+def get_global_grad_norm(grads):
+    sq_sum = jax.tree_util.tree_reduce(lambda acc, g: acc + jnp.sum(g * g), grads, initializer=0.)
+    return jnp.sqrt(sq_sum)

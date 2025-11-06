@@ -5,7 +5,6 @@ import optax
 import wandb
 from functools import partial
 from flax import nnx
-from optax import tree_utils as otu
 import optax
 from tqdm.auto import tqdm
 from omegaconf.dictconfig import DictConfig
@@ -14,7 +13,6 @@ import model as model_lib
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
 import os
-import numpy as np
 import sys
 
 
@@ -39,7 +37,7 @@ def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss
+    return opt_state, loss, raw_loss, utils.get_global_grad_norm(grads)
 
 
 def eval_step(model_state, model_graphdef, dataset):
@@ -158,9 +156,8 @@ def train_and_evaluate(c: DictConfig):
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
-
         # training step
-        opt_state, batch_loss, train_raw_loss = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        opt_state, batch_loss, train_raw_loss, grad_norm = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
         train_loss_sum += batch_loss
@@ -174,6 +171,7 @@ def train_and_evaluate(c: DictConfig):
             metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             metrics['lr'] = lr_schedule(step)
+            metrics['global_grad_norm'] = grad_norm
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
                 pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
