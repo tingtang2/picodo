@@ -141,6 +141,7 @@ def train_and_evaluate(c: DictConfig):
             diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
             os.makedirs(diagnostics_dir, exist_ok=True)
             utils.save_to_numpy(save_dir=diagnostics_dir, name='val_dataset', data=ds_valid)
+            utils.save_to_numpy(save_dir=diagnostics_dir, name='train_dataset', data=ds_train[:c.diagnostics.end_step])
 
     # start wandb
     if jax.process_index() == 0:
@@ -187,7 +188,6 @@ def train_and_evaluate(c: DictConfig):
             metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             if jax.process_index() == 0:
-                # metrics['eval_loss_histogram'] = wandb.Histogram(all_losses)
                 wandb.log(metrics, step)
             
             # diagnostics
@@ -196,10 +196,7 @@ def train_and_evaluate(c: DictConfig):
                     diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
                     os.makedirs(diagnostics_dir, exist_ok=True)
                     
-                    current_batch = ds_train[step]
-                    
                     # save diagnostic data
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_batch_tokens_step_{step}.npy', data=current_batch)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
 
