@@ -55,7 +55,11 @@ def eval_step(model_state, model_graphdef, dataset):
     return mean_loss, raw_losses
 
 
+
 def train_and_evaluate(c: DictConfig):
+    # init distributed env if using multiple vms
+    jax.distributed.initialize()
+    
     # get model and dataset rng seed
     key = jax.random.key(c.seed)
     key, key_model, key_dataset = jax.random.split(key, 3)
