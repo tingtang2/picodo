@@ -202,7 +202,7 @@ def train_and_evaluate(c: DictConfig):
 
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
             ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
-                'step': step + 1})))
+                'step': step + 1})), force=True)
     
     if num_opt_steps != len(ds_train):
         print('exiting early')
