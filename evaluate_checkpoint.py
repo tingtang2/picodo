@@ -91,24 +91,11 @@ def main(c: DictConfig):
     training_metadata=ocp.args.JsonRestore(),))
     opt_state = restored_data['state']
     start_step = restored_data['training_metadata']['step']
-    model_state = opt_state.model # This is the loaded model state!
     print("Checkpoint restored successfully.")
     ckpt_mngr.close()
-
-    # Run Evaluation
-    print("Running evaluation on validation set...")
-    eval_loss, eval_raw_loss = train.eval_step(model_state, model_graphdef, ds_valid)
-    eval_raw_loss_flat = jnp.concatenate(eval_raw_loss, axis=0)
-    print("Validation evaluation complete.")
     
-
-    metrics = {
-        "step": step_to_load,
-        "eval_loss": eval_loss,
-        "eval_med_loss": jnp.median(eval_raw_loss_flat),
-        "eval_lower_90th_mean_loss": utils.compute_lower_90th_percentile_mean(eval_raw_loss_flat),
-    }
-    
+    print('sim training step')
+    metrics = {}
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
     opt_state, batch_loss, train_raw_loss, grad_norm = train.train_step(opt_state, opt_graphdef, model_graphdef, ds_train[start_step])
     
@@ -122,8 +109,23 @@ def main(c: DictConfig):
     metrics['train_loss'] = train_loss_sum / train_loss_num
     metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
     metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
+    print(start_step)
     metrics['lr'] = lr_schedule(start_step)
     metrics['global_grad_norm'] = grad_norm
+    
+    # Run Evaluation
+    print("Running evaluation on validation set...")
+    eval_loss, eval_raw_loss = train.eval_step(opt_state.model, model_graphdef, ds_valid)
+    eval_raw_loss_flat = jnp.concatenate(eval_raw_loss, axis=0)
+    
+
+    metrics.update({
+        "step": step_to_load,
+        "eval_loss": eval_loss,
+        "eval_med_loss": jnp.median(eval_raw_loss_flat),
+        "eval_lower_90th_mean_loss": utils.compute_lower_90th_percentile_mean(eval_raw_loss_flat),
+    })
+    
 
     print("\n--- Metrics ---")
     for k, v in metrics.items():
