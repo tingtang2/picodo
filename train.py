@@ -53,7 +53,7 @@ def eval_step(model_state, model_graphdef, dataset):
         raw_loss, logits = aux
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
-        total_logits.append(logits)
+        total_logits.append(logits.astype(jnp.float32))
 
     mean_loss = loss_sum / len(dataset)
     
@@ -208,7 +208,7 @@ def train_and_evaluate(c: DictConfig):
                     # save diagnostic data
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_logits_step_{step}.npy', data=train_logits)
+                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_logits_step_{step}.npy', data=train_logits.astype(jnp.float32))
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
 
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
