@@ -97,7 +97,7 @@ def main(c: DictConfig):
     print('sim training step')
     metrics = {}
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
-    opt_state, batch_loss, train_raw_loss, grad_norm = train.train_step(opt_state, opt_graphdef, model_graphdef, ds_train[start_step])
+    opt_state, batch_loss, train_raw_loss, _, grad_norm = train.train_step(opt_state, opt_graphdef, model_graphdef, ds_train[start_step])
     
     # logging
     train_loss_sum += batch_loss
@@ -115,7 +115,7 @@ def main(c: DictConfig):
     
     # Run Evaluation
     print("Running evaluation on validation set...")
-    eval_loss, eval_raw_loss = train.eval_step(opt_state.model, model_graphdef, ds_valid)
+    eval_loss, eval_raw_loss, _ = train.eval_step(opt_state.model, model_graphdef, ds_valid)
     eval_raw_loss_flat = jnp.concatenate(eval_raw_loss, axis=0)
     
 
