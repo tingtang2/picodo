@@ -97,7 +97,9 @@ def main(c: DictConfig):
     print('sim training step')
     metrics = {}
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
-    opt_state, batch_loss, train_raw_loss, _, grad_norm = train.train_step(opt_state, opt_graphdef, model_graphdef, ds_train[start_step])
+    opt_state, batch_loss, train_raw_loss, grad_norm = train.train_step(opt_state, opt_graphdef, model_graphdef, ds_train[start_step])
+    mean_output_logit = train.get_mean_output_logit(opt_state.model, model_graphdef, ds_train[start_step]).astype(jnp.float32)
+    print(mean_output_logit)
     
     # logging
     train_loss_sum += batch_loss
@@ -109,6 +111,7 @@ def main(c: DictConfig):
     metrics['train_loss'] = train_loss_sum / train_loss_num
     metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
     metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
+    metrics['train_mean_output_logit'] = mean_output_logit
     print(start_step)
     metrics['lr'] = lr_schedule(start_step)
     metrics['global_grad_norm'] = grad_norm

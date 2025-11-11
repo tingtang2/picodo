@@ -39,10 +39,16 @@ def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     return opt_state, loss, raw_loss, utils.get_global_grad_norm(grads)
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
-def forward_pass(model_state, model_graphdef, x): # [B, T]
+def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     logits = model(x) # [B, T, V]
     return logits.reshape(-1, logits.shape[-1]).mean(axis=0) # [V]
+
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def get_mean_output_logit(model_state, model_graphdef, x): # [B, T]
+    model = nnx.merge(model_graphdef, model_state)
+    logits = model(x) # [B, T, V]
+    return logits.mean() # [V]
 
 
 def eval_step(model_state, model_graphdef, dataset):
@@ -55,7 +61,7 @@ def eval_step(model_state, model_graphdef, dataset):
         batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
-        # total_logits.append(forward_pass(model_state, model_graphdef, batch).astype(jnp.float32))
+        # total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
 
     mean_loss = loss_sum / len(dataset)
     
@@ -170,7 +176,7 @@ def train_and_evaluate(c: DictConfig):
     for step in pbar:
         # training step
         opt_state, batch_loss, train_raw_loss, grad_norm = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
-        train_logits = forward_pass(opt_state.model, model_graphdef, ds_train[step])
+        # train_logits = get_logits_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
 
         # logging
         train_loss_sum += batch_loss
@@ -193,14 +199,14 @@ def train_and_evaluate(c: DictConfig):
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
             eval_loss, eval_raw_loss, eval_logits = eval_step(opt_state.model, model_graphdef, ds_valid)
-            flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
-            metrics = {}
-            metrics['eval_loss'] = eval_loss
-            metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
-            metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
-            metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-            if jax.process_index() == 0:
-                wandb.log(metrics, step)
+            # flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
+            # metrics = {}
+            # metrics['eval_loss'] = eval_loss
+            # metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
+            # metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
+            # metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+            # if jax.process_index() == 0:
+            #     wandb.log(metrics, step)
             
             # diagnostics
             if c.diagnostics.save_raw_losses:
@@ -210,9 +216,9 @@ def train_and_evaluate(c: DictConfig):
                     
                     # save diagnostic data
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_logits_step_{step}.npy', data=train_logits.astype(jnp.float32))
-                    # utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
+                    # utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
+                    # utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_logits_step_{step}.npy', data=train_logits.astype(jnp.float32))
+                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
 
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
             ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
