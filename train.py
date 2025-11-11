@@ -48,7 +48,7 @@ def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
 def get_mean_output_logit(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     logits = model(x) # [B, T, V]
-    return logits.mean() # [V]
+    return logits.mean() 
 
 
 def eval_step(model_state, model_graphdef, dataset):
