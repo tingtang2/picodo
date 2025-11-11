@@ -13,6 +13,7 @@ import data
 import model as model_lib
 import utils
 import train 
+import json
 
 @hydra.main(version_base=None, config_path='configs', config_name='base')
 def main(c: DictConfig):
@@ -80,6 +81,10 @@ def main(c: DictConfig):
     mngr_options = ocp.CheckpointManagerOptions(create=False) # Don't create
     ckpt_mngr = ocp.CheckpointManager(ckpt_dir, options=mngr_options)
     
+    # Create a directory to store evaluation metrics
+    metrics_dir = os.path.join(c.checkpoint.workdir, 'evaluation_metrics', run_name)
+    os.makedirs(metrics_dir, exist_ok=True)
+    
     step_to_load = c.checkpoint.start_step if c.checkpoint.start_step is not None else ckpt_mngr.latest_step()
     
     if step_to_load is None:
@@ -134,6 +139,20 @@ def main(c: DictConfig):
     for k, v in metrics.items():
         print(f"{k}: {v:.6f}")
     print("---------------")
+    
+    # Save metrics to a JSON file
+    print(f"Saving metrics to {metrics_dir}...")
+    # Convert JAX/Numpy arrays to standard Python types for JSON serialization
+    serializable_metrics = {k: v.item() if hasattr(v, 'item') else v for k, v in metrics.items()}
+    metrics_filename = os.path.join(metrics_dir, f'metrics_step_{step_to_load}.json')
+    
+    try:
+        with open(metrics_filename, 'w') as f:
+            json.dump(serializable_metrics, f, indent=4)
+        print(f"Successfully saved metrics to {metrics_filename}")
+    except Exception as e:
+        print(f"Error saving metrics to {metrics_filename}: {e}")
+    # --- END ADDED ---
 
 
 if __name__ == '__main__':
