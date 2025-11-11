@@ -25,21 +25,24 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
     losses = losses.at[:, -1].set(0)
     
-    mean_logits = logits.reshape(-1, logits.shape[-1]).mean(axis=0) # [B * T, V] -> [V]
-    
-    return losses.mean(), (losses, mean_logits)
+    return losses.mean(), losses
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     # Use has_aux=True to get the raw losses
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
     
-    raw_loss, logits = aux
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss, logits, utils.get_global_grad_norm(grads)
+    return opt_state, loss, raw_loss, utils.get_global_grad_norm(grads)
+
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def forward_pass(model_state, model_graphdef, x): # [B, T]
+    model = nnx.merge(model_graphdef, model_state)
+    logits = model(x) # [B, T, V]
+    return logits.reshape(-1, logits.shape[-1]).mean(axis=0) # [V]
 
 
 def eval_step(model_state, model_graphdef, dataset):
@@ -49,11 +52,10 @@ def eval_step(model_state, model_graphdef, dataset):
     
     for i in range(len(dataset)):
         batch = dataset[i]
-        batch_loss, aux = loss_fn(model_state, model_graphdef, batch)
-        raw_loss, logits = aux
+        batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
-        total_logits.append(logits.astype(jnp.float32))
+        # total_logits.append(forward_pass(model_state, model_graphdef, batch).astype(jnp.float32))
 
     mean_loss = loss_sum / len(dataset)
     
@@ -167,7 +169,8 @@ def train_and_evaluate(c: DictConfig):
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
         # training step
-        opt_state, batch_loss, train_raw_loss, train_logits, grad_norm = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        opt_state, batch_loss, train_raw_loss, grad_norm = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        train_logits = forward_pass(opt_state.model, model_graphdef, ds_train[step])
 
         # logging
         train_loss_sum += batch_loss
@@ -209,7 +212,7 @@ def train_and_evaluate(c: DictConfig):
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_logits_step_{step}.npy', data=train_logits.astype(jnp.float32))
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
+                    # utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
 
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
             ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
