@@ -17,14 +17,14 @@ class TransformerDecoder(nnx.Module):
         self.blocks = nnx.List(TransformerBlock(c, rngs) for _ in range(c.L))
         self.out_ln = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
         
-    def __call__(self, x): # [B, S]
+    def __call__(self, x, attention_mask: jax.Array | None = None): # [B, S]
 
         # token embedding
         h = self.token_embed_in(x) # [B, T, D]
 
         # transformer blocks
         for block in self.blocks:
-            h = block(h)
+            h = block(h, attention_mask=attention_mask)
 
         # project back to vocabulary
         h = self.out_ln(h)
@@ -39,8 +39,8 @@ class TransformerBlock(nnx.Module):
         self.attn = MultiHeadAttention(c, rngs)
         self.mlp = MLP(c, rngs)
         
-    def __call__(self, x): # [B, T, D]
-        x = x + self.attn(self.ln1(x)) # attention block
+    def __call__(self, x, attention_mask: jax.Array | None = None): # [B, T, D]
+        x = x + self.attn(self.ln1(x), attention_mask=attention_mask) # attention block
         return x + self.mlp(self.ln2(x)) # MLP block
 
 
@@ -55,9 +55,10 @@ class MultiHeadAttention(nnx.Module):
             warnings.warn('cannot use flash attention because `model.H` is not a multiple of 128.')
         c.use_flash_attn &= jax.devices()[0].platform == 'tpu'
         c.use_flash_attn &= (c.H % 128 == 0)
-        self.attention = partial(tpu_causal_flash_attention) if c.use_flash_attn else partial(jax.nn.dot_product_attention, is_causal=True)
+        self.attention = partial(tpu_causal_flash_attention) if c.use_flash_attn else partial(jax.nn.dot_product_attention, is_causal=False)
+        self.use_flash_attn = c.use_flash_attn
 
-    def __call__(self, x): # [B, T, D]
+    def __call__(self, x, attention_mask: jax.Array | None = None): # [B, T, D]
         B, T, D = x.shape
 
         # input projection
@@ -73,7 +74,29 @@ class MultiHeadAttention(nnx.Module):
         k = apply_rope(k, position[None])
 
         # attention
-        out = self.attention(q, k, v) # [B, T, N, H]
+        if self.use_flash_attn:
+            out = self.attention(q, k, v) # [B, T, N, H]
+        else:
+             # 1. Create causal mask (allows attending to past)
+            # Shape [1, 1, T, T]
+            causal_mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_)).reshape(1, 1, T, T)
+            
+            # 2. Create padding mask (if provided)
+            if attention_mask is not None:
+                # attention_mask is [B, T]. Reshape to [B, 1, 1, T] (for broadcasting)
+                # This mask is 1 (True) for real tokens and 0 (False) for padding
+                padding_mask = attention_mask.astype(jnp.bool_).reshape(B, 1, 1, T)
+                
+                # 3. Combine masks: Both must be True to attend.
+                # causal_mask broadcasts to [B, 1, T, T]
+                # padding_mask broadcasts to [B, 1, T, T]
+                # combined_mask shape [B, 1, T, T]
+                combined_mask = jnp.logical_and(causal_mask, padding_mask)
+            else:
+                combined_mask = causal_mask
+            
+            # The mask will be broadcast by dot_product_attention to [B, N, T, T]
+            out = self.attention(q, k, v, mask=combined_mask) # [B, T, N, H]
 
         # output projection followed by contraction back to original dims
         out = self.out_proj(out) # [B, T, D]

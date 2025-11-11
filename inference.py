@@ -16,21 +16,30 @@ import utils
 import data
 
 @partial(jax.jit, static_argnames=('model_graphdef',))
-def get_next_token_logits(model_state, model_graphdef, x):
+def get_next_token_logits(model_state, model_graphdef, x, attention_mask):
     """
     JIT-compiled function to get the logits for the next token.
     x is expected to be [B, T]
+    attention_mask is expected to be [B, T] (1 for real, 0 for pad)
     """
     model = nnx.merge(model_graphdef, model_state)
-    # Get logits from the model
-    logits = model(x) # [B, T, V]
+    # Get logits from the model, passing the mask
+    logits = model(x, attention_mask=attention_mask) # [B, T, V]
     # Return logits for the very last token in the sequence
     return logits[:, -1, :] # [B, V]
 
+
 def generate(model_state, model_graphdef, tokenizer, prompt, max_new_tokens, context_size):
     """
-    Generate text using greedy decoding.
+    Generate text using greedy decoding, creating and passing an attention mask.
     """
+    
+    # The GPT-2 tokenizer uses <|endoftext|> (50256) as its EOT token
+    # and also for padding.
+    pad_token_id = tokenizer.eot_token 
+    eot = tokenizer._special_tokens['<|endoftext|>'] 
+    print(f"Using pad token ID: {pad_token_id}")
+
     # Encode the prompt string into token IDs
     prompt_tokens = tokenizer.encode(prompt, allowed_special={"<|endoftext|>"})
     
@@ -44,29 +53,39 @@ def generate(model_state, model_graphdef, tokenizer, prompt, max_new_tokens, con
     for _ in range(max_new_tokens):
         # --- Context Handling ---
         # If the sequence is longer than the model's context size (T),
-        # crop it to the last T tokens. This is the context window.
+        # crop it to the last T tokens.
         if idx.shape[1] > context_size:
             idx_cond = idx[:, -context_size:]
+            # Create a mask that is all 1s (no padding)
+            attention_mask = jnp.ones_like(idx_cond, dtype=jnp.int32) # [1, T]
         else:
-            idx_cond = idx
+            # --- Padding ---
+            # If the sequence is shorter than T, pad it on the left.
+            idx_cond_unpadded = idx
+            pad_len = context_size - idx_cond_unpadded.shape[1]
             
-        # --- Padding ---
-        # If the sequence is shorter than T, pad it on the left.
-        # The model was trained with a fixed context length.
-        # We use a non-special token (e.g., 0) for padding, assuming 0 
-        # is not a critical token. A dedicated pad token would be better,
-        # but GPT-2's tokenizer (EOT 50256) doesn't have a standard one.
-        pad_len = context_size - idx_cond.shape[1]
-        if pad_len > 0:
-            # Using 0 as a padding token.
-            padding = jnp.zeros((1, pad_len), dtype=idx_cond.dtype)
-            idx_cond = jnp.concatenate([padding, idx_cond], axis=1)
+            # Pad sequence on the left with the pad token
+            padding = jnp.full((1, pad_len), pad_token_id, dtype=idx_cond_unpadded.dtype)
+            idx_cond = jnp.concatenate([padding, idx_cond_unpadded], axis=1)
+            
+            # --- Create Attention Mask ---
+            # Create mask: 0 for padding, 1 for real tokens
+            mask_padding = jnp.zeros((1, pad_len), dtype=jnp.int32)
+            mask_real = jnp.ones_like(idx_cond_unpadded, dtype=jnp.int32)
+            attention_mask = jnp.concatenate([mask_padding, mask_real], axis=1) # [1, T]
+
         
         # Ensure the input is exactly [1, T]
         assert idx_cond.shape == (1, context_size)
+        assert attention_mask.shape == (1, context_size)
             
-        # Get logits for the next token
-        logits = get_next_token_logits(model_state, model_graphdef, idx_cond) # [1, V]
+        # Get logits for the next token, passing the mask
+        logits = get_next_token_logits(
+            model_state, 
+            model_graphdef, 
+            idx_cond, 
+            attention_mask
+        ) # [1, V]
         
         # Greedy decoding: pick the token with the highest probability
         next_token = jnp.argmax(logits, axis=-1) # [1]
@@ -92,11 +111,16 @@ def generate(model_state, model_graphdef, tokenizer, prompt, max_new_tokens, con
         
     return generated_text
 
-
 @hydra.main(version_base=None, config_path='configs', config_name='base')
 def main(c: DictConfig):
     OmegaConf.resolve(c) # Resolve interpolations
     run_name = c.run_name if c.run_name else 'picodo_run'
+    
+    # For inference, force disable flash attention to use the
+    # manual causal + padding mask in jax.nn.dot_product_attention.
+    # The flash attention kernel is hard-coded for causal-only.
+    print("Forcing 'c.model.use_flash_attn = False' for inference to support padding masks.")
+    c.model.use_flash_attn = False
     
     print("--- Configuration ---")
     print(OmegaConf.to_yaml(c))
@@ -189,8 +213,8 @@ def main(c: DictConfig):
 
     # --- Generate ---
     # !-- Customize your prompt here --!
-    prompt = "Hello, my name is"
-    max_new_tokens = 100
+    prompt = "The capital of Spain is"
+    max_new_tokens = 30
     
     generated_text = generate(
         model_state, 
