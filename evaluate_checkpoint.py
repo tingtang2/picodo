@@ -42,6 +42,8 @@ def main(c: DictConfig):
     # model
     print('initializing model...')
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count()) # round V up to enable sharding
+    model = model_lib.create_sharded_model(c.model, key_model)
+    model_graphdef = nnx.graphdef(model)
 
     # get num. model parameters
     n_params = {
