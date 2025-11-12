@@ -42,7 +42,7 @@ def train_step(opt_state, opt_graphdef, model_graphdef, batch):
 def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     logits = model(x) # [B, T, V]
-    return logits.reshape(-1, logits.shape[-1]).mean(axis=0) # [V]
+    return logits.reshape(-1, logits.shape[-1]).mean(axis=0) # [B * T, V] -> [V]
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_mean_output_logit(model_state, model_graphdef, x): # [B, T]
