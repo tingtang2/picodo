@@ -238,9 +238,15 @@ def train_and_evaluate(c: DictConfig):
         sys.exit(1)
 
     # eval at end of training
-    eval_loss, eval_raw_loss = eval_step(opt_state.model, model_graphdef, ds_valid)
+    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(opt_state.model, model_graphdef, ds_valid)
+    metrics = {}
+    flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
+    metrics['eval_loss'] = eval_loss
+    metrics['eval_output_logit_mean'] = mean_eval_output_logit
+    metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
+    metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
     if jax.process_index() == 0:
-        wandb.log({'eval_loss': eval_loss})
+        wandb.log(metrics)
         wandb.finish()
         if c.diagnostics.save_raw_losses:
             if ckpt_dir:
