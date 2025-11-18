@@ -231,6 +231,8 @@ def train_and_evaluate(c: DictConfig):
             metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
             metrics['lr'] = lr_schedule(step)
             metrics.update(grad_norms)
+            metrics.update(utils.get_layer_weight_norms(opt_state.model))
+            metrics.update(utils.get_layer_moment_norms(opt_state))
 
             if jax.process_index() == 0:
                 wandb.log(metrics, step)

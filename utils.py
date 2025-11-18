@@ -33,19 +33,84 @@ def compute_lower_90th_percentile_mean(x):
     return top_90th.mean()
 
 
-def get_global_grad_norm(grads):
-    sq_sum = jax.tree_util.tree_reduce(lambda acc, g: acc + jnp.sum(g * g), grads, initializer=0.)
+def get_l2_norm(data):
+    sq_sum = jax.tree_util.tree_reduce(lambda acc, g: acc + jnp.sum(g * g), data, initializer=0.)
     return jnp.sqrt(sq_sum)
 
 def get_layer_grad_norms(grads):
     norms = {}
-    norms['global_grad_norm'] = get_global_grad_norm(grads)
+    norms['global_grad_norm'] = get_l2_norm(grads)
     
     for key, value in grads.items():
         if key == 'blocks':
             for i, block_grads in value.items():
-                norms[f'grad_norm/blocks.{i}'] = get_global_grad_norm(block_grads)
+                norms[f'grad_norm/blocks.{i}'] = get_l2_norm(block_grads)
         else:
-            norms[f'grad_norm/{key}'] = get_global_grad_norm(value)
+            norms[f'grad_norm/{key}'] = get_l2_norm(value)
             
     return norms
+
+def get_layer_weight_norms(params):
+    norms = {}
+    norms['weight_norm/global'] = get_l2_norm(params)
+    
+    for key, value in params.items():
+        if key == 'blocks':
+            for i, block_params in value.items():
+                norms[f'weight_norm/blocks.{i}'] = get_l2_norm(block_params)
+        else:
+            norms[f'weight_norm/{key}'] = get_l2_norm(value)
+            
+    return norms
+
+def get_layer_moment_norms(opt_state):
+    def find_adam_state(tree):
+        # Recursively search for a node containing 'mu' and 'nu'
+        if isinstance(tree, Mapping):
+            if 'mu' in tree and 'nu' in tree:
+                return tree
+            for v in tree.values():
+                found = find_adam_state(v)
+                if found: return found
+        elif hasattr(tree, 'mu') and hasattr(tree, 'nu'):
+            return tree
+        elif isinstance(tree, (list, tuple)):
+            for v in tree:
+                found = find_adam_state(v)
+                if found: return found
+        return None
+
+    adam_state = find_adam_state(opt_state)
+    if adam_state is None:
+        return {}
+
+    def get_component(state, key):
+        if isinstance(state, Mapping):
+            return state[key]
+        return getattr(state, key)
+
+    metrics = {}
+    
+    # Process First Moment (mu)
+    mu = get_component(adam_state, 'mu')
+    metrics['moment1_norm/global'] = get_l2_norm(mu)
+    if isinstance(mu, (Mapping, nnx.State)):
+        for key, value in mu.items():
+            if key == 'blocks':
+                for i, block_params in value.items():
+                    metrics[f'moment1_norm/blocks.{i}'] = get_l2_norm(block_params)
+            else:
+                metrics[f'moment1_norm/{key}'] = get_l2_norm(value)
+
+    # Process Second Moment (nu)
+    nu = get_component(adam_state, 'nu')
+    metrics['moment2_norm/global'] = get_l2_norm(nu)
+    if isinstance(nu, (Mapping, nnx.State)):
+        for key, value in nu.items():
+            if key == 'blocks':
+                for i, block_params in value.items():
+                    metrics[f'moment2_norm/blocks.{i}'] = get_l2_norm(block_params)
+            else:
+                metrics[f'moment2_norm/{key}'] = get_l2_norm(value)
+                
+    return metrics
