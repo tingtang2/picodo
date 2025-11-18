@@ -36,3 +36,16 @@ def compute_lower_90th_percentile_mean(x):
 def get_global_grad_norm(grads):
     sq_sum = jax.tree_util.tree_reduce(lambda acc, g: acc + jnp.sum(g * g), grads, initializer=0.)
     return jnp.sqrt(sq_sum)
+
+def get_layer_grad_norms(grads):
+    norms = {}
+    norms['global_grad_norm'] = get_global_grad_norm(grads)
+    
+    for key, value in grads.items():
+        if key == 'blocks':
+            for i, block_grads in value.items():
+                norms[f'grad_norm/blocks.{i}'] = get_global_grad_norm(block_grads)
+        else:
+            norms[f'grad_norm/{key}'] = get_global_grad_norm(value)
+            
+    return norms

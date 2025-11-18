@@ -51,7 +51,7 @@ def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss, utils.get_global_grad_norm(grads)
+    return opt_state, loss, raw_loss, utils.get_layer_grad_norms(grads)
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
@@ -62,7 +62,7 @@ def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss, utils.get_global_grad_norm(grads)
+    return opt_state, loss, raw_loss, utils.get_layer_grad_norms(grads)
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
@@ -210,9 +210,9 @@ def train_and_evaluate(c: DictConfig):
     for step in pbar:
         # training step
         if c.opt.use_z_loss:
-            opt_state, batch_loss, train_raw_loss, grad_norm = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            opt_state, batch_loss, train_raw_loss, grad_norms = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
         else:
-            opt_state, batch_loss, train_raw_loss, grad_norm = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            opt_state, batch_loss, train_raw_loss, grad_norms = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
         
         if c.diagnostics.save_raw_losses:
             train_logits = get_logits_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
@@ -230,7 +230,8 @@ def train_and_evaluate(c: DictConfig):
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
             metrics['lr'] = lr_schedule(step)
-            metrics['global_grad_norm'] = grad_norm
+            metrics.update(grad_norms)
+
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
                 pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')

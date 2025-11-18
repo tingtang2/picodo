@@ -7,3 +7,4 @@ jax-smi
 tqdm
 huggingface_hub
 matplotlib
+tiktoken
