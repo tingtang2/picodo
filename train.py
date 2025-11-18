@@ -27,10 +27,36 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     
     return losses.mean(), losses
 
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis=1)
+    logits = model(x) # [B, T, V]
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
+    losses = losses.at[:, -1].set(0)
+
+    z = jax.nn.logsumexp(logits[:, :-1].astype(jnp.float32), axis=-1)  
+
+    z_loss = (z**2).mean()
+    lam = 1e-4
+    
+    return losses.mean() + lam * z_loss, losses
+
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     # Use has_aux=True to get the raw losses
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    optimizer.update(grads)
+    opt_state = nnx.state(optimizer)
+    
+    return opt_state, loss, raw_loss, utils.get_global_grad_norm(grads)
+
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
+def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
+    # Use has_aux=True to get the raw losses
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(opt_state.model, model_graphdef, batch)
     
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
@@ -51,7 +77,7 @@ def get_mean_output_logit(model_state, model_graphdef, x): # [B, T]
     return logits.astype(jnp.float32).mean() 
 
 
-def eval_step(model_state, model_graphdef, dataset):
+def eval_step(c, model_state, model_graphdef, dataset):
     loss_sum = jnp.zeros([], dtype=jnp.float32)
     raw_losses = []
     total_logits = []
@@ -60,11 +86,15 @@ def eval_step(model_state, model_graphdef, dataset):
     
     for i in range(len(dataset)):
         batch = dataset[i]
-        batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
+        if c.opt.use_z_loss:
+            batch_loss, raw_loss = loss_fn_z_loss(model_state, model_graphdef, batch)
+        else:
+            batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
         logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
-        # total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
+        if c.diagnostics.save_raw_losses:
+            total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
 
     mean_loss = loss_sum / len(dataset)
     mean_output_logit = logit_mean_sum / len(dataset)
@@ -179,7 +209,11 @@ def train_and_evaluate(c: DictConfig):
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
         # training step
-        opt_state, batch_loss, train_raw_loss, grad_norm = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        if c.opt.use_z_loss:
+            opt_state, batch_loss, train_raw_loss, grad_norm = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        else:
+            opt_state, batch_loss, train_raw_loss, grad_norm = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        
         if c.diagnostics.save_raw_losses:
             train_logits = get_logits_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
 
@@ -204,7 +238,7 @@ def train_and_evaluate(c: DictConfig):
         
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
-            eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(opt_state.model, model_graphdef, ds_valid)
+            eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(c, opt_state.model, model_graphdef, ds_valid)
             flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
             metrics = {}
             metrics['eval_loss'] = eval_loss
@@ -238,7 +272,7 @@ def train_and_evaluate(c: DictConfig):
         sys.exit(1)
 
     # eval at end of training
-    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(opt_state.model, model_graphdef, ds_valid)
+    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(c, opt_state.model, model_graphdef, ds_valid)
     metrics = {}
     flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
     metrics['eval_loss'] = eval_loss
