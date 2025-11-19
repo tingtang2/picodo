@@ -71,6 +71,20 @@ def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
     return logits.reshape(-1, logits.shape[-1]).astype(jnp.float32).mean(axis=0) # [B * T, V] -> [V]
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
+def get_logit_gaps_by_lm_head(model_state, model_graphdef, x): # [B, T]
+    model = nnx.merge(model_graphdef, model_state)
+    logits = model(x).astype(jnp.float32)[:, :-1, :] # [B, T, V]
+    max_logits = jnp.max(logits, axis=-1, keepdims=True)
+    gaps = logits - max_logits
+
+    mean_gaps = jnp.mean(gaps, axis=(0, 1)) # [V]
+    y = jnp.roll(x, -1, axis=1)[:, :-1]
+    target_logits = jnp.take_along_axis(logits, y[..., None], axis=-1).squeeze(-1)
+    target_gaps = target_logits - max_logits.squeeze(-1) # [B, T]
+
+    return mean_gaps, target_gaps
+
+@partial(jax.jit, static_argnames=('model_graphdef'))
 def get_mean_output_logit(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     logits = model(x) # [B, T, V]
@@ -215,7 +229,7 @@ def train_and_evaluate(c: DictConfig):
             opt_state, batch_loss, train_raw_loss, grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
         
         if c.diagnostics.save_raw_losses:
-            train_logits = get_logits_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
+            train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
 
         # logging
         train_loss_sum += batch_loss
@@ -261,7 +275,8 @@ def train_and_evaluate(c: DictConfig):
                     # save diagnostic data
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_logits_step_{step}.npy', data=train_logits)
+                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_mean_logit_gaps_step_{step}.npy', data=train_logit_gaps)
+                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_target_logit_gaps_step_{step}.npy', data=train_target_gaps)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
 
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
