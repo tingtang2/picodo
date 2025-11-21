@@ -50,6 +50,29 @@ def get_layer_grad_norms(grads):
             
     return norms
 
+
+def get_layer_grad_norms_split(grads):
+    norms = {}
+    norms['grad_norm/global'] = float(get_l2_norm(grads))
+    def visit(path, node):
+        # Case 1: Param leaf
+        if hasattr(node, "value"):      # nnx.Param
+            norms[f"grad_norm/{path}"] = float(get_l2_norm(node.value))
+            return
+        # Case 2: State or dict-like object
+        if hasattr(node, "items"):      # nnx.State, nested dicts
+            for key, value in node.items():
+                key = str(key)
+                new_path = key if path == "" else f"{path}.{key}"
+                visit(new_path, value)
+            return
+        # Case 3: raw array leaf
+        if isinstance(node, (jnp.ndarray, np.ndarray)):
+            norms[f"grad_norm/{path}"] = float(get_l2_norm(node))
+            return
+    visit("", grads)
+    return norms
+
 def get_layer_weight_norms(params):
     norms = {}
     norms['weight_norm/global'] = get_l2_norm(params)
@@ -62,6 +85,7 @@ def get_layer_weight_norms(params):
             norms[f'weight_norm/{key}'] = get_l2_norm(value)
             
     return norms
+
 
 def get_layer_moment_norms(opt_state):
     def find_adam_state(tree):
