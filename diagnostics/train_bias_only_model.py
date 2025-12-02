@@ -1,22 +1,51 @@
-from ..train import train_step, eval_step, get_mean_output_logit
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from train import train_step, eval_step, get_mean_output_logit
+import utils
+import data
+import model as model_lib
+from configs import resolver_setup
+
 import jax
 import math
-from .. import utils, data
 from flax import nnx
 import optax
-from configs import resolver_setup
 from omegaconf import OmegaConf, DictConfig
 import hydra
-from .. import model as model_lib
-
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
-import os
 import jax.numpy as jnp
-
 from tqdm.auto import tqdm
 import wandb
 import sys
+
+
+class BiasOnlyModel(nnx.Module):
+    """
+    Wraps a base model and adds a learnable bias to the output logits.
+    The base model is frozen (stored as nnx.Variable instead of nnx.Param).
+    This is equivalent to adding a Linear layer with Weight=Identity and learnable Bias.
+    """
+    def __init__(self, base_graphdef, base_state, V):
+        self.base_graphdef = base_graphdef
+        # Store base_state as a Variable (not Param) so the optimizer ignores it
+        self.base_state = nnx.Variable(base_state)
+        # Initialize bias to zeros
+        self.bias = nnx.Param(jnp.zeros(V))
+
+    def __call__(self, x, attention_mask=None):
+        # Reconstruct the base model from graphdef and state
+        # self.base_state.value holds the dictionary of arrays (the State)
+        base_model = nnx.merge(self.base_graphdef, self.base_state.value)
+        
+        # Get logits from frozen base model
+        logits = base_model(x, attention_mask=attention_mask)
+        
+        # Add the learnable bias (equivalent to Linear(I) + b)
+        return logits + self.bias
 
 
 @hydra.main(version_base=None, config_path='../configs', config_name='base')
@@ -37,17 +66,16 @@ def main(c: DictConfig):
     jax.set_mesh(mesh)
     print('sharding mesh:', ', '.join(f'{k}={v}' for k, v in mesh.shape.items()))
 
-    # model
-    print('initializing model...')
+    # --- 1. Initialize Base Model ---
+    print('initializing base model...')
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count()) # round V up to enable sharding
-    model = model_lib.create_sharded_model(c.model, key_model)
-    model_graphdef = nnx.graphdef(model)
-
+    base_model = model_lib.create_sharded_model(c.model, key_model)
+    
     # get num. model parameters
     n_params = {
         'n_param_nonembed': 12 * c.model.L * c.model.D**2,
         'n_param_embed': c.model.D * c.model.V,
-        'n_param_actual': utils.get_num_model_params(model),
+        'n_param_actual': utils.get_num_model_params(base_model),
     }
     for k, v in n_params.items():
         print(f'{k}={v:_}')
@@ -58,7 +86,13 @@ def main(c: DictConfig):
     ds_train, ds_valid = data.load_ds(key_dataset, mesh, c.ds_path, c.model.T, c.opt.batch_size, c.num_tokens_valid, c.num_tokens_train)
     if (c.num_tokens_train is None): c.num_tokens_train = ds_train.size
 
-    # optimizer
+    # --- 2. Restore Base Model Checkpoint ---
+    # We need to construct the optimizer structure used during training to load the checkpoint
+    # (even though we won't use this optimizer for the new training)
+    print("Setting up structure to load base model checkpoint...")
+    
+    # Dummy optimizer def to match checkpoint structure
+    # We use a simple scheduler/optimizer just to get the structure right
     num_opt_steps = len(ds_train)
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
@@ -70,47 +104,85 @@ def main(c: DictConfig):
         tx = optax.chain(
             optax.clip_by_global_norm(clip_by_global_norm), tx)
     
-    optimizer = nnx.ModelAndOptimizer(model, tx)
-    opt_graphdef, opt_state = nnx.split(optimizer)
+    optimizer = nnx.ModelAndOptimizer(base_model, tx)
+    _ , opt_state = nnx.split(optimizer)
 
     # set up checkpointing
     start_step = 0
     ckpt_mngr = None
-    abstract_opt_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, opt_state)
+    base_abstract_opt_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, opt_state)
+
+    run_name = c.run_name if c.run_name else 'picodo_run'
+    ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
+    mngr_options = ocp.CheckpointManagerOptions(create=False)
+    ckpt_mngr = ocp.CheckpointManager(ckpt_dir, options=mngr_options)
+    
+    step_to_load = c.checkpoint.start_step if c.checkpoint.start_step is not None else ckpt_mngr.latest_step()
+    
+    if step_to_load is None:
+        raise ValueError(f"No checkpoint found in {ckpt_dir} to load base model from.")
+        
+    print(f"Restoring base model from step {step_to_load} in {ckpt_dir}...")
+    restored_data = ckpt_mngr.restore(step_to_load, args=ocp.args.Composite(state=ocp.args.StandardRestore(base_abstract_opt_state),
+            training_metadata=ocp.args.JsonRestore(),))
+    loaded_base_opt_state = restored_data['state']
+    # Extract the actual model state (parameters) from the optimizer state
+    base_model_state = loaded_base_opt_state.model
+    print("Base model loaded successfully.")
+    
+    # --- 3. Wrap in BiasOnlyModel ---
+    print("wrapping in BiasOnlyModel...")
+    # Get the graph definition of the base model
+    base_graphdef = nnx.graphdef(base_model)
+    
+    # Create the wrapped model
+    # base_model_state contains the trained weights. We pass c.model.V for the bias size.
+    model = BiasOnlyModel(base_graphdef, base_model_state, c.model.V)
+    model_graphdef = nnx.graphdef(model)
+
+    # --- 4. Setup New Optimizer ---
+    print("Setting up optimizer for bias training...")
+    num_opt_steps = len(ds_train)
+    warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
+    tokens_per_opt_step = c.opt.batch_size * c.model.T
+    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
+    tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
+    
+    clip_by_global_norm = c.opt.clip_by_global_norm
+    if clip_by_global_norm:
+        tx = optax.chain(optax.clip_by_global_norm(clip_by_global_norm), tx)
+    
+    # Create optimizer for the wrapped model.
+    # IMPORTANT: ModelAndOptimizer defaults to wrt=nnx.Param.
+    # Since base_model_state is stored as nnx.Variable in BiasOnlyModel, 
+    # the optimizer will ONLY see and update 'self.bias' (which is nnx.Param).
+    optimizer = nnx.ModelAndOptimizer(model, tx)
+    opt_graphdef, opt_state = nnx.split(optimizer)
+    
+    # --- 5. Setup New Checkpointing (Optional) ---
+    # We might want to save the bias-tuned model to a new directory
+    start_step = 0
+    new_ckpt_mngr = None
     if c.checkpoint.turn_on:
-        run_name = c.run_name if c.run_name else 'picodo_run'
-        ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
+        # Use a suffix or different run name for the bias tuning run
+        bias_run_name = f"{run_name}_bias_only"
+        new_ckpt_dir = os.path.join(c.checkpoint.workdir, bias_run_name)
         
         mngr_options = ocp.CheckpointManagerOptions(
             create=True,
             preservation_policy=preservation_policy.LatestN(c.checkpoint.max_to_keep)
         )
         
-        ckpt_mngr = ocp.CheckpointManager(
-            ckpt_dir,
-            options=mngr_options
-        )
-        
-        print(f'Checking for existing checkpoints in: {ckpt_dir}')
-        latest_step = c.checkpoint.start_step if c.checkpoint.start_step != None else ckpt_mngr.latest_step()
+        new_ckpt_mngr = ocp.CheckpointManager(new_ckpt_dir, options=mngr_options)
+        print(f"New checkpoints will be saved to: {new_ckpt_dir}")
 
-        if latest_step is not None:
-            print(f'Restoring checkpoint from step {latest_step} in {ckpt_dir}...')
-            
-            restored_data = ckpt_mngr.restore(latest_step, args=ocp.args.Composite(state=ocp.args.StandardRestore(abstract_opt_state),
-            training_metadata=ocp.args.JsonRestore(),))
-            opt_state = restored_data['state']
-            start_step = restored_data['training_metadata']['step']
-            print(f'Successfully restored checkpoint. Resuming from step {start_step}.')
-        else:
-            print('No checkpoint found. Starting from scratch.')
-
+    # Initialize model with optimizer state
     model = nnx.merge(model_graphdef, opt_state.model)
     
     # start wandb
     if jax.process_index() == 0:
-        wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode, name=c.run_name)
-        wandb.summary.update(n_params)
+        wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode, name=f"{run_name}_bias_only")
+        wandb.summary.update(n_params) # Logs original params, maybe should log bias count too
     
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
 
@@ -135,6 +207,7 @@ def main(c: DictConfig):
             metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
             metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+            # Note: opt_state.model here is the BiasOnlyModel state
             metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
             metrics['lr'] = lr_schedule(step)
             metrics.update(utils.get_layer_grad_norms(grads))
@@ -161,8 +234,8 @@ def main(c: DictConfig):
             
             # diagnostics
             if c.diagnostics.save_raw_losses:
-                if ckpt_dir:
-                    diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
+                if c.checkpoint.turn_on: # Save to new dir
+                    diagnostics_dir = os.path.join(new_ckpt_dir, 'top_loss_diagnostics')
                     os.makedirs(diagnostics_dir, exist_ok=True)
                     
                     # save diagnostic data
@@ -171,13 +244,15 @@ def main(c: DictConfig):
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
 
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
-            ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
+            # We save the state of the BiasOnlyModel (which includes the frozen base state and the learnable bias)
+            # This is safer than trying to save only the bias, as it keeps the checkpoint self-contained.
+            new_ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
                 'step': step + 1})), force=True)
     
     if num_opt_steps != len(ds_train):
         print('exiting early')
         wandb.finish()
-        ckpt_mngr.close()
+        if new_ckpt_mngr: new_ckpt_mngr.close()
         sys.exit(1)
 
 
