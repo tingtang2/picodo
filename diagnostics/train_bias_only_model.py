@@ -145,6 +145,7 @@ def main(c: DictConfig):
     
     if step_to_load is None:
         raise ValueError(f"No checkpoint found in {ckpt_dir} to load base model from.")
+    start_step = step_to_load
         
     print(f"Restoring base model from step {step_to_load} in {ckpt_dir}...")
     restored_data = ckpt_mngr.restore(step_to_load, args=ocp.args.Composite(state=ocp.args.StandardRestore(base_abstract_opt_state),
@@ -169,8 +170,14 @@ def main(c: DictConfig):
     num_opt_steps = len(ds_train)
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
-    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
-    tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
+    # We define the global schedule but wrap it to shift the input 'count' by 'step_to_load'
+    global_lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
+    
+    def shifted_lr_schedule(count):
+        # The optimizer starts counting at 0, so we add the checkpoint step to get the absolute step
+        return global_lr_schedule(count + step_to_load)
+
+    tx = optax.inject_hyperparams(optax.adamw)(shifted_lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
     
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:
@@ -185,11 +192,10 @@ def main(c: DictConfig):
     
     # --- 5. Setup New Checkpointing (Optional) ---
     # We might want to save the bias-tuned model to a new directory
-    start_step = 0
     new_ckpt_mngr = None
     if c.checkpoint.turn_on:
         # Use a suffix or different run name for the bias tuning run
-        bias_run_name = f"{run_name}_bias_only"
+        bias_run_name = f"{run_name}_bias_only_final"
         new_ckpt_dir = os.path.join(c.checkpoint.workdir, bias_run_name)
         
         mngr_options = ocp.CheckpointManagerOptions(
@@ -218,7 +224,6 @@ def main(c: DictConfig):
         opt_state, batch_loss, train_raw_loss, grads = custom_train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
-        train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
         metrics = {}
         metrics['train_loss'] = batch_loss
         metrics['train_med_loss'] = jnp.median(train_raw_loss)
