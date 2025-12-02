@@ -3,7 +3,7 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train import train_step, eval_step, get_mean_output_logit
+from train import eval_step, get_mean_output_logit, loss_fn
 import utils
 import data
 import model as model_lib
@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from tqdm.auto import tqdm
 import wandb
 import sys
+from functools import partial
 
 
 class BiasOnlyModel(nnx.Module):
@@ -37,9 +38,10 @@ class BiasOnlyModel(nnx.Module):
         self.bias = nnx.Param(jnp.zeros(V))
 
     def __call__(self, x, attention_mask=None):
-        # Reconstruct the base model from graphdef and state
-        # self.base_state.value holds the dictionary of arrays (the State)
-        base_model = nnx.merge(self.base_graphdef, self.base_state.value)
+        frozen_state = jax.lax.stop_gradient(self.base_state.value)
+        
+        # Reconstruct the base model from graphdef and frozen state
+        base_model = nnx.merge(self.base_graphdef, frozen_state)
         
         # Get logits from frozen base model
         logits = base_model(x, attention_mask=attention_mask)
@@ -47,6 +49,28 @@ class BiasOnlyModel(nnx.Module):
         # Add the learnable bias (equivalent to Linear(I) + b)
         return logits + self.bias
 
+
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
+def custom_train_step(opt_state, opt_graphdef, model_graphdef, batch):
+    """
+    Custom train step for BiasOnlyModel.
+    Handles the structural mismatch between full gradients and optimizer params.
+    """
+    # 1. Compute gradients w.r.t. EVERYTHING in opt_state.model (bias AND base_state)
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    
+    # 2. Filter Gradients
+    # The optimizer (created with wrt=nnx.Param) expects grads ONLY for Params ('bias').
+    # However, 'grads' contains keys for both 'bias' and 'base_state'.
+    # We manually construct a new State containing only the 'bias' gradient.
+    grads_filtered = nnx.State({'bias': grads['bias']})
+    
+    # 3. Update Optimizer
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    optimizer.update(grads_filtered)
+    opt_state = nnx.state(optimizer)
+    
+    return opt_state, loss, raw_loss, grads
 
 @hydra.main(version_base=None, config_path='../configs', config_name='base')
 def main(c: DictConfig):
@@ -184,8 +208,6 @@ def main(c: DictConfig):
         wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode, name=f"{run_name}_bias_only")
         wandb.summary.update(n_params) # Logs original params, maybe should log bias count too
     
-    train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
-
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
 
@@ -193,32 +215,26 @@ def main(c: DictConfig):
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
         # training step
-        opt_state, batch_loss, train_raw_loss, grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
-        
+        opt_state, batch_loss, train_raw_loss, grads = custom_train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
-        train_loss_sum += batch_loss
-        train_med_loss_sum += jnp.median(train_raw_loss)
         train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
-        train_loss_num += 1
-        if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
-            metrics = {}
-            metrics['train_loss'] = train_loss_sum / train_loss_num
-            metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
-            metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
-            metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-            # Note: opt_state.model here is the BiasOnlyModel state
-            metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
-            metrics['lr'] = lr_schedule(step)
-            metrics.update(utils.get_layer_grad_norms(grads))
-            metrics.update(utils.get_layer_weight_norms(opt_state.model))
-            metrics.update(utils.get_layer_moment_norms(opt_state))
+        metrics = {}
+        metrics['train_loss'] = batch_loss
+        metrics['train_med_loss'] = jnp.median(train_raw_loss)
+        metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
+        metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+        # Note: opt_state.model here is the BiasOnlyModel state
+        metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
+        metrics['lr'] = lr_schedule(step)
+        # metrics.update(utils.get_layer_grad_norms(grads))
+        # metrics.update(utils.get_layer_weight_norms(opt_state.model))
+        # metrics.update(utils.get_layer_moment_norms(opt_state))
 
-            if jax.process_index() == 0:
-                wandb.log(metrics, step)
-                pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
-            train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
-        
+        if jax.process_index() == 0:
+            wandb.log(metrics, step)
+            pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
+    
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
             eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(c, opt_state.model, model_graphdef, ds_valid)
@@ -232,17 +248,6 @@ def main(c: DictConfig):
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
             
-            # diagnostics
-            if c.diagnostics.save_raw_losses:
-                if c.checkpoint.turn_on: # Save to new dir
-                    diagnostics_dir = os.path.join(new_ckpt_dir, 'top_loss_diagnostics')
-                    os.makedirs(diagnostics_dir, exist_ok=True)
-                    
-                    # save diagnostic data
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
-
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
             # We save the state of the BiasOnlyModel (which includes the frozen base state and the learnable bias)
             # This is safer than trying to save only the bias, as it keeps the checkpoint self-contained.
