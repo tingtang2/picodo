@@ -195,7 +195,7 @@ def main(c: DictConfig):
     new_ckpt_mngr = None
     if c.checkpoint.turn_on:
         # Use a suffix or different run name for the bias tuning run
-        bias_run_name = f"{run_name}_bias_only_final"
+        bias_run_name = f"{run_name}_bias_only_{c.opt.peak_lr}"
         new_ckpt_dir = os.path.join(c.checkpoint.workdir, bias_run_name)
         
         mngr_options = ocp.CheckpointManagerOptions(
@@ -211,7 +211,7 @@ def main(c: DictConfig):
     
     # start wandb
     if jax.process_index() == 0:
-        wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode, name=f"{run_name}_bias_only")
+        wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode, name=f"{run_name}_bias_only_{c.opt.peak_lr}")
         wandb.summary.update(n_params) # Logs original params, maybe should log bias count too
     
     if c.diagnostics.end_step:

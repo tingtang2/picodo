@@ -15,6 +15,8 @@ import numpy as np
 import tiktoken
 import math
 
+import matplotlib.pyplot as plt
+
 # Import project modules
 import utils
 import model as model_lib
@@ -136,8 +138,8 @@ def main(c: DictConfig):
     try:
         enc = tiktoken.get_encoding("gpt2")
         
-        # Get indices of top 10 and bottom 10 biases
-        top_k = 20
+        # Get indices of top 20 and bottom 20 biases
+        top_k = 40
         sorted_indices = np.argsort(bias_np)
         bottom_indices = sorted_indices[:top_k]
         top_indices = sorted_indices[-top_k:][::-1] # Reverse to get highest first
@@ -163,6 +165,25 @@ def main(c: DictConfig):
             
     except Exception as e:
         print(f"\nCould not decode tokens (requires tiktoken): {e}")
+
+    # --- 7. Plot Histogram ---
+    print("\nPlotting histogram...")
+    try:
+        plt.figure(figsize=(10, 6))
+        # Use a reasonable number of bins (e.g., 100) to see distribution shape
+        plt.hist(bias_np, bins=100, color='skyblue', edgecolor='black', alpha=0.7)
+        plt.title(f"Histogram of Learned Bias Weights\nRun: {bias_run_name}")
+        plt.xlabel("Bias Weight Value")
+        plt.ylabel("Count")
+        plt.grid(axis='y', alpha=0.5)
+        
+        # Save to the checkpoint directory
+        output_path = os.path.join(ckpt_dir, 'bias_histogram.png')
+        plt.savefig(output_path)
+        plt.close()
+        print(f"Histogram saved to: {output_path}")
+    except Exception as e:
+        print(f"Error plotting histogram: {e}")
 
 if __name__ == '__main__':
     main()
