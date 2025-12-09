@@ -136,32 +136,37 @@ def get_layer_moment_norms(opt_state):
         return getattr(state, key)
 
     metrics = {}
+    # Helper to traverse the tree with a specific prefix
+    def log_tree(tree, prefix):
+        def visit(path, node):
+            # Case 1: Param leaf (nnx.Param or similar wrapper with .value)
+            if hasattr(node, "value"):      
+                metrics[f"{prefix}/{path}"] = float(get_l2_norm(node.value))
+                return
+            # Case 2: State or dict-like object (recurse)
+            if hasattr(node, "items"):      
+                for key, value in node.items():
+                    key = str(key)
+                    new_path = key if path == "" else f"{path}.{key}"
+                    visit(new_path, value)
+                return
+            # Case 3: raw array leaf
+            if isinstance(node, (jnp.ndarray, np.ndarray)):
+                metrics[f"{prefix}/{path}"] = float(get_l2_norm(node))
+                return
+        
+        visit("", tree)
     
     # Process First Moment (mu)
     mu = get_component(adam_state, 'mu')
-    metrics['moment1_norm/global'] = get_l2_norm(mu)
-    def visit(path, node):
-        # Case 1: Param leaf
-        if hasattr(node, "value"):      # nnx.Param
-            metrics[f"weight_norm/{path}"] = float(get_l2_norm(node.value))
-            return
-        # Case 2: State or dict-like object
-        if hasattr(node, "items"):      # nnx.State, nested dicts
-            for key, value in node.items():
-                key = str(key)
-                new_path = key if path == "" else f"{path}.{key}"
-                visit(new_path, value)
-            return
-        # Case 3: raw array leaf
-        if isinstance(node, (jnp.ndarray, np.ndarray)):
-            metrics[f"weight_norm/{path}"] = float(get_l2_norm(node))
-            return
-    visit("", mu)
+    metrics['moment1_norm/global'] = float(get_l2_norm(mu))
+    log_tree(mu, 'moment1_norm')
 
     # Process Second Moment (nu)
     nu = get_component(adam_state, 'nu')
-    metrics['moment2_norm/global'] = get_l2_norm(nu)
-    visit("", nu)
+    metrics['moment2_norm/global'] = float(get_l2_norm(nu))
+    log_tree(nu, 'moment2_norm')
+
     return metrics
 
 def compute_qkv_stats(qkv_dict):
