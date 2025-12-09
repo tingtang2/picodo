@@ -25,11 +25,6 @@ from functools import partial
 
 
 class BiasOnlyModel(nnx.Module):
-    """
-    Wraps a base model and adds a learnable bias to the output logits.
-    The base model is frozen (stored as nnx.Variable instead of nnx.Param).
-    This is equivalent to adding a Linear layer with Weight=Identity and learnable Bias.
-    """
     def __init__(self, base_graphdef, base_state, V):
         self.base_graphdef = base_graphdef
         # Store base_state as a Variable (not Param) so the optimizer ignores it
@@ -40,32 +35,19 @@ class BiasOnlyModel(nnx.Module):
     def __call__(self, x, attention_mask=None):
         frozen_state = jax.lax.stop_gradient(self.base_state.value)
         
-        # Reconstruct the base model from graphdef and frozen state
         base_model = nnx.merge(self.base_graphdef, frozen_state)
         
-        # Get logits from frozen base model
         logits = base_model(x, attention_mask=attention_mask)
         
-        # Add the learnable bias (equivalent to Linear(I) + b)
         return logits + self.bias
 
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def custom_train_step(opt_state, opt_graphdef, model_graphdef, batch):
-    """
-    Custom train step for BiasOnlyModel.
-    Handles the structural mismatch between full gradients and optimizer params.
-    """
-    # 1. Compute gradients w.r.t. EVERYTHING in opt_state.model (bias AND base_state)
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
     
-    # 2. Filter Gradients
-    # The optimizer (created with wrt=nnx.Param) expects grads ONLY for Params ('bias').
-    # However, 'grads' contains keys for both 'bias' and 'base_state'.
-    # We manually construct a new State containing only the 'bias' gradient.
     grads_filtered = nnx.State({'bias': grads['bias']})
     
-    # 3. Update Optimizer
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads_filtered)
     opt_state = nnx.state(optimizer)
@@ -110,13 +92,8 @@ def main(c: DictConfig):
     ds_train, ds_valid = data.load_ds(key_dataset, mesh, c.ds_path, c.model.T, c.opt.batch_size, c.num_tokens_valid, c.num_tokens_train)
     if (c.num_tokens_train is None): c.num_tokens_train = ds_train.size
 
-    # --- 2. Restore Base Model Checkpoint ---
-    # We need to construct the optimizer structure used during training to load the checkpoint
-    # (even though we won't use this optimizer for the new training)
     print("Setting up structure to load base model checkpoint...")
     
-    # Dummy optimizer def to match checkpoint structure
-    # We use a simple scheduler/optimizer just to get the structure right
     num_opt_steps = len(ds_train)
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
@@ -155,17 +132,13 @@ def main(c: DictConfig):
     base_model_state = loaded_base_opt_state.model
     print("Base model loaded successfully.")
     
-    # --- 3. Wrap in BiasOnlyModel ---
     print("wrapping in BiasOnlyModel...")
     # Get the graph definition of the base model
     base_graphdef = nnx.graphdef(base_model)
     
-    # Create the wrapped model
-    # base_model_state contains the trained weights. We pass c.model.V for the bias size.
     model = BiasOnlyModel(base_graphdef, base_model_state, c.model.V)
     model_graphdef = nnx.graphdef(model)
 
-    # --- 4. Setup New Optimizer ---
     print("Setting up optimizer for bias training...")
     num_opt_steps = len(ds_train)
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
@@ -183,15 +156,9 @@ def main(c: DictConfig):
     if clip_by_global_norm:
         tx = optax.chain(optax.clip_by_global_norm(clip_by_global_norm), tx)
     
-    # Create optimizer for the wrapped model.
-    # IMPORTANT: ModelAndOptimizer defaults to wrt=nnx.Param.
-    # Since base_model_state is stored as nnx.Variable in BiasOnlyModel, 
-    # the optimizer will ONLY see and update 'self.bias' (which is nnx.Param).
     optimizer = nnx.ModelAndOptimizer(model, tx)
     opt_graphdef, opt_state = nnx.split(optimizer)
     
-    # --- 5. Setup New Checkpointing (Optional) ---
-    # We might want to save the bias-tuned model to a new directory
     new_ckpt_mngr = None
     if c.checkpoint.turn_on:
         # Use a suffix or different run name for the bias tuning run

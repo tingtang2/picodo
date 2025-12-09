@@ -1,0 +1,143 @@
+--- Configuration ---
+seed: 0
+ds_path: ~/datasets/fineweb_gpt2.bin
+tokens_params_ratio: 20
+num_tokens_train: null
+log_every_tokens: 1000000
+eval_every_steps: 100
+num_tokens_valid: 20000000
+wandb_project: picodo-loss-spikes
+wandb_mode: disabled
+run_name: null
+num_tp_devices: 1
+model:
+  D: 768
+  L: 12
+  H: 128
+  F: 3072
+  'N': 6
+  T: 1024
+  V: 50257
+  activ_dtype: bfloat16
+  use_flash_attn: true
+  use_qk_norm: true
+opt:
+  batch_size: 256
+  peak_lr: 0.01
+  warmup_frac: 0.05
+  b1: 0.9
+  b2: 0.95
+  weight_decay: 0.0001
+  clip_by_global_norm: 1.0
+  use_z_loss: false
+checkpoint:
+  turn_on: true
+  workdir: /home/tingchen/loss-spikes-project/picodo_workdir/wortsman_default_1_5e-1_lr
+  checkpoint_every_steps: 2000
+  max_to_keep: 100
+  start_step: null
+diagnostics:
+  end_step: null
+  save_raw_losses: false
+
+Model V rounded to: 50260
+Initializing base model structure...
+Initializing BiasOnlyModel structure...
+Setting up optimizer structure...
+Looking for checkpoints in: /home/tingchen/loss-spikes-project/picodo_workdir/wortsman_default_1_5e-1_lr/picodo_run_bias_only_final
+Restoring from step 1500...
+
+=== Bias Weights Inspection ===
+Shape: (50260,)
+Mean:   2.308470
+Std:    6.507344
+Min:    -19.513376
+Max:    21.412334
+L2 Norm: 1547.941650
+
+--- Top 40 Tokens (Highest Bias / Most Encouraged) ---
+Token ID 262   | Bias: 21.4123 | ' the'
+Token ID 60    | Bias: 20.8964 | ']'
+Token ID 1312  | Bias: 20.6355 | ' i'
+Token ID 685   | Bias: 20.5798 | ' ['
+Token ID 2123  | Bias: 20.5237 | ' et'
+Token ID 497   | Bias: 20.0473 | ' ne'
+Token ID 6181  | Bias: 19.9895 | ' evil'
+Token ID 449   | Bias: 19.9595 | ' J'
+Token ID 705   | Bias: 19.9241 | " '"
+Token ID 1395  | Bias: 19.7593 | ' X'
+Token ID 309   | Bias: 19.7458 | ' T'
+Token ID 285   | Bias: 19.7342 | ' m'
+Token ID 12088 | Bias: 19.6901 | ' Tel'
+Token ID 474   | Bias: 19.6761 | ' j'
+Token ID 399   | Bias: 19.6595 | ' N'
+Token ID 256   | Bias: 19.3647 | ' t'
+Token ID 337   | Bias: 19.2083 | ' M'
+Token ID 383   | Bias: 19.1603 | ' The'
+Token ID 509   | Bias: 19.1396 | ' K'
+Token ID 575   | Bias: 19.0954 | ' Y'
+Token ID 479   | Bias: 19.0810 | ' k'
+Token ID 360   | Bias: 19.0685 | ' D'
+Token ID 5231  | Bias: 19.0487 | ' Aut'
+Token ID 8756  | Bias: 19.0288 | ' alien'
+Token ID 7507  | Bias: 18.9819 | ' Pen'
+Token ID 257   | Bias: 18.9019 | ' a'
+Token ID 3738  | Bias: 18.8553 | ' Ant'
+Token ID 367   | Bias: 18.8377 | ' H'
+Token ID 311   | Bias: 18.8243 | ' S'
+Token ID 299   | Bias: 18.7881 | ' n'
+Token ID 440   | Bias: 18.7783 | ' O'
+Token ID 9576  | Bias: 18.7488 | ' Very'
+Token ID 435   | Bias: 18.7465 | ' al'
+Token ID 1190  | Bias: 18.7061 | ' cle'
+Token ID 502   | Bias: 18.6918 | ' me'
+Token ID 350   | Bias: 18.5491 | ' P'
+Token ID 7852  | Bias: 18.5355 | ' CL'
+Token ID 220   | Bias: 18.5287 | ' '
+Token ID 14770 | Bias: 18.5112 | ' Kl'
+Token ID 13549 | Bias: 18.5032 | ' Horn'
+
+--- Bottom 40 Tokens (Lowest Bias / Most Suppressed) ---
+Token ID 40564 | Bias: -19.5134 | 'inoa'
+Token ID 40818 | Bias: -19.3954 | 'ALTH'
+Token ID 47471 | Bias: -19.2748 | 'ATURES'
+Token ID 21075 | Bias: -18.9904 | 'intendent'
+Token ID 13842 | Bias: -18.7795 | 'idays'
+Token ID 31292 | Bias: -18.6625 | 'ocese'
+Token ID 44318 | Bias: -18.4180 | '1007'
+Token ID 46640 | Bias: -18.2690 | 'DAQ'
+Token ID 49094 | Bias: -18.2257 | 'PLIED'
+Token ID 46134 | Bias: -18.0537 | 'ominium'
+Token ID 35728 | Bias: -17.8366 | 'ploma'
+Token ID 25200 | Bias: -17.7291 | 'bial'
+Token ID 41308 | Bias: -17.6831 | ' Gaal'
+Token ID 44034 | Bias: -17.6666 | 'avement'
+Token ID 44913 | Bias: -17.6610 | 'ptroller'
+Token ID 46025 | Bias: -17.6565 | 'GROUND'
+Token ID 44014 | Bias: -17.6182 | ' nonprofits'
+Token ID 47597 | Bias: -17.5953 | 'flake'
+Token ID 32907 | Bias: -17.5013 | ' Orioles'
+Token ID 28410 | Bias: -17.4825 | 'HUD'
+Token ID 36367 | Bias: -17.3714 | ' tbsp'
+Token ID 41924 | Bias: -17.3648 | 'STON'
+Token ID 46880 | Bias: -17.3448 | 'emouth'
+Token ID 19364 | Bias: -17.3316 | 'nsic'
+Token ID 8538  | Bias: -17.3190 | 'oenix'
+Token ID 48607 | Bias: -17.2706 | ' Bezos'
+Token ID 42335 | Bias: -17.1886 | 'ravings'
+Token ID 18826 | Bias: -17.1748 | 'abases'
+Token ID 27956 | Bias: -17.1039 | '1016'
+Token ID 33978 | Bias: -17.0601 | ' Nuggets'
+Token ID 32360 | Bias: -17.0411 | 'negie'
+Token ID 18532 | Bias: -17.0257 | ' MLB'
+Token ID 49406 | Bias: -16.9999 | 'perors'
+Token ID 42184 | Bias: -16.9908 | 'Romney'
+Token ID 18000 | Bias: -16.9828 | 'VERTIS'
+Token ID 41283 | Bias: -16.9469 | 'PROV'
+Token ID 29457 | Bias: -16.9188 | 'izons'
+Token ID 48933 | Bias: -16.9094 | 'POSE'
+Token ID 34764 | Bias: -16.8995 | ' WARRANT'
+Token ID 46505 | Bias: -16.8072 | 'kson'
+
+Plotting histogram...
+Histogram saved to: /home/tingchen/loss-spikes-project/picodo_workdir/wortsman_default_1_5e-1_lr/picodo_run_bias_only_final/bias_histogram.png
