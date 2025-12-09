@@ -86,6 +86,28 @@ def get_layer_weight_norms(params):
             
     return norms
 
+def get_layer_weight_norms_split(params):
+    norms = {}
+    norms['weight_norm/global'] = float(get_l2_norm(params))
+    def visit(path, node):
+        # Case 1: Param leaf
+        if hasattr(node, "value"):      # nnx.Param
+            norms[f"weight_norm/{path}"] = float(get_l2_norm(node.value))
+            return
+        # Case 2: State or dict-like object
+        if hasattr(node, "items"):      # nnx.State, nested dicts
+            for key, value in node.items():
+                key = str(key)
+                new_path = key if path == "" else f"{path}.{key}"
+                visit(new_path, value)
+            return
+        # Case 3: raw array leaf
+        if isinstance(node, (jnp.ndarray, np.ndarray)):
+            norms[f"weight_norm/{path}"] = float(get_l2_norm(node))
+            return
+    visit("", params)
+    return norms
+
 
 def get_layer_moment_norms(opt_state):
     def find_adam_state(tree):
@@ -118,23 +140,41 @@ def get_layer_moment_norms(opt_state):
     # Process First Moment (mu)
     mu = get_component(adam_state, 'mu')
     metrics['moment1_norm/global'] = get_l2_norm(mu)
-    if isinstance(mu, (Mapping, nnx.State)):
-        for key, value in mu.items():
-            if key == 'blocks':
-                for i, block_params in value.items():
-                    metrics[f'moment1_norm/blocks.{i}'] = get_l2_norm(block_params)
-            else:
-                metrics[f'moment1_norm/{key}'] = get_l2_norm(value)
+    def visit(path, node):
+        # Case 1: Param leaf
+        if hasattr(node, "value"):      # nnx.Param
+            metrics[f"weight_norm/{path}"] = float(get_l2_norm(node.value))
+            return
+        # Case 2: State or dict-like object
+        if hasattr(node, "items"):      # nnx.State, nested dicts
+            for key, value in node.items():
+                key = str(key)
+                new_path = key if path == "" else f"{path}.{key}"
+                visit(new_path, value)
+            return
+        # Case 3: raw array leaf
+        if isinstance(node, (jnp.ndarray, np.ndarray)):
+            metrics[f"weight_norm/{path}"] = float(get_l2_norm(node))
+            return
+    visit("", mu)
 
     # Process Second Moment (nu)
     nu = get_component(adam_state, 'nu')
     metrics['moment2_norm/global'] = get_l2_norm(nu)
-    if isinstance(nu, (Mapping, nnx.State)):
-        for key, value in nu.items():
-            if key == 'blocks':
-                for i, block_params in value.items():
-                    metrics[f'moment2_norm/blocks.{i}'] = get_l2_norm(block_params)
-            else:
-                metrics[f'moment2_norm/{key}'] = get_l2_norm(value)
-                
+    visit("", nu)
     return metrics
+
+def compute_qkv_stats(qkv_dict):
+    stats = {}
+    for i, (q, k, v) in qkv_dict.items():
+        # Using simple mean/std here. Could add min/max/norm if needed.
+        stats[f'q/layer_{i}/mean'] = q.mean()
+        stats[f'k/layer_{i}/mean'] = k.mean()
+        stats[f'v/layer_{i}/mean'] = v.mean()
+        stats[f'q/layer_{i}/std'] = q.std()
+        stats[f'k/layer_{i}/std'] = k.std()
+        stats[f'v/layer_{i}/std'] = v.std()
+        stats[f'q/layer_{i}/max'] = q.max()
+        stats[f'k/layer_{i}/max'] = k.max()
+        stats[f'v/layer_{i}/max'] = v.max()
+    return stats

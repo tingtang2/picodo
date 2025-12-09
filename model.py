@@ -17,18 +17,27 @@ class TransformerDecoder(nnx.Module):
         self.blocks = nnx.List(TransformerBlock(c, rngs) for _ in range(c.L))
         self.out_ln = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
         
-    def __call__(self, x, attention_mask: jax.Array | None = None): # [B, S]
+    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, S]
 
+        qkv_outputs = {}
         # token embedding
         h = self.token_embed_in(x) # [B, T, D]
 
         # transformer blocks
-        for block in self.blocks:
-            h = block(h, attention_mask=attention_mask)
+        for i, block in enumerate(self.blocks):
+            if return_qkv:
+                h, qkv = block(h, attention_mask=attention_mask, return_qkv=True)
+                qkv_outputs[i] = qkv
+            else:
+                h = block(h, attention_mask=attention_mask)
 
         # project back to vocabulary
         h = self.out_ln(h)
         logits = self.token_embed_out.attend(h) # [B, T, V]
+
+        if return_qkv:
+            return logits, qkv_outputs
+
         return logits
 
 
@@ -39,8 +48,16 @@ class TransformerBlock(nnx.Module):
         self.attn = MultiHeadAttention(c, rngs)
         self.mlp = MLP(c, rngs)
         
-    def __call__(self, x, attention_mask: jax.Array | None = None): # [B, T, D]
-        x = x + self.attn(self.ln1(x), attention_mask=attention_mask) # attention block
+    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, T, D]
+        if return_qkv:
+            attn_out, qkv = self.attn(self.ln1(x), attention_mask=attention_mask, return_qkv=True)
+            x = x + attn_out
+        else:
+            x = x + self.attn(self.ln1(x), attention_mask=attention_mask)
+        
+        if return_qkv:
+            return x, qkv
+
         return x + self.mlp(self.ln2(x)) # MLP block
 
 
@@ -58,7 +75,7 @@ class MultiHeadAttention(nnx.Module):
         self.attention = partial(tpu_causal_flash_attention) if c.use_flash_attn else partial(jax.nn.dot_product_attention, is_causal=False)
         self.use_flash_attn = c.use_flash_attn
 
-    def __call__(self, x, attention_mask: jax.Array | None = None): # [B, T, D]
+    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, T, D]
         B, T, D = x.shape
 
         # input projection
@@ -100,6 +117,8 @@ class MultiHeadAttention(nnx.Module):
 
         # output projection followed by contraction back to original dims
         out = self.out_proj(out) # [B, T, D]
+        if return_qkv:
+            return out, (q, k, v)
         return out
 
 

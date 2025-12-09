@@ -21,17 +21,20 @@ import sys
 def loss_fn(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
-    logits = model(x) # [B, T, V]
+    logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
     losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
     losses = losses.at[:, -1].set(0)
+
+    qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
+    qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
     
-    return losses.mean(), losses
+    return losses.mean(), (losses, qkv_stats)
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
-    logits = model(x) # [B, T, V]
+    logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
     losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
     losses = losses.at[:, -1].set(0)
 
@@ -39,8 +42,11 @@ def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
 
     z_loss = (z**2).mean()
     lam = 1e-4
+
+    qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
+    qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
     
-    return losses.mean() + lam * z_loss, losses
+    return losses.mean() + lam * z_loss, (losses, qkv_stats)
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step(opt_state, opt_graphdef, model_graphdef, batch):
@@ -101,9 +107,9 @@ def eval_step(c, model_state, model_graphdef, dataset):
     for i in range(len(dataset)):
         batch = dataset[i]
         if c.opt.use_z_loss:
-            batch_loss, raw_loss = loss_fn_z_loss(model_state, model_graphdef, batch)
+            batch_loss, (raw_loss, _) = loss_fn_z_loss(model_state, model_graphdef, batch)
         else:
-            batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
+            batch_loss, (raw_loss, _) = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
         logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
@@ -224,9 +230,9 @@ def train_and_evaluate(c: DictConfig):
     for step in pbar:
         # training step
         if c.opt.use_z_loss:
-            opt_state, batch_loss, train_raw_loss, grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
         else:
-            opt_state, batch_loss, train_raw_loss, grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
         
         if c.diagnostics.save_raw_losses:
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
@@ -245,8 +251,11 @@ def train_and_evaluate(c: DictConfig):
             metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
             metrics['lr'] = lr_schedule(step)
             metrics.update(utils.get_layer_grad_norms_split(grads))
-            metrics.update(utils.get_layer_weight_norms(opt_state.model))
+            metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
             metrics.update(utils.get_layer_moment_norms(opt_state))
+            
+            # Add QKV stats to metrics
+            metrics.update(qkv_stats)
 
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
