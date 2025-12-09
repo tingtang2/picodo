@@ -55,10 +55,12 @@ class TransformerBlock(nnx.Module):
         else:
             x = x + self.attn(self.ln1(x), attention_mask=attention_mask)
         
+        x = x + self.mlp(self.ln2(x)) # MLP block
+
         if return_qkv:
             return x, qkv
 
-        return x + self.mlp(self.ln2(x)) # MLP block
+        return x
 
 
 class MultiHeadAttention(nnx.Module):
@@ -80,6 +82,8 @@ class MultiHeadAttention(nnx.Module):
 
         # input projection
         q, k, v = self.qkv_proj(x) # [B, T, N, H]
+        if return_qkv:
+            raw_qkv = (q, k, v)
 
         # qk-norm
         q = self.query_norm(q)
@@ -118,7 +122,7 @@ class MultiHeadAttention(nnx.Module):
         # output projection followed by contraction back to original dims
         out = self.out_proj(out) # [B, T, D]
         if return_qkv:
-            return out, (q, k, v)
+            return out, raw_qkv
         return out
 
 
