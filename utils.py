@@ -182,4 +182,7 @@ def compute_qkv_stats(qkv_dict):
         stats[f'q/layer_{i}/max'] = q.max()
         stats[f'k/layer_{i}/max'] = k.max()
         stats[f'v/layer_{i}/max'] = v.max()
+        stats[f'q/layer_{i}/fro_norm'] = get_l2_norm(q)
+        stats[f'k/layer_{i}/fro_norm'] = get_l2_norm(k)
+        stats[f'v/layer_{i}/fro_norm'] = get_l2_norm(v)
     return stats
