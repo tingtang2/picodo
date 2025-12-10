@@ -8,13 +8,14 @@ from jax.experimental.shard_map import shard_map
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel, splash_attention_mask
 from omegaconf.dictconfig import DictConfig
 from rope import apply_rope
+from omegaconf import ListConfig
 
 
 class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
         self.token_embed_in = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
         self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
-        self.blocks = nnx.List(TransformerBlock(c, rngs) for _ in range(c.L))
+        self.blocks = nnx.List(TransformerBlock(c, rngs, layer_idx=i) for i in range(c.L))
         self.out_ln = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
         
     def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, S]
@@ -42,10 +43,18 @@ class TransformerDecoder(nnx.Module):
 
 
 class TransformerBlock(nnx.Module):
-    def __init__(self, c: DictConfig, rngs: nnx.Rngs):
+    def __init__(self, c: DictConfig, rngs: nnx.Rngs, layer_idx: int):
         self.ln1 = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
         self.ln2 = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
-        self.attn = MultiHeadAttention(c, rngs)
+        
+        qk_config = c.use_qk_norm
+        
+        if isinstance(qk_config, (list, tuple, ListConfig)):
+            use_qk_norm = layer_idx in qk_config
+        else:
+            use_qk_norm = bool(qk_config)
+        
+        self.attn = MultiHeadAttention(c, rngs, use_qk_norm=use_qk_norm)
         self.mlp = MLP(c, rngs)
         
     def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, T, D]
@@ -65,11 +74,15 @@ class TransformerBlock(nnx.Module):
 
 class MultiHeadAttention(nnx.Module):
     """Causal attention layer."""
-    def __init__(self, c: DictConfig, rngs: nnx.Rngs):
+    def __init__(self, c: DictConfig, rngs: nnx.Rngs, use_qk_norm: bool = None):
         self.qkv_proj = nnx.Einsum('BTd,SNdH->SBTNH', (3, c.N, c.D, c.H), dtype=c.activ_dtype, rngs=rngs)
         self.out_proj = nnx.Einsum('BTnh,nhD->BTD', (c.N, c.H, c.D), dtype=c.activ_dtype, rngs=rngs)
-        self.query_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs) if c.use_qk_norm else nnx.identity
-        self.key_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs) if c.use_qk_norm else nnx.identity
+        
+        if use_qk_norm is None:
+            use_qk_norm = c.use_qk_norm
+        
+        self.query_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
+        self.key_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
         if c.use_flash_attn and jax.devices()[0].platform == 'tpu' and (c.H % 128 != 0):
             warnings.warn('cannot use flash attention because `model.H` is not a multiple of 128.')
         c.use_flash_attn &= jax.devices()[0].platform == 'tpu'
