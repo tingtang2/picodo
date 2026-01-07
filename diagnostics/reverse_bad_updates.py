@@ -207,7 +207,7 @@ def main(c: DictConfig):
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
 
-            if float(eval_loss) > 12.0 and last_opt_state is not None:
+            if float(eval_loss) > 10.0 and last_opt_state is not None:
                 opt_state = jax.tree_util.tree_map(jax.device_put, last_opt_state)
                 if jax.process_index() == 0:
                     print(f"Reversed optimizer update at step {step} due to high eval loss: {float(eval_loss):.2f}")
