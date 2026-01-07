@@ -3,7 +3,7 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train import eval_step, get_mean_output_logit, loss_fn
+from train import get_mean_output_logit, get_logit_gaps_by_lm_head, loss_fn_z_loss, get_logits_by_lm_head
 import utils
 import data
 import model as model_lib
@@ -23,6 +23,39 @@ import wandb
 import sys
 from functools import partial
 
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def loss_fn(model_state, model_graphdef, x): # [B, T]
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis=1)
+    logits = model(x) # [B, T, V]
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
+    losses = losses.at[:, -1].set(0)
+    
+    return losses.mean(), losses
+
+def eval_step(c, model_state, model_graphdef, dataset):
+    loss_sum = jnp.zeros([], dtype=jnp.float32)
+    raw_losses = []
+    total_logits = []
+    logit_mean_sum = jnp.zeros([], dtype=jnp.float32)
+
+    
+    for i in range(len(dataset)):
+        batch = dataset[i]
+        if c.opt.use_z_loss:
+            batch_loss, raw_loss = loss_fn_z_loss(model_state, model_graphdef, batch)
+        else:
+            batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
+        loss_sum += batch_loss
+        raw_losses.append(raw_loss)
+        logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
+        if c.diagnostics.save_raw_losses:
+            total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
+
+    mean_loss = loss_sum / len(dataset)
+    mean_output_logit = logit_mean_sum / len(dataset)
+    
+    return mean_loss, raw_losses, total_logits, mean_output_logit
 
 class BiasOnlyModel(nnx.Module):
     def __init__(self, base_graphdef, base_state, V):
@@ -223,8 +256,9 @@ def main(c: DictConfig):
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
             # We save the state of the BiasOnlyModel (which includes the frozen base state and the learnable bias)
             # This is safer than trying to save only the bias, as it keeps the checkpoint self-contained.
-            new_ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
-                'step': step + 1})), force=True)
+            # new_ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
+            #     'step': step + 1})), force=True)
+            pass
     
     if num_opt_steps != len(ds_train):
         print('exiting early')
