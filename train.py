@@ -49,24 +49,40 @@ def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
     return losses.mean() + lam * z_loss, (losses, qkv_stats)
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
-def train_step(opt_state, opt_graphdef, model_graphdef, batch):
+def train_step(opt_state, opt_graphdef, model_graphdef, batch, skip_bad_batch):
     # Use has_aux=True to get the raw losses
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
-    
-    optimizer = nnx.merge(opt_graphdef, opt_state)
-    optimizer.update(grads)
-    opt_state = nnx.state(optimizer)
-    
+
+    def do_update(state):
+        optimizer = nnx.merge(opt_graphdef, state)
+        optimizer.update(grads)
+        return nnx.state(optimizer)
+
+    opt_state = jax.lax.cond(
+        jnp.logical_and(skip_bad_batch, loss > 12.0),
+        lambda state: state,
+        do_update,
+        operand=opt_state,
+    )
+
     return opt_state, loss, raw_loss, grads
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
-def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
+def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch, skip_bad_batch):
     # Use has_aux=True to get the raw losses
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(opt_state.model, model_graphdef, batch)
     
-    optimizer = nnx.merge(opt_graphdef, opt_state)
-    optimizer.update(grads)
-    opt_state = nnx.state(optimizer)
+    def do_update(state):
+        optimizer = nnx.merge(opt_graphdef, state)
+        optimizer.update(grads)
+        return nnx.state(optimizer)
+
+    opt_state = jax.lax.cond(
+        jnp.logical_and(skip_bad_batch, loss > 12.0),
+        lambda state: state,
+        do_update,
+        operand=opt_state,
+    )
     
     return opt_state, loss, raw_loss, grads
 
@@ -230,9 +246,9 @@ def train_and_evaluate(c: DictConfig):
     for step in pbar:
         # training step
         if c.opt.use_z_loss:
-            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step], c.opt.skip_bad_batch)
         else:
-            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step], c.opt.skip_bad_batch)
         
         if c.diagnostics.save_raw_losses:
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, ds_train[step])

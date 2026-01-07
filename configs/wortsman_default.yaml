@@ -25,7 +25,8 @@ model:
   V: null # vocab size -> must match dataset tokenizer!
   activ_dtype: 'bfloat16'
   use_flash_attn: true
-  use_qk_norm: [0, 5, 10]
+  use_qk_norm: true
+  # use_qk_norm: [0, 1, 2, 3, 4, 9, 10, 11]
   
 opt:
   batch_size: 256
@@ -36,6 +37,7 @@ opt:
   weight_decay: 1e-4
   clip_by_global_norm: 1.0
   use_z_loss: false
+  skip_bad_batch: false
 
 checkpoint:
   turn_on: true
