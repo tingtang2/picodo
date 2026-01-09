@@ -37,7 +37,6 @@ opt:
   weight_decay: 1e-4
   clip_by_global_norm: 1.0
   use_z_loss: false
-  skip_bad_batch: false
 
 checkpoint:
   turn_on: true
