@@ -2,7 +2,7 @@
 fire 
 hydra-core 
 wandb 
-jax[tpu] 
+jax[tpu]==0.8.1
 flax==0.12.0
 jax-smi
 tqdm
