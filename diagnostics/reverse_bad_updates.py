@@ -166,6 +166,7 @@ def main(c: DictConfig):
         # logging
         metrics = {}
         metrics['train_loss'] = batch_loss
+        metrics['train_loss_after_update'] = loss_fn_light(opt_state.model, model_graphdef, ds_train[step])[0]
         metrics['train_med_loss'] = jnp.median(train_raw_loss)
         metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
         metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
