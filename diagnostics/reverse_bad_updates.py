@@ -192,7 +192,7 @@ def main(c: DictConfig):
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
 
-            if float(eval_loss) > 10.0 and last_opt_state is not None:
+            if float(eval_loss) > 10.0 and last_opt_state is not None and c.skip_bad_batch:
                 opt_state = jax.tree_util.tree_map(
                     lambda arr, ref: jax.device_put(arr, ref.sharding) if hasattr(ref, "sharding") else jax.device_put(arr),
                     last_opt_state,
