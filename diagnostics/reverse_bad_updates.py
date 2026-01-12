@@ -162,7 +162,13 @@ def main(c: DictConfig):
     last_train_losses = deque(maxlen=3)
     for step in pbar:
         # training step
-        last_opt_states.append(jax.tree_util.tree_map(np.asarray, jax.device_get(opt_state)))  # keep snapshot on host (CPU) to save HBM
+        snapshot_state = jax.tree_util.tree_map(np.asarray, jax.device_get(opt_state))  # keep snapshot on host (CPU) to save HBM
+        # avoid duplicate snapshots
+        if (len(last_opt_states) == 0) or (not jax.tree_util.tree_reduce(
+                lambda a, b: a and b,
+                jax.tree_util.tree_map(lambda x, y: np.array_equal(x, y), snapshot_state, last_opt_states[-1]),
+                True)):
+            last_opt_states.append(snapshot_state)
         opt_state, batch_loss, train_raw_loss, grads = custom_train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
@@ -174,7 +180,7 @@ def main(c: DictConfig):
         metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
         metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
         metrics['lr'] = lr_schedule(step)
-        if len(last_opt_states) > 0:
+        if len(last_opt_states) > len(last_train_losses):
             last_train_losses.append(float(metrics['train_loss_after_update']))
         # metrics.update(utils.get_layer_grad_norms(grads))
         # metrics.update(utils.get_layer_weight_norms(opt_state.model))
@@ -191,7 +197,7 @@ def main(c: DictConfig):
         ):
             # pick the lowest-loss snapshot among the buffered ones
             # best_idx = int(np.argmin(np.array(last_train_losses)))
-            best_idx = -1
+            best_idx = -2
             rollback_state = list(last_opt_states)[best_idx]
             opt_state = jax.tree_util.tree_map(
                 lambda arr, ref: jax.device_put(arr, ref.sharding) if hasattr(ref, "sharding") else jax.device_put(arr),
