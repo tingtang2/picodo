@@ -18,6 +18,7 @@ import hydra
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
 import jax.numpy as jnp
+import numpy as np
 from tqdm.auto import tqdm
 import wandb
 import sys
@@ -98,7 +99,7 @@ def main(c: DictConfig):
             optax.clip_by_global_norm(clip_by_global_norm), tx)
     
     optimizer = nnx.ModelAndOptimizer(base_model, tx)
-    _ , opt_state = nnx.split(optimizer)
+    opt_graphdef , opt_state = nnx.split(optimizer)
 
     # set up checkpointing
     start_step = 0
@@ -129,22 +130,6 @@ def main(c: DictConfig):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     
-    # We define the global schedule but wrap it to shift the input 'count' by 'step_to_load'
-    global_lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
-    
-    def shifted_lr_schedule(count):
-        # The optimizer starts counting at 0, so we add the checkpoint step to get the absolute step
-        return global_lr_schedule(count + step_to_load)
-
-    tx = optax.inject_hyperparams(optax.adamw)(shifted_lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
-    
-    clip_by_global_norm = c.opt.clip_by_global_norm
-    if clip_by_global_norm:
-        tx = optax.chain(optax.clip_by_global_norm(clip_by_global_norm), tx)
-    
-    optimizer = nnx.ModelAndOptimizer(model, tx)
-    opt_graphdef, _ = nnx.split(optimizer)  # keep restored opt_state to stay consistent with checkpoint
-
     new_ckpt_mngr = None
     if c.checkpoint.turn_on:
         # Use a suffix or different run name for the bias tuning run
@@ -175,7 +160,7 @@ def main(c: DictConfig):
     last_opt_state = None
     for step in pbar:
         # training step
-        last_opt_state = jax.tree_util.tree_map(jax.device_get, opt_state)  # keep snapshot on host to save device memory
+        last_opt_state = jax.tree_util.tree_map(np.asarray, jax.device_get(opt_state))  # keep snapshot on host (CPU) to save HBM
         opt_state, batch_loss, train_raw_loss, grads = custom_train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
@@ -185,7 +170,7 @@ def main(c: DictConfig):
         metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
         metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
         metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
-        metrics['lr'] = shifted_lr_schedule(step - start_step)
+        metrics['lr'] = lr_schedule(step)
         # metrics.update(utils.get_layer_grad_norms(grads))
         # metrics.update(utils.get_layer_weight_norms(opt_state.model))
         # metrics.update(utils.get_layer_moment_norms(opt_state))
@@ -208,7 +193,11 @@ def main(c: DictConfig):
                 wandb.log(metrics, step)
 
             if float(eval_loss) > 10.0 and last_opt_state is not None:
-                opt_state = jax.tree_util.tree_map(jax.device_put, last_opt_state)
+                opt_state = jax.tree_util.tree_map(
+                    lambda arr, ref: jax.device_put(arr, ref.sharding) if hasattr(ref, "sharding") else jax.device_put(arr),
+                    last_opt_state,
+                    opt_state,
+                )
                 if jax.process_index() == 0:
                     print(f"Reversed optimizer update at step {step} due to high eval loss: {float(eval_loss):.2f}")
             
