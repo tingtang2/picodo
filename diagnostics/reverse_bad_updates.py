@@ -23,6 +23,7 @@ from tqdm.auto import tqdm
 import wandb
 import sys
 from functools import partial
+from collections import deque
 
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
@@ -157,10 +158,11 @@ def main(c: DictConfig):
 
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
-    last_opt_state = None
+    last_opt_states = deque(maxlen=3)
+    last_train_losses = deque(maxlen=3)
     for step in pbar:
         # training step
-        last_opt_state = jax.tree_util.tree_map(np.asarray, jax.device_get(opt_state))  # keep snapshot on host (CPU) to save HBM
+        last_opt_states.append(jax.tree_util.tree_map(np.asarray, jax.device_get(opt_state)))  # keep snapshot on host (CPU) to save HBM
         opt_state, batch_loss, train_raw_loss, grads = custom_train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
 
         # logging
@@ -172,6 +174,8 @@ def main(c: DictConfig):
         metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
         metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
         metrics['lr'] = lr_schedule(step)
+        if len(last_opt_states) > 0:
+            last_train_losses.append(float(metrics['train_loss_after_update']))
         # metrics.update(utils.get_layer_grad_norms(grads))
         # metrics.update(utils.get_layer_weight_norms(opt_state.model))
         # metrics.update(utils.get_layer_moment_norms(opt_state))
@@ -180,6 +184,24 @@ def main(c: DictConfig):
             wandb.log(metrics, step)
             pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
     
+        if (
+            (metrics['train_loss_after_update'] - metrics['train_loss']) / (metrics['train_loss'] + 1e-6) > 0.5
+            and len(last_opt_states) > 0
+            and c.skip_bad_batch
+        ):
+            # pick the lowest-loss snapshot among the buffered ones
+            # best_idx = int(np.argmin(np.array(last_train_losses)))
+            best_idx = 0
+            rollback_state = list(last_opt_states)[best_idx]
+            opt_state = jax.tree_util.tree_map(
+                lambda arr, ref: jax.device_put(arr, ref.sharding) if hasattr(ref, "sharding") else jax.device_put(arr),
+                rollback_state,
+                opt_state,
+            )
+            if jax.process_index() == 0:
+                pct_jump = 100.0 * (float(metrics['train_loss_after_update'] - metrics['train_loss']) / (float(metrics['train_loss']) + 1e-6))
+                print(f"Reversed optimizer update at step {step} due to train loss jump of {pct_jump:.1f}%")
+            
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
             eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(c, opt_state.model, model_graphdef, ds_valid)
@@ -193,15 +215,6 @@ def main(c: DictConfig):
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
 
-            if float(eval_loss) > 10.0 and last_opt_state is not None and c.skip_bad_batch:
-                opt_state = jax.tree_util.tree_map(
-                    lambda arr, ref: jax.device_put(arr, ref.sharding) if hasattr(ref, "sharding") else jax.device_put(arr),
-                    last_opt_state,
-                    opt_state,
-                )
-                if jax.process_index() == 0:
-                    print(f"Reversed optimizer update at step {step} due to high eval loss: {float(eval_loss):.2f}")
-            
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
             new_ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
                 'step': step + 1})), force=True)
