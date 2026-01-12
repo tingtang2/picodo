@@ -191,7 +191,7 @@ def main(c: DictConfig):
         ):
             # pick the lowest-loss snapshot among the buffered ones
             # best_idx = int(np.argmin(np.array(last_train_losses)))
-            best_idx = 0
+            best_idx = -1
             rollback_state = list(last_opt_states)[best_idx]
             opt_state = jax.tree_util.tree_map(
                 lambda arr, ref: jax.device_put(arr, ref.sharding) if hasattr(ref, "sharding") else jax.device_put(arr),
