@@ -26,20 +26,21 @@ def get_next_token_logits(model_state, model_graphdef, x, attention_mask):
     # Get logits from the model, passing the mask
     logits = model(x, attention_mask=attention_mask) # [B, T, V]
     # Return logits for the very last token in the sequence
-    return logits[:, -1, :] # [B, V]
+    return logits[:, -1, :].astype(jnp.float32) # [B, V]
 
 
-def teacher_force_sequence(model_state, model_graphdef, tokenizer, sequence, top_k, context_size):
+def teacher_force_sequence(model_state, model_graphdef, tokenizer, sequence, top_k, context_size, diagnostics_dir, step_to_load):
     """
     Teacher-force a sequence through the model and print the top-K logits for
     the next token at each decoding step.
     """
     pad_token_id = tokenizer.eot_token
-    seq = jnp.array(sequence, dtype=jnp.int32)
-    seq_len = seq.shape[0]
+    seq = jnp.array(sequence, dtype=jnp.int32)[20:]
+    # seq_len = seq.shape[0]
+    seq_len = 20
     print(f"Teacher forcing first validation sequence of length {seq_len} with top_k={top_k}.")
 
-    printable_prefix = tokenizer.decode(seq[:min(40, seq_len)].tolist())
+    printable_prefix = tokenizer.decode(seq[:min(100, seq_len)].tolist())
     print(f"Prefix preview: {printable_prefix!r}")
 
     for step in range(seq_len - 1):
@@ -60,6 +61,7 @@ def teacher_force_sequence(model_state, model_graphdef, tokenizer, sequence, top
             attention_mask = jnp.concatenate([mask_padding, mask_real], axis=1)
 
         logits = get_next_token_logits(model_state, model_graphdef, idx_cond, attention_mask)  # [1, V]
+        utils.save_to_numpy(save_dir=diagnostics_dir, name=f'logits_step_{step}_teacher_force_checkpoint_{step_to_load}.npy', data=logits)
         capped_top_k = max(1, min(int(top_k), logits.shape[-1]))
         values, indices = jax.lax.top_k(logits[0], k=capped_top_k)
 
@@ -167,6 +169,8 @@ def main(c: DictConfig):
     print("Checkpoint restored successfully.")
     ckpt_mngr.close()
     
+    diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
+    os.makedirs(diagnostics_dir, exist_ok=True)                     
     # Extract the model state from the optimizer state
     model_state = opt_state.model
 
@@ -176,7 +180,7 @@ def main(c: DictConfig):
 
     # --- Teacher forcing on first validation example ---
     print("Fetching first validation batch and sequence...")
-    first_val_batch = jax.device_get(ds_valid[0]) # [batch_size, T]
+    first_val_batch = jax.device_get(ds_valid[1]) # [batch_size, T]
     first_sequence = first_val_batch[0] # [T]
 
     teacher_force_sequence(
@@ -186,6 +190,8 @@ def main(c: DictConfig):
         sequence=first_sequence,
         top_k=c.teacher_force_top_k,
         context_size=c.model.T,
+        diagnostics_dir=diagnostics_dir,
+        step_to_load=step_to_load
     )
 
 
