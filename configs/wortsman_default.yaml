@@ -14,6 +14,7 @@ wandb_project: 'picodo-loss-spikes'
 wandb_mode: 'disabled'
 run_name: null
 num_tp_devices: 1 # optional tensor parallelism
+log_logit_grad_stats: false
 
 model:
   D: null # model/embed/qkv dim

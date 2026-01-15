@@ -96,6 +96,26 @@ def get_mean_output_logit(model_state, model_graphdef, x): # [B, T]
     logits = model(x) # [B, T, V]
     return logits.astype(jnp.float32).mean() 
 
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis=1)
+    logits = model(x) # [B, T, V]
+
+    def loss_from_logits(l):
+        losses = optax.softmax_cross_entropy_with_integer_labels(l.astype(jnp.float32), y)
+        losses = losses.at[:, -1].set(0)
+        return losses.mean()
+
+    grad_logits = jax.grad(loss_from_logits)(logits) # dL/dz
+    grad_sum = grad_logits.sum(axis=-1)[:, :-1] # [B, T-1]
+
+    return {
+        'logit_grad_sum_mean_abs': jnp.mean(jnp.abs(grad_sum)),
+        'logit_grad_sum_max_abs': jnp.max(jnp.abs(grad_sum)),
+        'logit_grad_sum_mean': jnp.mean(grad_sum),
+    }
+
 
 def eval_step(c, model_state, model_graphdef, dataset):
     loss_sum = jnp.zeros([], dtype=jnp.float32)
@@ -228,6 +248,8 @@ def train_and_evaluate(c: DictConfig):
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
+        if c.log_logit_grad_stats:
+            logit_grad_stats = get_logit_grad_sum_stats(opt_state.model, model_graphdef, ds_train[step])
         # training step
         if c.opt.use_z_loss:
             opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
@@ -253,6 +275,8 @@ def train_and_evaluate(c: DictConfig):
             metrics.update(utils.get_layer_grad_norms_split(grads))
             metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
             metrics.update(utils.get_layer_moment_norms(opt_state))
+            if c.log_logit_grad_stats:
+                metrics.update(logit_grad_stats)
             
             # Add QKV stats to metrics
             metrics.update(qkv_stats)
