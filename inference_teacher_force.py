@@ -144,7 +144,7 @@ def main(c: DictConfig):
     num_opt_steps = len(ds_train)
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
-    tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, weight_decay=c.opt.weight_decay)
+    tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, eps=c.opt.eps, weight_decay=c.opt.weight_decay)
     if c.opt.clip_by_global_norm:
         tx = optax.chain(optax.clip_by_global_norm(c.opt.clip_by_global_norm), tx)
     optimizer = nnx.ModelAndOptimizer(model, tx)
