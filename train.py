@@ -100,10 +100,10 @@ def get_mean_output_logit(model_state, model_graphdef, x): # [B, T]
 def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
-    logits = model(x) # [B, T, V]
+    logits = model(x).astype(jnp.float32) # [B, T, V]
 
     def loss_from_logits(l):
-        losses = optax.softmax_cross_entropy_with_integer_labels(l.astype(jnp.float32), y)
+        losses = optax.softmax_cross_entropy_with_integer_labels(l, y)
         losses = losses.at[:, -1].set(0)
         return losses.mean()
 
