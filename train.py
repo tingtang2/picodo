@@ -15,8 +15,43 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy
 import os
 import sys
 
+def compute_logit_distribution_stats(logits_bf16):
+    # logits_fp32: [B, T-1, V]
+    flat = logits_bf16.reshape(-1, logits_bf16.shape[-1])  # [N, V]
 
+    stats = {
+        # scale / imbalance
+        "logit_mean": jnp.mean(flat),
+        "logit_std": jnp.std(flat),
+        "logit_rms": jnp.sqrt(jnp.mean(flat ** 2)),
+        "logit_max": jnp.max(flat),
+        "logit_min": jnp.min(flat),
+        # shape (imbalance proxy)
+        "logit_abs_mean": jnp.mean(jnp.abs(flat)),
+        "logit_abs_max": jnp.max(jnp.abs(flat)),
+    }
 
+    # Optional but VERY good
+    probs = jax.nn.softmax(flat, axis=-1)
+    entropy = -jnp.sum(probs * jnp.log(probs + 1e-9), axis=-1)
+    stats["softmax_entropy_mean"] = jnp.mean(entropy)
+
+	'''
+    # Precision diagnostics
+    if logits_bf16 is not None:
+        diff = logits_fp32 - logits_bf16.astype(jnp.float32)
+        stats.update({
+            "bf16_abs_err_mean": jnp.mean(jnp.abs(diff)),
+            "bf16_abs_err_max": jnp.max(jnp.abs(diff)),
+            "bf16_rel_err_rms": jnp.sqrt(
+                jnp.mean((diff / (jnp.abs(logits_fp32) + 1e-6)) ** 2)
+            ),
+        })
+	'''
+
+    return stats
+
+'''
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def loss_fn(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
@@ -33,6 +68,34 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
     
     return losses.mean(), (losses, qkv_stats)
+'''
+
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def loss_fn(model_state, model_graphdef, x):
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis=1)
+
+    logits_bf16, qkv_dict = model(x, return_qkv=True)
+    logits_fp32 = logits_bf16.astype(jnp.float32)
+
+    losses = optax.softmax_cross_entropy_with_integer_labels(
+        logits_fp32, y
+    )
+    losses = losses.at[:, -1].set(0)
+
+    # Drop last token
+    #logits_fp32 = logits_fp32[:, :-1, :]
+    logits_bf16 = logits_bf16[:, :-1, :]
+
+    logit_stats = compute_logit_distribution_stats(
+        #logits_fp32,
+        logits_bf16
+    )
+
+    qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
+    qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
+
+    return losses.mean(), (losses, qkv_stats, logit_stats)
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
@@ -129,24 +192,46 @@ def eval_step(c, model_state, model_graphdef, dataset):
     total_logits = []
     logit_mean_sum = jnp.zeros([], dtype=jnp.float32)
 
-    
+   	logit_stats_sum = None
     for i in range(len(dataset)):
         batch = dataset[i]
         if c.opt.use_z_loss:
             batch_loss, (raw_loss, _) = loss_fn_z_loss(model_state, model_graphdef, batch)
         else:
-            batch_loss, (raw_loss, _) = loss_fn(model_state, model_graphdef, batch)
+			#TODO changed this 
+            batch_loss, (raw_loss, _, logit_stats) = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
         logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
+
+		#TODO addedd this	
+		if logit_stats is not None:
+			if logit_stats_sum is None:
+				logit_stats_sum = logit_stats
+			else:
+				logit_stats_sum = jax.tree.map(
+					lambda a, b: a + b,
+					logit_stats_sum,
+					logit_stats,
+				)
+
+
         if c.diagnostics.save_raw_losses:
             total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
 
     mean_loss = loss_sum / len(dataset)
     mean_output_logit = logit_mean_sum / len(dataset)
-    
-    return mean_loss, raw_losses, total_logits, mean_output_logit
 
+
+	mean_logit_stats = None
+	if logit_stats_sum is not None:
+		logit_stats_sum = logit_stats_sum / len(dataset)
+		#mean_logit_stats = jax.tree.map(
+		#	lambda x: x / len(dataset),
+		#	logit_stats_sum,
+		#)
+
+    return mean_loss, raw_losses, total_logits, mean_output_logit, mean_logit_stats
 
 
 def train_and_evaluate(c: DictConfig):
@@ -297,7 +382,7 @@ def train_and_evaluate(c: DictConfig):
         
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
-            eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(c, opt_state.model, model_graphdef, ds_valid)
+            eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit, eval_logit_stats = eval_step(c, opt_state.model, model_graphdef, ds_valid)
             flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
             metrics = {}
             metrics['eval_loss'] = eval_loss
@@ -332,13 +417,18 @@ def train_and_evaluate(c: DictConfig):
         sys.exit(1)
 
     # eval at end of training
-    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(c, opt_state.model, model_graphdef, ds_valid)
+    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit, eval_logit_stats = eval_step(c, opt_state.model, model_graphdef, ds_valid)
     metrics = {}
     flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
     metrics['eval_loss'] = eval_loss
     metrics['eval_output_logit_mean'] = mean_eval_output_logit
     metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
     metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
+
+	if eval_logit_stats is not None:
+		for k, v in eval_logit_stats.items():
+			metrics[f"eval/{k}"] = v
+
     if jax.process_index() == 0:
         wandb.log(metrics)
         wandb.finish()
