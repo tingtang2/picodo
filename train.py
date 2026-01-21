@@ -258,6 +258,9 @@ def train_and_evaluate(c: DictConfig):
             opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
         else:
             opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+        if jax.process_index() == 0:
+            min_train_loss = float(jax.device_get(jnp.min(train_raw_loss)))
+            assert min_train_loss >= 0.0, f"negative train loss: {min_train_loss}"
         
         if c.diagnostics.save_raw_losses:
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
