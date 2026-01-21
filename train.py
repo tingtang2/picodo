@@ -22,7 +22,8 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
     logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
-    losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
+    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses.at[:, -1].set(0)
 
     qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
@@ -35,7 +36,8 @@ def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
     logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
-    losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y) # [B, T]
+    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses.at[:, -1].set(0)
 
     z = jax.nn.logsumexp(logits[:, :-1].astype(jnp.float32), axis=-1)  
@@ -103,7 +105,8 @@ def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
     logits = model(x).astype(jnp.float32) # [B, T, V]
 
     def loss_from_logits(l):
-        losses = optax.softmax_cross_entropy_with_integer_labels(l, y)
+        log_probs = jax.nn.log_softmax(l, axis=-1)
+        losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
         losses = losses.at[:, -1].set(0)
         return losses.mean()
 
