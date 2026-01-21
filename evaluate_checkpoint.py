@@ -13,7 +13,25 @@ import data
 import model as model_lib
 import utils
 import train 
+from functools import partial
 import json
+
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def loss_fn_light(model_state, model_graphdef, x):
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis=1)
+    logits = model(x).astype(jnp.float32)
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+    losses = losses.at[:, -1].set(0)
+    
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    manual_losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
+    manual_losses = manual_losses.at[:, -1].set(0)
+    
+    label_logits = jnp.take_along_axis(logits, y[..., None], axis=-1).squeeze(-1)
+    manual_optax_like = jax.nn.logsumexp(logits, axis=-1) - label_logits
+    manual_optax_like = manual_optax_like.at[:, -1].set(0)
+    return losses.mean(), losses, manual_losses, manual_losses - losses, manual_optax_like, manual_optax_like - losses
 
 @hydra.main(version_base=None, config_path='configs', config_name='base')
 def main(c: DictConfig):
@@ -101,8 +119,84 @@ def main(c: DictConfig):
     
     print('sim training step')
     metrics = {}
+    
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
-    opt_state, batch_loss, train_raw_loss, grad_norm = train.train_step(opt_state, opt_graphdef, model_graphdef, ds_train[start_step])
+    # opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train.train_step(opt_state, opt_graphdef, model_graphdef, ds_train[start_step])
+    batch_loss, train_raw_loss, manual_raw_loss, manual_diff, manual_optax_like, manual_optax_like_diff = loss_fn_light(
+        opt_state.model, model_graphdef, ds_train[start_step]
+    )
+    train_raw_loss_flat = jnp.ravel(train_raw_loss)
+    train_raw_loss_sorted = jnp.sort(train_raw_loss_flat)
+    print("train_raw_loss top5 low:", train_raw_loss_sorted[:5])
+    print("train_raw_loss top5 high:", train_raw_loss_sorted[-5:][::-1])
+    print("train module:", train.__file__)
+    neg_mask = train_raw_loss_flat < 0
+    neg_count = jnp.sum(neg_mask)
+    print("train_raw_loss min:", train_raw_loss_flat.min(), "neg_count:", neg_count, "dtype:", train_raw_loss_flat.dtype)
+    manual_flat = jnp.ravel(manual_raw_loss)
+    print(
+        "manual_raw_loss min:",
+        manual_flat.min(),
+        "neg_count:",
+        jnp.sum(manual_flat < 0),
+        "diff_min:",
+        manual_diff.min(),
+        "diff_max:",
+        manual_diff.max(),
+        "diff_abs_max:",
+        jnp.max(jnp.abs(manual_diff)),
+    )
+    manual_optax_like_flat = jnp.ravel(manual_optax_like)
+    print(
+        "manual_optax_like min:",
+        manual_optax_like_flat.min(),
+        "neg_count:",
+        jnp.sum(manual_optax_like_flat < 0),
+        "diff_min:",
+        manual_optax_like_diff.min(),
+        "diff_max:",
+        manual_optax_like_diff.max(),
+        "diff_abs_max:",
+        jnp.max(jnp.abs(manual_optax_like_diff)),
+    )
+    if neg_count > 0:
+        neg_idx = jnp.argmax(neg_mask)
+        b = int(jax.device_get(neg_idx // train_raw_loss.shape[1]))
+        t = int(jax.device_get(neg_idx % train_raw_loss.shape[1]))
+        print("first negative idx:", b, t, "value:", train_raw_loss[b, t])
+        batch = ds_train[start_step]
+        y_full = jnp.roll(batch, -1, axis=1)
+        max_token = jnp.max(y_full)
+        oob_mask = y_full >= c.model.V
+        oob_count = jnp.sum(oob_mask)
+        print("max_token:", max_token, "vocab_size:", c.model.V, "oob_count:", oob_count)
+        batch_ex = batch[b:b + 4]
+        model = nnx.merge(model_graphdef, opt_state.model)
+        logits_ex = model(batch_ex)
+        y_ex = jnp.roll(batch_ex, -1, axis=1)
+        log_probs_ex = jax.nn.log_softmax(logits_ex.astype(jnp.float32), axis=-1)
+        manual = -log_probs_ex[0, t, y_ex[0, t]]
+        print("manual ce:", manual, "is_last_token:", t == batch.shape[1] - 1)
+        print("logits nan:", jnp.any(jnp.isnan(logits_ex)), "inf:", jnp.any(jnp.isinf(logits_ex)))
+        try:
+            import torch
+            logits_ex_np = jax.device_get(logits_ex.astype(jnp.float32))
+            y_ex_np = jax.device_get(y_ex)
+            logits_t = torch.tensor(logits_ex_np)
+            y_t = torch.tensor(y_ex_np, dtype=torch.long)
+            ce_flat = torch.nn.functional.cross_entropy(
+                logits_t.view(-1, logits_t.shape[-1]),
+                y_t.view(-1),
+                reduction="none",
+            )
+            ce_t = ce_flat.view(y_t.shape)
+            print("torch ce:", float(ce_t[0, t]), "is_last_token:", t == y_t.shape[1] - 1)
+        except Exception as e:
+            print("torch ce skipped:", e)
+    
+    # diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
+    # os.makedirs(diagnostics_dir, exist_ok=True)
+    # utils.save_to_numpy(diagnostics_dir, f'train_data_{start_step}', ds_train[start_step])
     mean_output_logit = train.get_mean_output_logit(opt_state.model, model_graphdef, ds_train[start_step]).astype(jnp.float32)
     print(mean_output_logit)
     
@@ -119,11 +213,10 @@ def main(c: DictConfig):
     metrics['train_mean_output_logit'] = mean_output_logit
     print(start_step)
     metrics['lr'] = lr_schedule(start_step)
-    metrics['global_grad_norm'] = grad_norm
     
     # Run Evaluation
     print("Running evaluation on validation set...")
-    eval_loss, eval_raw_loss, _ = train.eval_step(opt_state.model, model_graphdef, ds_valid)
+    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = train.eval_step(c, opt_state.model, model_graphdef, ds_valid)
     eval_raw_loss_flat = jnp.concatenate(eval_raw_loss, axis=0)
     
 
@@ -132,6 +225,7 @@ def main(c: DictConfig):
         "eval_loss": eval_loss,
         "eval_med_loss": jnp.median(eval_raw_loss_flat),
         "eval_lower_90th_mean_loss": utils.compute_lower_90th_percentile_mean(eval_raw_loss_flat),
+        'eval_output_logit_mean': mean_eval_output_logit
     })
     
 
@@ -140,19 +234,19 @@ def main(c: DictConfig):
         print(f"{k}: {v:.6f}")
     print("---------------")
     
-    # Save metrics to a JSON file
-    print(f"Saving metrics to {metrics_dir}...")
-    # Convert JAX/Numpy arrays to standard Python types for JSON serialization
-    serializable_metrics = {k: v.item() if hasattr(v, 'item') else v for k, v in metrics.items()}
-    metrics_filename = os.path.join(metrics_dir, f'metrics_step_{step_to_load}.json')
+    # # Save metrics to a JSON file
+    # print(f"Saving metrics to {metrics_dir}...")
+    # # Convert JAX/Numpy arrays to standard Python types for JSON serialization
+    # serializable_metrics = {k: v.item() if hasattr(v, 'item') else v for k, v in metrics.items()}
+    # metrics_filename = os.path.join(metrics_dir, f'metrics_step_{step_to_load}.json')
     
-    try:
-        with open(metrics_filename, 'w') as f:
-            json.dump(serializable_metrics, f, indent=4)
-        print(f"Successfully saved metrics to {metrics_filename}")
-    except Exception as e:
-        print(f"Error saving metrics to {metrics_filename}: {e}")
-    # --- END ADDED ---
+    # try:
+    #     with open(metrics_filename, 'w') as f:
+    #         json.dump(serializable_metrics, f, indent=4)
+    #     print(f"Successfully saved metrics to {metrics_filename}")
+    # except Exception as e:
+    #     print(f"Error saving metrics to {metrics_filename}: {e}")
+    # # --- END ADDED ---
 
 
 if __name__ == '__main__':
