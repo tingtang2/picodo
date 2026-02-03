@@ -24,7 +24,7 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
     log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
     losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
-    losses = losses[:, -1]
+    losses = losses[:, :-1]
 
     qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
     qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
@@ -38,7 +38,7 @@ def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
     logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
     log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
     losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
-    losses = losses[:, -1]
+    losses = losses[:, :-1]
 
     z = jax.nn.logsumexp(logits[:, :-1].astype(jnp.float32), axis=-1)  
 
