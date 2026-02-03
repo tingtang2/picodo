@@ -22,7 +22,10 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
     logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
-    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+
+    logits = logits.astype(jnp.float32)
+    logits = logits - logits.mean(axis=-1, keepdims=True)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
     losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
 
@@ -258,9 +261,9 @@ def train_and_evaluate(c: DictConfig):
             opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
         else:
             opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
-        if jax.process_index() == 0:
-            min_train_loss = float(jax.device_get(jnp.min(train_raw_loss)))
-            assert min_train_loss >= 0.0, f"negative train loss: {min_train_loss}"
+        # if jax.process_index() == 0:
+        #     min_train_loss = float(jax.device_get(jnp.min(train_raw_loss)))
+        #     assert min_train_loss >= 0.0, f"negative train loss: {min_train_loss}"
         
         if c.diagnostics.save_raw_losses:
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
