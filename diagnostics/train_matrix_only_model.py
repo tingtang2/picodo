@@ -3,7 +3,7 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train import get_mean_output_logit, get_logit_gaps_by_lm_head, loss_fn_z_loss, get_logits_by_lm_head
+from train import get_mean_and_norm_output_logit, get_logit_gaps_by_lm_head, loss_fn_z_loss, get_logits_by_lm_head
 import utils
 import data
 import model as model_lib
@@ -48,7 +48,7 @@ def eval_step(c, model_state, model_graphdef, dataset):
             batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
-        logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
+        logit_mean_sum += get_mean_and_norm_output_logit(model_state, model_graphdef, batch)[0]
         if c.diagnostics.save_raw_losses:
             total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
 
@@ -239,7 +239,7 @@ def main(c: DictConfig):
         metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
         metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
         # Note: opt_state.model here is the MatrixOnlyModel state
-        metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
+        metrics['train_output_logit_mean'] = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])[0]
         metrics['lr'] = lr_schedule(step)
         # metrics.update(utils.get_layer_grad_norms(grads))
         # metrics.update(utils.get_layer_weight_norms(opt_state.model))

@@ -197,7 +197,7 @@ def main(c: DictConfig):
     # diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
     # os.makedirs(diagnostics_dir, exist_ok=True)
     # utils.save_to_numpy(diagnostics_dir, f'train_data_{start_step}', ds_train[start_step])
-    mean_output_logit = train.get_mean_output_logit(opt_state.model, model_graphdef, ds_train[start_step]).astype(jnp.float32)
+    mean_output_logit, output_logit_norm = train.get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[start_step]).astype(jnp.float32)
     print(mean_output_logit)
     
     # logging

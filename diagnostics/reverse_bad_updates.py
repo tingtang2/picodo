@@ -3,7 +3,7 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train import eval_step, get_mean_output_logit, loss_fn
+from train import eval_step, get_mean_and_norm_output_logit, loss_fn
 import utils
 import data
 import model as model_lib
@@ -178,7 +178,7 @@ def main(c: DictConfig):
         metrics['train_med_loss'] = jnp.median(train_raw_loss)
         metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
         metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-        metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
+        metrics['train_output_logit_mean'] = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])[0]
         metrics['lr'] = lr_schedule(step)
         if len(last_opt_states) > len(last_train_losses):
             last_train_losses.append(float(metrics['train_loss_after_update']))

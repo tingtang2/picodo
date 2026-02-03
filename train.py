@@ -24,7 +24,6 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
 
     logits = logits.astype(jnp.float32)
-    logits = logits - logits.mean(axis=-1, keepdims=True)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
@@ -96,10 +95,11 @@ def get_logit_gaps_by_lm_head(model_state, model_graphdef, x): # [B, T]
     return mean_gaps, target_gaps
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
-def get_mean_output_logit(model_state, model_graphdef, x): # [B, T]
+def get_mean_and_norm_output_logit(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     logits = model(x) # [B, T, V]
-    return logits.astype(jnp.float32).mean() 
+    logits = logits[:, :-1].astype(jnp.float32)
+    return logits.mean(), utils.get_l2_norm(logits)
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
@@ -110,7 +110,7 @@ def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
     def loss_from_logits(l):
         log_probs = jax.nn.log_softmax(l, axis=-1)
         losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
-        losses = losses.at[:, -1].set(0)
+        losses = losses[:, :-1]
         return losses.mean()
 
     grad_logits = jax.grad(loss_from_logits)(logits) # dL/dz
@@ -138,7 +138,7 @@ def eval_step(c, model_state, model_graphdef, dataset):
             batch_loss, (raw_loss, _) = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
-        logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
+        logit_mean_sum += get_mean_and_norm_output_logit(model_state, model_graphdef, batch)[0]
         if c.diagnostics.save_raw_losses:
             total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
 
@@ -279,7 +279,9 @@ def train_and_evaluate(c: DictConfig):
             metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
             metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-            metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
+            output_logit_mean, output_logit_norm = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])
+            metrics['train_output_logit_mean'] = output_logit_mean
+            metrics['train_output_logit_norm'] = output_logit_norm
             metrics['lr'] = lr_schedule(step)
             metrics.update(utils.get_layer_grad_norms_split(grads))
             metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
