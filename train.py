@@ -15,9 +15,13 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy
 import os
 import sys
 
+#import jax
+#jax.config.update("jax_disable_jit", True)
+
 def compute_logit_distribution_stats(logits_bf16):
     # logits_fp32: [B, T-1, V]
     flat = logits_bf16.reshape(-1, logits_bf16.shape[-1])  # [N, V]
+    print("flat is ", flat)
 
     stats = {
         # scale / imbalance
@@ -36,7 +40,7 @@ def compute_logit_distribution_stats(logits_bf16):
     entropy = -jnp.sum(probs * jnp.log(probs + 1e-9), axis=-1)
     stats["softmax_entropy_mean"] = jnp.mean(entropy)
 
-	'''
+    '''
     # Precision diagnostics
     if logits_bf16 is not None:
         diff = logits_fp32 - logits_bf16.astype(jnp.float32)
@@ -47,8 +51,18 @@ def compute_logit_distribution_stats(logits_bf16):
                 jnp.mean((diff / (jnp.abs(logits_fp32) + 1e-6)) ** 2)
             ),
         })
-	'''
+    '''
+    
+    '''
+    jax.debug.print(
+        "logit_mean={m}, logit_std={s}, abs_max={a}",
+        m=stats["logit_mean"],
+        s=stats["logit_std"],
+        a=stats["logit_abs_max"],
+    )
+    '''
 
+    
     return stats
 
 '''
@@ -76,20 +90,22 @@ def loss_fn(model_state, model_graphdef, x):
     y = jnp.roll(x, -1, axis=1)
 
     logits_bf16, qkv_dict = model(x, return_qkv=True)
+    #print("loss fn logits ", logits_bf16)
     logits_fp32 = logits_bf16.astype(jnp.float32)
 
+    #TODO change precision here (either bf16 or fp32)
     losses = optax.softmax_cross_entropy_with_integer_labels(
         logits_fp32, y
     )
     losses = losses.at[:, -1].set(0)
 
     # Drop last token
-    #logits_fp32 = logits_fp32[:, :-1, :]
-    logits_bf16 = logits_bf16[:, :-1, :]
+    logits_fp32 = logits_fp32[:, :-1, :]
+    #logits_bf16 = logits_bf16[:, :-1, :]
 
     logit_stats = compute_logit_distribution_stats(
-        #logits_fp32,
-        logits_bf16
+        logits_bf32,
+        #logits_bf16
     )
 
     qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
@@ -119,13 +135,23 @@ def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     # Use has_aux=True to get the raw losses
-    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    #(loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+
+    (loss, aux), grads = jax.value_and_grad(
+                    loss_fn, has_aux=True
+                        )(opt_state.model, model_graphdef, batch)
     
+    raw_losses, qkv_stats, logit_stats = aux
+
+
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss, grads
+    #return opt_state, loss, raw_loss, grads
+
+    return opt_state, loss, (raw_losses, qkv_stats, logit_stats), grads
+
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
@@ -192,28 +218,27 @@ def eval_step(c, model_state, model_graphdef, dataset):
     total_logits = []
     logit_mean_sum = jnp.zeros([], dtype=jnp.float32)
 
-   	logit_stats_sum = None
+    logit_stats_sum = None
     for i in range(len(dataset)):
         batch = dataset[i]
         if c.opt.use_z_loss:
             batch_loss, (raw_loss, _) = loss_fn_z_loss(model_state, model_graphdef, batch)
         else:
-			#TODO changed this 
+            #TODO changed this 
             batch_loss, (raw_loss, _, logit_stats) = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
         logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
 
-		#TODO addedd this	
-		if logit_stats is not None:
-			if logit_stats_sum is None:
-				logit_stats_sum = logit_stats
-			else:
-				logit_stats_sum = jax.tree.map(
-					lambda a, b: a + b,
-					logit_stats_sum,
-					logit_stats,
-				)
+        if logit_stats is not None:
+            if logit_stats_sum is None:
+                logit_stats_sum = logit_stats
+            else:
+                logit_stats_sum = jax.tree.map(
+                    lambda a, b: a + b,
+                    logit_stats_sum,
+                    logit_stats,
+                )
 
 
         if c.diagnostics.save_raw_losses:
@@ -222,14 +247,13 @@ def eval_step(c, model_state, model_graphdef, dataset):
     mean_loss = loss_sum / len(dataset)
     mean_output_logit = logit_mean_sum / len(dataset)
 
-
-	mean_logit_stats = None
-	if logit_stats_sum is not None:
-		logit_stats_sum = logit_stats_sum / len(dataset)
-		#mean_logit_stats = jax.tree.map(
-		#	lambda x: x / len(dataset),
-		#	logit_stats_sum,
-		#)
+    mean_logit_stats = None
+    if logit_stats_sum is not None:
+        #logit_stats_sum = logit_stats_sum / len(dataset)
+        mean_logit_stats = jax.tree.map(
+           lambda x: x / len(dataset),
+           logit_stats_sum,
+        )
 
     return mean_loss, raw_losses, total_logits, mean_output_logit, mean_logit_stats
 
@@ -345,11 +369,9 @@ def train_and_evaluate(c: DictConfig):
         if c.opt.use_z_loss:
             opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
         else:
-            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
-        # if jax.process_index() == 0:
-        #     min_train_loss = float(jax.device_get(jnp.min(train_raw_loss)))
-        #     assert min_train_loss >= 0.0, f"negative train loss: {min_train_loss}"
-        
+            #opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            opt_state, batch_loss, (train_raw_loss, qkv_stats, logit_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+
         if c.diagnostics.save_raw_losses:
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
 
@@ -391,6 +413,9 @@ def train_and_evaluate(c: DictConfig):
             metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             if jax.process_index() == 0:
+                for k, v in logit_stats.items(): 
+                    metrics[f"logits/{k}"] = float(jax.device_get(v))
+
                 wandb.log(metrics, step)
             
             # diagnostics
@@ -425,9 +450,9 @@ def train_and_evaluate(c: DictConfig):
     metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
     metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
 
-	if eval_logit_stats is not None:
-		for k, v in eval_logit_stats.items():
-			metrics[f"eval/{k}"] = v
+    if eval_logit_stats is not None:
+        for k, v in eval_logit_stats.items():
+            metrics[f"eval/{k}"] = v
 
     if jax.process_index() == 0:
         wandb.log(metrics)

@@ -15,7 +15,10 @@ class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
         lm_head_dtype = getattr(c, "lm_head_dtype", c.activ_dtype)
         self.token_embed_in = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
-        self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=lm_head_dtype, rngs=rngs)
+        #change 1 
+        self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
+        #self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
+
         self.blocks = nnx.List(TransformerBlock(c, rngs, layer_idx=i) for i in range(c.L))
         self.out_ln = nnx.RMSNorm(c.D, use_scale=False, dtype=lm_head_dtype, rngs=rngs)
         
@@ -36,6 +39,13 @@ class TransformerDecoder(nnx.Module):
         # project back to vocabulary
         h = self.out_ln(h)
         logits = self.token_embed_out.attend(h) # [B, T, V]
+
+        #change 2 
+        '''
+        h = self.out_ln(h)
+        h_fp32 = h.astype(jnp.float32)     # ← FORCE fp32 activations
+        logits = self.token_embed_out.attend(h_fp32)
+        '''
 
         if return_qkv:
             return logits, qkv_outputs

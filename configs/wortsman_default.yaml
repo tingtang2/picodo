@@ -14,7 +14,7 @@ wandb_project: 'picodo-loss-spikes'
 wandb_mode: 'disabled'
 run_name: null
 num_tp_devices: 1 # optional tensor parallelism
-log_logit_grad_stats: false
+log_logit_grad_stats: true
 
 model:
   D: null # model/embed/qkv dim
@@ -30,8 +30,8 @@ model:
   # use_qk_norm: [0, 1, 2, 3, 4, 9, 10, 11]
   
 opt:
-  batch_size: 256
-  peak_lr: 0.01
+  batch_size: 32
+  peak_lr: 0.075
   warmup_frac: 0.05
   b1: 0.9
   b2: 0.95
@@ -41,7 +41,7 @@ opt:
   eps: 1e-8
 
 checkpoint:
-  turn_on: true
+  turn_on: false
   workdir: ""
   checkpoint_every_steps: 2000
   max_to_keep: 100
