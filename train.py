@@ -74,6 +74,30 @@ def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
     
     return opt_state, loss, raw_loss, grads
 
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
+def train_step_centered(opt_state, opt_graphdef, model_graphdef, batch):
+    # Use has_aux=True to get the raw losses
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    optimizer.update(grads)
+    model_lib.center_output_embeddings(optimizer.model)
+    opt_state = nnx.state(optimizer)
+    
+    return opt_state, loss, raw_loss, grads
+
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
+def train_step_z_loss_centered(opt_state, opt_graphdef, model_graphdef, batch):
+    # Use has_aux=True to get the raw losses
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(opt_state.model, model_graphdef, batch)
+    
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    optimizer.update(grads)
+    model_lib.center_output_embeddings(optimizer.model)
+    opt_state = nnx.state(optimizer)
+    
+    return opt_state, loss, raw_loss, grads
+
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
@@ -250,6 +274,8 @@ def train_and_evaluate(c: DictConfig):
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
+    
+    mucentering = bool(getattr(c.opt, "mucentering", False))
 
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
@@ -258,9 +284,23 @@ def train_and_evaluate(c: DictConfig):
             logit_grad_stats = get_logit_grad_sum_stats(opt_state.model, model_graphdef, ds_train[step])
         # training step
         if c.opt.use_z_loss:
-            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            if mucentering:
+                opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss_centered(
+                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                )
+            else:
+                opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(
+                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                )
         else:
-            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            if mucentering:
+                opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_centered(
+                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                )
+            else:
+                opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(
+                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                )
         # if jax.process_index() == 0:
         #     min_train_loss = float(jax.device_get(jnp.min(train_raw_loss)))
         #     assert min_train_loss >= 0.0, f"negative train loss: {min_train_loss}"

@@ -43,6 +43,12 @@ class TransformerDecoder(nnx.Module):
         return logits
 
 
+def center_output_embeddings(model: TransformerDecoder):
+    embeddings = model.token_embed_out.embedding.value
+    mean = jnp.mean(embeddings.astype(jnp.float32), axis=0, keepdims=True).astype(embeddings.dtype)
+    model.token_embed_out.embedding.value = embeddings - mean
+
+
 class TransformerBlock(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs, layer_idx: int):
         self.ln1 = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
