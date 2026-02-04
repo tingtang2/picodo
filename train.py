@@ -298,6 +298,7 @@ def train_and_evaluate(c: DictConfig):
 
     # training loop
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
+    log_metrics_per_step = bool(getattr(c, "log_metrics_per_step", False))
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
@@ -336,15 +337,11 @@ def train_and_evaluate(c: DictConfig):
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
 
         # logging
-        train_loss_sum += batch_loss
-        train_med_loss_sum += jnp.median(train_raw_loss)
-        train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
-        train_loss_num += 1
-        if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
+        if log_metrics_per_step:
             metrics = {}
-            metrics['train_loss'] = train_loss_sum / train_loss_num
-            metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
-            metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
+            metrics['train_loss'] = batch_loss
+            metrics['train_med_loss'] = jnp.median(train_raw_loss)
+            metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             output_logit_mean, output_logit_norm = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])
             metrics['train_output_logit_mean'] = output_logit_mean
@@ -355,14 +352,40 @@ def train_and_evaluate(c: DictConfig):
             metrics.update(utils.get_layer_moment_norms(opt_state))
             if c.log_logit_grad_stats:
                 metrics.update(logit_grad_stats)
-            
             # Add QKV stats to metrics
             metrics.update(qkv_stats)
 
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
                 pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
-            train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
+        else:
+            train_loss_sum += batch_loss
+            train_med_loss_sum += jnp.median(train_raw_loss)
+            train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
+            train_loss_num += 1
+            if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
+                metrics = {}
+                metrics['train_loss'] = train_loss_sum / train_loss_num
+                metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
+                metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
+                metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+                output_logit_mean, output_logit_norm = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])
+                metrics['train_output_logit_mean'] = output_logit_mean
+                metrics['train_output_logit_norm'] = output_logit_norm
+                metrics['lr'] = lr_schedule(step)
+                metrics.update(utils.get_layer_grad_norms_split(grads))
+                metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
+                metrics.update(utils.get_layer_moment_norms(opt_state))
+                if c.log_logit_grad_stats:
+                    metrics.update(logit_grad_stats)
+                
+                # Add QKV stats to metrics
+                metrics.update(qkv_stats)
+
+                if jax.process_index() == 0:
+                    wandb.log(metrics, step)
+                    pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
+                train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
         # eval and checkpointing
         if step % c.eval_every_steps == 0:

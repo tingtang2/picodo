@@ -8,6 +8,7 @@ ds_path: null
 tokens_params_ratio: 20 # chinchilla scaling
 num_tokens_train: null
 log_every_tokens: 1_000_000
+log_metrics_per_step: false
 num_tokens_valid: 20_000_000
 wandb_project: 'picodo-loss-spikes'
 wandb_mode: 'disabled'
