@@ -223,10 +223,37 @@ def train_and_evaluate(c: DictConfig):
         if latest_step is not None:
             print(f'Restoring checkpoint from step {latest_step} in {ckpt_dir}...')
             
-            restored_data = ckpt_mngr.restore(latest_step, args=ocp.args.Composite(state=ocp.args.StandardRestore(abstract_opt_state),
-            training_metadata=ocp.args.JsonRestore(),))
+            restored_data = ckpt_mngr.restore(
+                latest_step,
+                args=ocp.args.Composite(
+                    state=ocp.args.StandardRestore(abstract_opt_state),
+                    training_metadata=ocp.args.JsonRestore(),
+                ),
+            )
             opt_state = restored_data['state']
-            start_step = restored_data['training_metadata']['step']
+            training_metadata = restored_data.get('training_metadata', {})
+            meta_step = training_metadata.get('step')
+            meta_next_step = training_metadata.get('next_step')
+            if meta_next_step is not None:
+                start_step = meta_next_step
+            elif meta_step is not None:
+                if meta_step == latest_step + 1:
+                    start_step = meta_step
+                elif meta_step == latest_step:
+                    start_step = meta_step + 1
+                else:
+                    print(
+                        'Warning: checkpoint metadata step does not match checkpoint id '
+                        f'(metadata step={meta_step}, checkpoint id={latest_step}). '
+                        'Falling back to resume from checkpoint id + 1.'
+                    )
+                    start_step = latest_step + 1
+            else:
+                print(
+                    'Warning: checkpoint metadata missing step/next_step; '
+                    'falling back to resume from checkpoint id + 1.'
+                )
+                start_step = latest_step + 1
             print(f'Successfully restored checkpoint. Resuming from step {start_step}.')
         else:
             print('No checkpoint found. Starting from scratch.')
@@ -324,8 +351,17 @@ def train_and_evaluate(c: DictConfig):
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
 
         if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
-            ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
-                'step': step + 1})), force=True)
+            ckpt_mngr.save(
+                step,
+                args=ocp.args.Composite(
+                    state=ocp.args.StandardSave(opt_state),
+                    training_metadata=ocp.args.JsonSave({
+                        'step': step,
+                        'next_step': step + 1,
+                    }),
+                ),
+                force=True,
+            )
     
     if num_opt_steps != len(ds_train):
         print('exiting early')
@@ -354,8 +390,17 @@ def train_and_evaluate(c: DictConfig):
             
     # final checkpoint
     if c.checkpoint.turn_on and not c.diagnostics.save_raw_losses:
-        ckpt_mngr.save(num_opt_steps, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
-            'step': num_opt_steps + 1})))
+        final_step = max(num_opt_steps - 1, 0)
+        ckpt_mngr.save(
+            final_step,
+            args=ocp.args.Composite(
+                state=ocp.args.StandardSave(opt_state),
+                training_metadata=ocp.args.JsonSave({
+                    'step': final_step,
+                    'next_step': final_step + 1,
+                }),
+            ),
+        )
         
         ckpt_mngr.wait_until_finished() 
         if jax.process_index() == 0:
