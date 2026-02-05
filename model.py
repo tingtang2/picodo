@@ -84,6 +84,9 @@ class MultiHeadAttention(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs, use_qk_norm: bool = None):
         self.qkv_proj = nnx.Einsum('BTd,SNdH->SBTNH', (3, c.N, c.D, c.H), dtype=c.activ_dtype, rngs=rngs)
         self.out_proj = nnx.Einsum('BTnh,nhD->BTD', (c.N, c.H, c.D), dtype=c.activ_dtype, rngs=rngs)
+        self.elementwise_attn_output_gate = bool(getattr(c, "elementwise_attn_output_gate", False))
+        if self.elementwise_attn_output_gate:
+            self.gate_proj = nnx.Einsum('BTd,NdH->BTNH', (c.N, c.D, c.H), dtype=c.activ_dtype, rngs=rngs)
         
         if use_qk_norm is None:
             use_qk_norm = c.use_qk_norm
@@ -102,6 +105,7 @@ class MultiHeadAttention(nnx.Module):
 
         # input projection
         q, k, v = self.qkv_proj(x) # [B, T, N, H]
+        gate_score = self.gate_proj(x) if self.elementwise_attn_output_gate else None
         if return_qkv:
             raw_qkv = (q, k, v)
 
@@ -138,6 +142,9 @@ class MultiHeadAttention(nnx.Module):
             
             # The mask will be broadcast by dot_product_attention to [B, N, T, T]
             out = self.attention(q, k, v, mask=combined_mask) # [B, T, N, H]
+
+        if self.elementwise_attn_output_gate:
+            out = out * jax.nn.sigmoid(gate_score)
 
         # output projection followed by contraction back to original dims
         out = self.out_proj(out) # [B, T, D]
@@ -211,12 +218,16 @@ def create_sharded_model(c: DictConfig, key):
 
         def add_sharding(path, v):
             key = jax.tree_util.keystr(path, simple=True, separator='/')
+            pspec = None
             if 'token_embed_in' in key: pspec = P('data', 'model')
             if 'up_proj' in key: pspec = P('data', 'model')
             if 'down_proj' in key: pspec = P('model', 'data')
             if 'qkv_proj' in key: pspec = P(None, 'model', 'data', None)
+            if 'gate_proj' in key: pspec = P('model', 'data', None)
             if 'out_proj' in key: pspec = P('model', None, 'data')
             if 'token_embed_out' in key: pspec = P('model', 'data')
+            if pspec is None:
+                return v
             return jax.lax.with_sharding_constraint(v, pspec)
         state = jax.tree.map_with_path(add_sharding, state)
         nnx.update(model, state) # the model is sharded now
