@@ -163,8 +163,9 @@ def main(c: DictConfig):
     restored_data = ckpt_mngr.restore(step_to_load, args=ocp.args.Composite(state=ocp.args.StandardRestore(abstract_opt_state),
     training_metadata=ocp.args.JsonRestore(),))
     opt_state = restored_data['state']
-    start_step = restored_data['training_metadata']['step']
+    start_step = restored_data['training_metadata']['next_step']
     print("Checkpoint restored successfully.")
+    print(f'start_step: {start_step}')
     ckpt_mngr.close()
     
     print('sim training step')
@@ -244,13 +245,13 @@ def main(c: DictConfig):
         except Exception as e:
             print("torch ce skipped:", e)
     
-    diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
+    diagnostics_dir = os.path.join(c.checkpoint.workdir, 'top_loss_diagnostics')
     os.makedirs(diagnostics_dir, exist_ok=True)
     
     # save diagnostic data
-    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{start_step}.npy', data=train_raw_loss)
+    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{start_step}.npy', data=manual_raw_loss)
     # utils.save_to_numpy(diagnostics_dir, f'train_data_{start_step}', ds_train[start_step])
-    mean_output_logit, output_logit_norm = train.get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[start_step]).astype(jnp.float32)
+    mean_output_logit, output_logit_norm = train.get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[start_step])
     print(mean_output_logit)
     
     # logging
