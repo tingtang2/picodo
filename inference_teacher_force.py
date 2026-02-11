@@ -5,6 +5,8 @@ import os
 import math
 import optax
 import orbax.checkpoint as ocp
+from etils import epath
+from orbax.checkpoint._src.path import gcs_utils, step as step_lib
 from omegaconf import OmegaConf, DictConfig
 from flax import nnx
 import tiktoken  # For GPT-2 tokenization
@@ -14,6 +16,33 @@ from configs import resolver_setup
 import model as model_lib
 import utils 
 import data
+
+class _StandardNameFormatHNS(step_lib._StandardNameFormat):
+    """Fixes GCS HNS listing when step_prefix is None."""
+
+    def _glob_step_paths(self, base_path: epath.PathLike) -> list[epath.Path]:
+        base_path = epath.Path(base_path)
+        if gcs_utils.is_hierarchical_namespace_enabled(base_path):
+            bucket_name, path_prefix = gcs_utils.parse_gcs_path(base_path)
+            bucket = gcs_utils.get_bucket(bucket_name)
+            result = bucket.list_blobs(
+                prefix=path_prefix,
+                delimiter='/',
+                include_folders_as_prefixes=True,
+            )
+            for _ in result.pages:
+                pass
+            step_prefix = self.step_prefix or ''
+            return [
+                epath.Path(f'gs://{bucket_name}/{folder}')
+                for folder in result.prefixes
+                if folder.startswith(os.path.join(path_prefix, step_prefix))
+            ]
+        return list(
+            epath.Path(base_path).glob(
+                f'{step_lib.step_prefix_with_underscore(self.step_prefix)}*'
+            )
+        )
 
 @partial(jax.jit, static_argnames=('model_graphdef',))
 def get_next_token_logits(model_state, model_graphdef, x, attention_mask):
@@ -160,8 +189,24 @@ def main(c: DictConfig):
     
     abstract_opt_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, opt_state)
     # --- Load Checkpoint ---
-    ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
-    mngr_options = ocp.CheckpointManagerOptions(create=False) # Don't create
+    gcp_bucket = getattr(c.checkpoint, 'gcp_bucket', None)
+    if gcp_bucket:
+        if not gcp_bucket.startswith('gs://'):
+            gcp_bucket = f'gs://{gcp_bucket}'
+        ckpt_dir = f'{gcp_bucket.rstrip("/")}/{run_name}'
+        print(f'Loading checkpoint from GCS bucket: {ckpt_dir}')
+    else:
+        ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
+
+    step_prefix = getattr(c.checkpoint, 'step_prefix', None)
+    if gcp_bucket:
+        name_format = _StandardNameFormatHNS(step_prefix=step_prefix)
+        mngr_options = ocp.CheckpointManagerOptions(
+            create=False,
+            step_name_format=name_format,
+        )
+    else:
+        mngr_options = ocp.CheckpointManagerOptions(create=False)
     ckpt_mngr = ocp.CheckpointManager(ckpt_dir, options=mngr_options)
     
     step_to_load = c.checkpoint.start_step if c.checkpoint.start_step is not None else ckpt_mngr.latest_step()
