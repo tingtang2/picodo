@@ -12,8 +12,37 @@ import data, utils
 import model as model_lib
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
+from etils import epath
+from orbax.checkpoint._src.path import gcs_utils, step as step_lib
 import os
 import sys
+
+class _StandardNameFormatHNS(step_lib._StandardNameFormat):
+    """Fixes GCS HNS listing when step_prefix is None."""
+
+    def _glob_step_paths(self, base_path: epath.PathLike) -> list[epath.Path]:
+        base_path = epath.Path(base_path)
+        if gcs_utils.is_hierarchical_namespace_enabled(base_path):
+            bucket_name, path_prefix = gcs_utils.parse_gcs_path(base_path)
+            bucket = gcs_utils.get_bucket(bucket_name)
+            result = bucket.list_blobs(
+                prefix=path_prefix,
+                delimiter='/',
+                include_folders_as_prefixes=True,
+            )
+            for _ in result.pages:
+                pass
+            step_prefix = self.step_prefix or ''
+            return [
+                epath.Path(f'gs://{bucket_name}/{folder}')
+                for folder in result.prefixes
+                if folder.startswith(os.path.join(path_prefix, step_prefix))
+            ]
+        return list(
+            epath.Path(base_path).glob(
+                f'{step_lib.step_prefix_with_underscore(self.step_prefix)}*'
+            )
+        )
 
 
 
@@ -251,11 +280,18 @@ def train_and_evaluate(c: DictConfig):
         else:
             ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
 
+        step_prefix = getattr(c.checkpoint, 'step_prefix', None)
+
         # Base checkpoint manager options
         mngr_options_kwargs = {
             'create': True,
             'preservation_policy': preservation_policy.LatestN(c.checkpoint.max_to_keep)
         }
+
+        if gcp_bucket:
+            mngr_options_kwargs['step_name_format'] = _StandardNameFormatHNS(
+                step_prefix=step_prefix
+            )
 
         # Add multihost settings if running on multiple hosts
         is_multihost = jax.process_count() > 1
