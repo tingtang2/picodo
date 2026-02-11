@@ -238,13 +238,38 @@ def train_and_evaluate(c: DictConfig):
     abstract_opt_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, opt_state)
     if c.checkpoint.turn_on:
         run_name = c.run_name if c.run_name else 'picodo_run'
-        ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
-        
-        mngr_options = ocp.CheckpointManagerOptions(
-            create=True,
-            preservation_policy=preservation_policy.LatestN(c.checkpoint.max_to_keep)
-        )
-        
+
+        # Use GCP bucket if specified, otherwise use local workdir
+        gcp_bucket = getattr(c.checkpoint, 'gcp_bucket', None)
+        if gcp_bucket:
+            # Format: gs://bucket-name/path
+            if not gcp_bucket.startswith('gs://'):
+                gcp_bucket = f'gs://{gcp_bucket}'
+            ckpt_dir = os.path.join(gcp_bucket, run_name)
+            if jax.process_index() == 0:
+                print(f'Checkpoints will be saved to GCS bucket: {ckpt_dir}')
+        else:
+            ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
+
+        # Base checkpoint manager options
+        mngr_options_kwargs = {
+            'create': True,
+            'preservation_policy': preservation_policy.LatestN(c.checkpoint.max_to_keep)
+        }
+
+        # Add multihost settings if running on multiple hosts
+        is_multihost = jax.process_count() > 1
+        if is_multihost:
+            mngr_options_kwargs['enable_async_checkpointing'] = True
+            mngr_options_kwargs['multiprocessing_options'] = ocp.multiprocessing.MultiprocessingOptions(
+                primary_host=0,
+                active_processes=set(range(jax.process_count()))
+            )
+            if jax.process_index() == 0:
+                print(f'Multihost checkpointing enabled with {jax.process_count()} processes')
+
+        mngr_options = ocp.CheckpointManagerOptions(**mngr_options_kwargs)
+
         ckpt_mngr = ocp.CheckpointManager(
             ckpt_dir,
             options=mngr_options
@@ -422,7 +447,19 @@ def train_and_evaluate(c: DictConfig):
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_target_logit_gaps_step_{step}.npy', data=train_target_gaps)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
 
-        if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
+        # Determine if we should checkpoint at this step
+        should_checkpoint = False
+        if c.checkpoint.turn_on:
+            # Check if specific checkpoint steps are configured
+            checkpoint_steps = getattr(c.checkpoint, 'checkpoint_steps', None)
+            if checkpoint_steps is not None:
+                # If checkpoint_steps is specified, only checkpoint at those exact steps
+                should_checkpoint = step in checkpoint_steps
+            else:
+                # Otherwise, use the regular interval-based checkpointing
+                should_checkpoint = step % c.checkpoint.checkpoint_every_steps == 0
+
+        if should_checkpoint:
             ckpt_mngr.save(
                 step,
                 args=ocp.args.Composite(
@@ -434,6 +471,9 @@ def train_and_evaluate(c: DictConfig):
                 ),
                 force=True,
             )
+            # Wait for async checkpoint to complete in multihost setting
+            if jax.process_count() > 1:
+                ckpt_mngr.wait_until_finished()
     
     if num_opt_steps != len(ds_train):
         print('exiting early')
@@ -472,9 +512,10 @@ def train_and_evaluate(c: DictConfig):
                     'next_step': final_step + 1,
                 }),
             ),
+            force=True,
         )
-        
-        ckpt_mngr.wait_until_finished() 
+
+        ckpt_mngr.wait_until_finished()
         if jax.process_index() == 0:
-            print(f'Saved final checkpoint at step {num_opt_steps} to {ckpt_mngr.directory}')
+            print(f'Saved final checkpoint at step {final_step} to {ckpt_mngr.directory}')
         ckpt_mngr.close()

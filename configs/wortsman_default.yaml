@@ -49,6 +49,7 @@ checkpoint:
   checkpoint_every_steps: 2000
   max_to_keep: 100
   start_step: null # pick a specific checkpoint to start off from
+  checkpoint_steps: [10, 1962, 1963, 1964, 1965, 1966, 1967]
 
 diagnostics:
   end_step: null # to specific end step
