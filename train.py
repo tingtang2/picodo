@@ -12,11 +12,37 @@ import data, utils
 import model as model_lib
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
+from etils import epath
+from orbax.checkpoint._src.path import gcs_utils, step as step_lib
 import os
 import sys
 
-#import jax
-#jax.config.update("jax_disable_jit", True)
+class _StandardNameFormatHNS(step_lib._StandardNameFormat):
+    """Fixes GCS HNS listing when step_prefix is None."""
+
+    def _glob_step_paths(self, base_path: epath.PathLike) -> list[epath.Path]:
+        base_path = epath.Path(base_path)
+        if gcs_utils.is_hierarchical_namespace_enabled(base_path):
+            bucket_name, path_prefix = gcs_utils.parse_gcs_path(base_path)
+            bucket = gcs_utils.get_bucket(bucket_name)
+            result = bucket.list_blobs(
+                prefix=path_prefix,
+                delimiter='/',
+                include_folders_as_prefixes=True,
+            )
+            for _ in result.pages:
+                pass
+            step_prefix = self.step_prefix or ''
+            return [
+                epath.Path(f'gs://{bucket_name}/{folder}')
+                for folder in result.prefixes
+                if folder.startswith(os.path.join(path_prefix, step_prefix))
+            ]
+        return list(
+            epath.Path(base_path).glob(
+                f'{step_lib.step_prefix_with_underscore(self.step_prefix)}*'
+            )
+        )
 
 def compute_logit_distribution_stats(logits_bf16):
     # logits_fp32: [B, T-1, V]
@@ -73,7 +99,6 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
 
     logits = logits.astype(jnp.float32)
-    logits = logits - logits.mean(axis=-1, keepdims=True)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
@@ -164,6 +189,30 @@ def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
     
     return opt_state, loss, raw_loss, grads
 
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
+def train_step_centered(opt_state, opt_graphdef, model_graphdef, batch):
+    # Use has_aux=True to get the raw losses
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    optimizer.update(grads)
+    model_lib.center_output_embeddings(optimizer.model)
+    opt_state = nnx.state(optimizer)
+    
+    return opt_state, loss, raw_loss, grads
+
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
+def train_step_z_loss_centered(opt_state, opt_graphdef, model_graphdef, batch):
+    # Use has_aux=True to get the raw losses
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(opt_state.model, model_graphdef, batch)
+    
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    optimizer.update(grads)
+    model_lib.center_output_embeddings(optimizer.model)
+    opt_state = nnx.state(optimizer)
+    
+    return opt_state, loss, raw_loss, grads
+
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
@@ -185,10 +234,11 @@ def get_logit_gaps_by_lm_head(model_state, model_graphdef, x): # [B, T]
     return mean_gaps, target_gaps
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
-def get_mean_output_logit(model_state, model_graphdef, x): # [B, T]
+def get_mean_and_norm_output_logit(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     logits = model(x) # [B, T, V]
-    return logits.astype(jnp.float32).mean() 
+    logits = logits[:, :-1].astype(jnp.float32)
+    return logits.mean(), utils.get_l2_norm(logits)
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
@@ -199,7 +249,7 @@ def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
     def loss_from_logits(l):
         log_probs = jax.nn.log_softmax(l, axis=-1)
         losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
-        losses = losses.at[:, -1].set(0)
+        losses = losses[:, :-1]
         return losses.mean()
 
     grad_logits = jax.grad(loss_from_logits)(logits) # dL/dz
@@ -228,6 +278,7 @@ def eval_step(c, model_state, model_graphdef, dataset):
             batch_loss, (raw_loss, _, logit_stats) = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
+        '''
         logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
 
         if logit_stats is not None:
@@ -239,7 +290,8 @@ def eval_step(c, model_state, model_graphdef, dataset):
                     logit_stats_sum,
                     logit_stats,
                 )
-
+        '''
+        logit_mean_sum += get_mean_and_norm_output_logit(model_state, model_graphdef, batch)[0]
 
         if c.diagnostics.save_raw_losses:
             total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
@@ -298,7 +350,15 @@ def train_and_evaluate(c: DictConfig):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
-    tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, eps=c.opt.eps, weight_decay=c.opt.weight_decay)
+    wd_mask = utils.build_weight_decay_mask(model, c.opt.exclude_input_embedding_weight_decay)
+    tx = optax.inject_hyperparams(optax.adamw)(
+        lr_schedule,
+        c.opt.b1,
+        c.opt.b2,
+        eps=c.opt.eps,
+        weight_decay=c.opt.weight_decay,
+        mask=wd_mask,
+    )
     
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:
@@ -308,19 +368,52 @@ def train_and_evaluate(c: DictConfig):
     optimizer = nnx.ModelAndOptimizer(model, tx)
     opt_graphdef, opt_state = nnx.split(optimizer)
 
+
     # set up checkpointing
     start_step = 0
     ckpt_mngr = None
     abstract_opt_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, opt_state)
     if c.checkpoint.turn_on:
         run_name = c.run_name if c.run_name else 'picodo_run'
-        ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
-        
-        mngr_options = ocp.CheckpointManagerOptions(
-            create=True,
-            preservation_policy=preservation_policy.LatestN(c.checkpoint.max_to_keep)
-        )
-        
+
+        # Use GCP bucket if specified, otherwise use local workdir
+        gcp_bucket = getattr(c.checkpoint, 'gcp_bucket', None)
+        if gcp_bucket:
+            # Format: gs://bucket-name/path
+            if not gcp_bucket.startswith('gs://'):
+                gcp_bucket = f'gs://{gcp_bucket}'
+            ckpt_dir = os.path.join(gcp_bucket, run_name)
+            if jax.process_index() == 0:
+                print(f'Checkpoints will be saved to GCS bucket: {ckpt_dir}')
+        else:
+            ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
+
+        step_prefix = getattr(c.checkpoint, 'step_prefix', None)
+
+        # Base checkpoint manager options
+        mngr_options_kwargs = {
+            'create': True,
+            'preservation_policy': preservation_policy.LatestN(c.checkpoint.max_to_keep)
+        }
+
+        if gcp_bucket:
+            mngr_options_kwargs['step_name_format'] = _StandardNameFormatHNS(
+                step_prefix=step_prefix
+            )
+
+        # Add multihost settings if running on multiple hosts
+        is_multihost = jax.process_count() > 1
+        if is_multihost:
+            mngr_options_kwargs['enable_async_checkpointing'] = True
+            mngr_options_kwargs['multiprocessing_options'] = ocp.multiprocessing.MultiprocessingOptions(
+                primary_host=0,
+                active_processes=set(range(jax.process_count()))
+            )
+            if jax.process_index() == 0:
+                print(f'Multihost checkpointing enabled with {jax.process_count()} processes')
+
+        mngr_options = ocp.CheckpointManagerOptions(**mngr_options_kwargs)
+
         ckpt_mngr = ocp.CheckpointManager(
             ckpt_dir,
             options=mngr_options
@@ -332,10 +425,37 @@ def train_and_evaluate(c: DictConfig):
         if latest_step is not None:
             print(f'Restoring checkpoint from step {latest_step} in {ckpt_dir}...')
             
-            restored_data = ckpt_mngr.restore(latest_step, args=ocp.args.Composite(state=ocp.args.StandardRestore(abstract_opt_state),
-            training_metadata=ocp.args.JsonRestore(),))
+            restored_data = ckpt_mngr.restore(
+                latest_step,
+                args=ocp.args.Composite(
+                    state=ocp.args.StandardRestore(abstract_opt_state),
+                    training_metadata=ocp.args.JsonRestore(),
+                ),
+            )
             opt_state = restored_data['state']
-            start_step = restored_data['training_metadata']['step']
+            training_metadata = restored_data.get('training_metadata', {})
+            meta_step = training_metadata.get('step')
+            meta_next_step = training_metadata.get('next_step')
+            if meta_next_step is not None:
+                start_step = meta_next_step
+            elif meta_step is not None:
+                if meta_step == latest_step + 1:
+                    start_step = meta_step
+                elif meta_step == latest_step:
+                    start_step = meta_step + 1
+                else:
+                    print(
+                        'Warning: checkpoint metadata step does not match checkpoint id '
+                        f'(metadata step={meta_step}, checkpoint id={latest_step}). '
+                        'Falling back to resume from checkpoint id + 1.'
+                    )
+                    start_step = latest_step + 1
+            else:
+                print(
+                    'Warning: checkpoint metadata missing step/next_step; '
+                    'falling back to resume from checkpoint id + 1.'
+                )
+                start_step = latest_step + 1
             print(f'Successfully restored checkpoint. Resuming from step {start_step}.')
         else:
             print('No checkpoint found. Starting from scratch.')
@@ -356,9 +476,12 @@ def train_and_evaluate(c: DictConfig):
 
     # training loop
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
+    log_metrics_per_step = bool(getattr(c, "log_metrics_per_step", False))
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
+    
+    mucentering = bool(getattr(c.opt, "mucentering", False))
 
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
@@ -367,40 +490,85 @@ def train_and_evaluate(c: DictConfig):
             logit_grad_stats = get_logit_grad_sum_stats(opt_state.model, model_graphdef, ds_train[step])
         # training step
         if c.opt.use_z_loss:
-            opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            if mucentering:
+                opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss_centered(
+                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                )
+            else:
+                opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(
+                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                )
         else:
+            '''
             #opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
             opt_state, batch_loss, (train_raw_loss, qkv_stats, logit_stats), grads = train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+            '''
 
+            if mucentering:
+                opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_centered(
+                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                )
+            else:
+                opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(
+                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                )
+        # if jax.process_index() == 0:
+        #     min_train_loss = float(jax.device_get(jnp.min(train_raw_loss)))
+        #     assert min_train_loss >= 0.0, f"negative train loss: {min_train_loss}"
+        
         if c.diagnostics.save_raw_losses:
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
 
         # logging
-        train_loss_sum += batch_loss
-        train_med_loss_sum += jnp.median(train_raw_loss)
-        train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
-        train_loss_num += 1
-        if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
+        if log_metrics_per_step:
             metrics = {}
-            metrics['train_loss'] = train_loss_sum / train_loss_num
-            metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
-            metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
+            metrics['train_loss'] = batch_loss
+            metrics['train_med_loss'] = jnp.median(train_raw_loss)
+            metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-            metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
+            output_logit_mean, output_logit_norm = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])
+            metrics['train_output_logit_mean'] = output_logit_mean
+            metrics['train_output_logit_norm'] = output_logit_norm
             metrics['lr'] = lr_schedule(step)
             metrics.update(utils.get_layer_grad_norms_split(grads))
             metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
             metrics.update(utils.get_layer_moment_norms(opt_state))
             if c.log_logit_grad_stats:
                 metrics.update(logit_grad_stats)
-            
             # Add QKV stats to metrics
             metrics.update(qkv_stats)
 
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
                 pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
-            train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
+        else:
+            train_loss_sum += batch_loss
+            train_med_loss_sum += jnp.median(train_raw_loss)
+            train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
+            train_loss_num += 1
+            if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
+                metrics = {}
+                metrics['train_loss'] = train_loss_sum / train_loss_num
+                metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
+                metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
+                metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+                output_logit_mean, output_logit_norm = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])
+                metrics['train_output_logit_mean'] = output_logit_mean
+                metrics['train_output_logit_norm'] = output_logit_norm
+                metrics['lr'] = lr_schedule(step)
+                metrics.update(utils.get_layer_grad_norms_split(grads))
+                metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
+                metrics.update(utils.get_layer_moment_norms(opt_state))
+                if c.log_logit_grad_stats:
+                    metrics.update(logit_grad_stats)
+                
+                # Add QKV stats to metrics
+                metrics.update(qkv_stats)
+
+                if jax.process_index() == 0:
+                    wandb.log(metrics, step)
+                    pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
+                train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
@@ -431,9 +599,33 @@ def train_and_evaluate(c: DictConfig):
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_target_logit_gaps_step_{step}.npy', data=train_target_gaps)
                     utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
 
-        if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
-            ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
-                'step': step + 1})), force=True)
+        # Determine if we should checkpoint at this step
+        should_checkpoint = False
+        if c.checkpoint.turn_on:
+            # Check if specific checkpoint steps are configured
+            checkpoint_steps = getattr(c.checkpoint, 'checkpoint_steps', None)
+            if checkpoint_steps is not None:
+                # If checkpoint_steps is specified, only checkpoint at those exact steps
+                should_checkpoint = step in checkpoint_steps
+            else:
+                # Otherwise, use the regular interval-based checkpointing
+                should_checkpoint = step % c.checkpoint.checkpoint_every_steps == 0
+
+        if should_checkpoint:
+            ckpt_mngr.save(
+                step,
+                args=ocp.args.Composite(
+                    state=ocp.args.StandardSave(opt_state),
+                    training_metadata=ocp.args.JsonSave({
+                        'step': step,
+                        'next_step': step + 1,
+                    }),
+                ),
+                force=True,
+            )
+            # Wait for async checkpoint to complete in multihost setting
+            if jax.process_count() > 1:
+                ckpt_mngr.wait_until_finished()
     
     if num_opt_steps != len(ds_train):
         print('exiting early')
@@ -467,10 +659,20 @@ def train_and_evaluate(c: DictConfig):
             
     # final checkpoint
     if c.checkpoint.turn_on and not c.diagnostics.save_raw_losses:
-        ckpt_mngr.save(num_opt_steps, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
-            'step': num_opt_steps + 1})))
-        
-        ckpt_mngr.wait_until_finished() 
+        final_step = max(num_opt_steps - 1, 0)
+        ckpt_mngr.save(
+            final_step,
+            args=ocp.args.Composite(
+                state=ocp.args.StandardSave(opt_state),
+                training_metadata=ocp.args.JsonSave({
+                    'step': final_step,
+                    'next_step': final_step + 1,
+                }),
+            ),
+            force=True,
+        )
+
+        ckpt_mngr.wait_until_finished()
         if jax.process_index() == 0:
-            print(f'Saved final checkpoint at step {num_opt_steps} to {ckpt_mngr.directory}')
+            print(f'Saved final checkpoint at step {final_step} to {ckpt_mngr.directory}')
         ckpt_mngr.close()

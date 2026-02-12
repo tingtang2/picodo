@@ -8,6 +8,7 @@ ds_path: null
 tokens_params_ratio: 20 # chinchilla scaling
 num_tokens_train: null
 log_every_tokens: 1_000_000
+log_metrics_per_step: false
 eval_every_steps: 100
 num_tokens_valid: 20_000_000
 wandb_project: 'picodo-loss-spikes'
@@ -27,6 +28,7 @@ model:
   activ_dtype: 'bfloat16'
   use_flash_attn: true
   use_qk_norm: true
+  elementwise_attn_output_gate: false
   # use_qk_norm: [0, 1, 2, 3, 4, 9, 10, 11]
   
 opt:
@@ -36,6 +38,7 @@ opt:
   b1: 0.9
   b2: 0.95
   weight_decay: 1e-4
+  exclude_input_embedding_weight_decay: false
   clip_by_global_norm: 1.0
   use_z_loss: false
   eps: 1e-8
@@ -46,6 +49,7 @@ checkpoint:
   checkpoint_every_steps: 2000
   max_to_keep: 100
   start_step: null # pick a specific checkpoint to start off from
+  checkpoint_steps: [5467, 5468, 5469, 5470, 5471, 5472, 5473, 5474, 5475, 5476, 5477, 5503, 5504, 5505, 5506, 5507, 5508, 5509, 5510]
 
 diagnostics:
   end_step: null # to specific end step

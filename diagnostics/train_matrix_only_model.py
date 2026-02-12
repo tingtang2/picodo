@@ -3,7 +3,7 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train import get_mean_output_logit, get_logit_gaps_by_lm_head, loss_fn_z_loss, get_logits_by_lm_head
+from train import get_mean_and_norm_output_logit, get_logit_gaps_by_lm_head, loss_fn_z_loss, get_logits_by_lm_head
 import utils
 import data
 import model as model_lib
@@ -48,7 +48,7 @@ def eval_step(c, model_state, model_graphdef, dataset):
             batch_loss, raw_loss = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
-        logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
+        logit_mean_sum += get_mean_and_norm_output_logit(model_state, model_graphdef, batch)[0]
         if c.diagnostics.save_raw_losses:
             total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
 
@@ -132,7 +132,15 @@ def main(c: DictConfig):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
-    tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, eps=c.opt.eps, weight_decay=c.opt.weight_decay)
+    wd_mask = utils.build_weight_decay_mask(base_model, c.opt.exclude_input_embedding_weight_decay)
+    tx = optax.inject_hyperparams(optax.adamw)(
+        lr_schedule,
+        c.opt.b1,
+        c.opt.b2,
+        eps=c.opt.eps,
+        weight_decay=c.opt.weight_decay,
+        mask=wd_mask,
+    )
     
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:
@@ -192,7 +200,15 @@ def main(c: DictConfig):
         # The optimizer starts counting at 0, so we add the checkpoint step to get the absolute step
         return global_lr_schedule(count + step_to_load)
 
-    tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, eps=c.opt.eps, weight_decay=c.opt.weight_decay)
+    wd_mask = utils.build_weight_decay_mask(model, c.opt.exclude_input_embedding_weight_decay)
+    tx = optax.inject_hyperparams(optax.adamw)(
+        lr_schedule,
+        c.opt.b1,
+        c.opt.b2,
+        eps=c.opt.eps,
+        weight_decay=c.opt.weight_decay,
+        mask=wd_mask,
+    )
     
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:
@@ -239,7 +255,7 @@ def main(c: DictConfig):
         metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
         metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
         # Note: opt_state.model here is the MatrixOnlyModel state
-        metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
+        metrics['train_output_logit_mean'] = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])[0]
         metrics['lr'] = lr_schedule(step)
         # metrics.update(utils.get_layer_grad_norms(grads))
         # metrics.update(utils.get_layer_weight_norms(opt_state.model))

@@ -22,6 +22,22 @@ def get_num_model_params(model: nnx.Module):
     n_params = jax.tree.reduce(lambda x, y: x + jnp.size(y), params, 0)
     return n_params
 
+
+def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
+    if not exclude_input_embedding:
+        return None
+    _, params = nnx.split(model, nnx.Param)
+
+    def mask_leaf(path, _):
+        key = jax.tree_util.keystr(path, simple=True, separator='/')
+        return 'token_embed_in' not in key
+
+    return jax.tree_util.tree_map_with_path(
+        mask_leaf,
+        params,
+        is_leaf=lambda x: isinstance(x, nnx.Param),
+    )
+
 def save_to_numpy(save_dir: str, name: str, data):
     path = os.path.join(save_dir, name)
     np.save(path, np.array(data))

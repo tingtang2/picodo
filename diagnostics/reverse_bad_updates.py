@@ -3,7 +3,7 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train import eval_step, get_mean_output_logit, loss_fn
+from train import eval_step, get_mean_and_norm_output_logit, loss_fn
 import utils
 import data
 import model as model_lib
@@ -92,7 +92,15 @@ def main(c: DictConfig):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
-    tx = optax.inject_hyperparams(optax.adamw)(lr_schedule, c.opt.b1, c.opt.b2, eps=c.opt.eps, weight_decay=c.opt.weight_decay)
+    wd_mask = utils.build_weight_decay_mask(base_model, c.opt.exclude_input_embedding_weight_decay)
+    tx = optax.inject_hyperparams(optax.adamw)(
+        lr_schedule,
+        c.opt.b1,
+        c.opt.b2,
+        eps=c.opt.eps,
+        weight_decay=c.opt.weight_decay,
+        mask=wd_mask,
+    )
     
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:
@@ -178,7 +186,7 @@ def main(c: DictConfig):
         metrics['train_med_loss'] = jnp.median(train_raw_loss)
         metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
         metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-        metrics['train_output_logit_mean'] = get_mean_output_logit(opt_state.model, model_graphdef, ds_train[step])
+        metrics['train_output_logit_mean'] = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])[0]
         metrics['lr'] = lr_schedule(step)
         if len(last_opt_states) > len(last_train_losses):
             last_train_losses.append(float(metrics['train_loss_after_update']))

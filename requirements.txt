@@ -9,3 +9,4 @@ tqdm
 huggingface_hub
 matplotlib
 tiktoken
+gcsfs
