@@ -16,6 +16,7 @@ wandb_mode: 'disabled'
 run_name: null
 num_tp_devices: 1 # optional tensor parallelism
 log_logit_grad_stats: false
+log_logit_grad_scaling_stats: false
 
 model:
   D: null # model/embed/qkv dim

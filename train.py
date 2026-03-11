@@ -176,6 +176,46 @@ def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
     }
 
 
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def get_logit_grad_scaling_stats(model_state, model_graphdef, x): # [B, T]
+    """Compares autodiff CE logits grads vs closed-form grads to detect scaling issues."""
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis=1)
+    logits = model(x).astype(jnp.float32) # [B, T, V]
+
+    mask = jnp.ones_like(y, dtype=logits.dtype)
+    mask = mask.at[:, -1].set(0)
+    denom = jnp.maximum(mask.sum(), 1.0)
+
+    def loss_from_logits(l):
+        log_probs = jax.nn.log_softmax(l, axis=-1)
+        losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
+        return (losses * mask).sum() / denom
+
+    grad_auto = jax.grad(loss_from_logits)(logits)
+
+    probs = jax.nn.softmax(logits, axis=-1)
+    one_hot = jax.nn.one_hot(y, logits.shape[-1], dtype=logits.dtype)
+    grad_closed_form = (probs - one_hot) * mask[..., None] / denom
+
+    grad_diff = grad_auto - grad_closed_form
+    auto_norm = utils.get_l2_norm(grad_auto)
+    diff_norm = utils.get_l2_norm(grad_diff)
+
+    grad_sum = grad_auto.sum(axis=-1)[:, :-1]
+    closed_form_sum = grad_closed_form.sum(axis=-1)[:, :-1]
+
+    return {
+        'logit_grad_rel_l2_err': diff_norm / jnp.maximum(auto_norm, 1e-30),
+        'logit_grad_max_abs_err': jnp.max(jnp.abs(grad_diff[:, :-1])),
+        'logit_grad_mean_abs_err': jnp.mean(jnp.abs(grad_diff[:, :-1])),
+        'logit_grad_closed_form_sum_mean_abs': jnp.mean(jnp.abs(closed_form_sum)),
+        'logit_grad_closed_form_sum_max_abs': jnp.max(jnp.abs(closed_form_sum)),
+        'logit_grad_auto_sum_mean_abs': jnp.mean(jnp.abs(grad_sum)),
+        'logit_grad_auto_sum_max_abs': jnp.max(jnp.abs(grad_sum)),
+    }
+
+
 def eval_step(c, model_state, model_graphdef, dataset):
     loss_sum = jnp.zeros([], dtype=jnp.float32)
     raw_losses = []
@@ -369,6 +409,8 @@ def train_and_evaluate(c: DictConfig):
     # training loop
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
     log_metrics_per_step = bool(getattr(c, "log_metrics_per_step", False))
+    log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
+    log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
@@ -378,8 +420,10 @@ def train_and_evaluate(c: DictConfig):
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
-        if c.log_logit_grad_stats:
+        if log_logit_grad_stats:
             logit_grad_stats = get_logit_grad_sum_stats(opt_state.model, model_graphdef, ds_train[step])
+        if log_logit_grad_scaling_stats:
+            logit_grad_scaling_stats = get_logit_grad_scaling_stats(opt_state.model, model_graphdef, ds_train[step])
         # training step
         if c.opt.use_z_loss:
             if mucentering:
@@ -420,8 +464,10 @@ def train_and_evaluate(c: DictConfig):
             metrics.update(utils.get_layer_grad_norms_split(grads))
             metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
             metrics.update(utils.get_layer_moment_norms(opt_state))
-            if c.log_logit_grad_stats:
+            if log_logit_grad_stats:
                 metrics.update(logit_grad_stats)
+            if log_logit_grad_scaling_stats:
+                metrics.update(logit_grad_scaling_stats)
             # Add QKV stats to metrics
             metrics.update(qkv_stats)
 
@@ -446,8 +492,10 @@ def train_and_evaluate(c: DictConfig):
                 metrics.update(utils.get_layer_grad_norms_split(grads))
                 metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
                 metrics.update(utils.get_layer_moment_norms(opt_state))
-                if c.log_logit_grad_stats:
+                if log_logit_grad_stats:
                     metrics.update(logit_grad_stats)
+                if log_logit_grad_scaling_stats:
+                    metrics.update(logit_grad_scaling_stats)
                 
                 # Add QKV stats to metrics
                 metrics.update(qkv_stats)
