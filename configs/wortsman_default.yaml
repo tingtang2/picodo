@@ -31,6 +31,7 @@ model:
   use_qk_norm: true
   elementwise_attn_output_gate: false
   final_hidden_mean_centering: false
+  alpha: 1.0
   # use_qk_norm: [0, 1, 2, 3, 4, 9, 10, 11]
   
 opt:
