@@ -29,6 +29,7 @@ model:
   use_flash_attn: true
   use_qk_norm: true
   elementwise_attn_output_gate: false
+  final_hidden_mean_centering: false
   
 opt:
   batch_size: 8

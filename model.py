@@ -14,6 +14,7 @@ from omegaconf import ListConfig
 class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
         lm_head_dtype = getattr(c, "lm_head_dtype", c.activ_dtype)
+        self.final_hidden_mean_centering = bool(getattr(c, "final_hidden_mean_centering", False))
         self.token_embed_in = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
         self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=lm_head_dtype, rngs=rngs)
         self.blocks = nnx.List(TransformerBlock(c, rngs, layer_idx=i) for i in range(c.L))
@@ -35,6 +36,8 @@ class TransformerDecoder(nnx.Module):
 
         # project back to vocabulary
         h = self.out_ln(h)
+        if self.final_hidden_mean_centering:
+            h = h - jnp.mean(h, axis=-1, keepdims=True)
         logits = self.token_embed_out.attend(h) # [B, T, V]
 
         if return_qkv:
