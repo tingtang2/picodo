@@ -17,6 +17,8 @@ from orbax.checkpoint._src.path import gcs_utils, step as step_lib
 import os
 import sys
 
+import tiktoken
+
 class _StandardNameFormatHNS(step_lib._StandardNameFormat):
     """Fixes GCS HNS listing when step_prefix is None."""
 
@@ -129,7 +131,7 @@ def loss_fn(model_state, model_graphdef, x):
     #logits_bf16 = logits_bf16[:, :-1, :]
 
     logit_stats = compute_logit_distribution_stats(
-        logits_bf32,
+        logits_fp32,
         #logits_bf16
     )
 
@@ -173,9 +175,9 @@ def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    #return opt_state, loss, raw_loss, grads
 
-    return opt_state, loss, (raw_losses, qkv_stats, logit_stats), grads
+    #return opt_state, loss, (raw_losses, qkv_stats, logit_stats), grads
+    return opt_state, loss, (raw_losses, qkv_stats), grads
 
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
@@ -192,14 +194,19 @@ def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step_centered(opt_state, opt_graphdef, model_graphdef, batch):
     # Use has_aux=True to get the raw losses
-    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
-    
+    #(loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    (loss, aux), grads = jax.value_and_grad(
+                    loss_fn, has_aux=True
+                        )(opt_state.model, model_graphdef, batch)
+    raw_losses, qkv_stats, logit_stats = aux
+
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
     model_lib.center_output_embeddings(optimizer.model)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss, grads
+    #return opt_state, loss, raw_loss, grads
+    return opt_state, loss, (raw_losses, qkv_stats), grads
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
 def train_step_z_loss_centered(opt_state, opt_graphdef, model_graphdef, batch):
@@ -262,7 +269,7 @@ def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
     }
 
 
-def eval_step(c, model_state, model_graphdef, dataset):
+def eval_step(c, model_state, model_graphdef, dataset, inspect_spike = False, tokenizer = None):
     loss_sum = jnp.zeros([], dtype=jnp.float32)
     raw_losses = []
     total_logits = []
@@ -278,19 +285,6 @@ def eval_step(c, model_state, model_graphdef, dataset):
             batch_loss, (raw_loss, _, logit_stats) = loss_fn(model_state, model_graphdef, batch)
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
-        '''
-        logit_mean_sum += get_mean_output_logit(model_state, model_graphdef, batch)
-
-        if logit_stats is not None:
-            if logit_stats_sum is None:
-                logit_stats_sum = logit_stats
-            else:
-                logit_stats_sum = jax.tree.map(
-                    lambda a, b: a + b,
-                    logit_stats_sum,
-                    logit_stats,
-                )
-        '''
         logit_mean_sum += get_mean_and_norm_output_logit(model_state, model_graphdef, batch)[0]
 
         if c.diagnostics.save_raw_losses:
@@ -306,9 +300,112 @@ def eval_step(c, model_state, model_graphdef, dataset):
            lambda x: x / len(dataset),
            logit_stats_sum,
         )
+    
+    if inspect_spike: 
+        all_raw_losses = jnp.concatenate(raw_losses, axis=0) # [TotalSamples, SeqLen]
+        
+        # find the absolute biggest loss value
+        max_loss_val = jnp.max(all_raw_losses)
+        max_idx = jnp.argmax(all_raw_losses)
+        
+        # math to get the exact sequence and position
+        num_sequences, seq_len = all_raw_losses.shape
+        spike_seq_idx = max_idx // seq_len
+        spike_pos = max_idx % seq_len
 
+        # need the actual tokens for that specific sequence
+        spiky_batch = dataset[int(spike_seq_idx // c.opt.batch_size)]
+        spiky_sequence = spiky_batch[int(spike_seq_idx % c.opt.batch_size)]
+
+        print(f"\n[DIAGNOSTIC] Global Max Loss: {max_loss_val:.2f}")
+        print(f"[DIAGNOSTIC] Sequence Index: {spike_seq_idx}, Position: {spike_pos}")
+
+        #CALL COUNTERFACTUAL ANALYSIS HERE
+        counterfactual_analysis(
+            c =c, model_state=model_state,
+            model_graphdef=model_graphdef,
+            tokenizer=tokenizer, # Make sure tokenizer is passed into eval_step or is global
+            sequence=spiky_sequence,
+            spike_pos=int(spike_pos)
+        )
     return mean_loss, raw_losses, total_logits, mean_output_logit, mean_logit_stats
 
+def find_similar_tokens(model_state, tokenizer, trigger_str=" end", top_k=5):
+    trigger_id = tokenizer.encode(trigger_str)[0]
+    embs = model_state['token_embed_in']['embedding'].value
+    # 3. Normalize for Cosine Similarity
+    norm = jnp.linalg.norm(embs, axis=1, keepdims=True)
+    embs_norm = embs / (norm + 1e-9)
+    trigger_vec = embs_norm[trigger_id]
+    cos_sim = jnp.dot(embs_norm, trigger_vec)
+    
+    top_ids = jnp.argsort(cos_sim)[-(top_k+1):-1][::-1]
+    print(f"Tokens most similar to {trigger_str!r}:")
+    for tid in top_ids:
+        print(f"ID: {tid:<6} | Token: {tokenizer.decode([int(tid)])!r} | Sim: {cos_sim[tid]:.4f}")
+    
+    return top_ids
+
+def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence, spike_pos, swap_token_str=" "):
+    context_size = c.model.T
+    pad_token_id = tokenizer.eot_token
+    original_seq = jnp.array(sequence)
+    
+    top_sim_ids = find_similar_tokens(model_state, tokenizer, trigger_str=tokenizer.decode([ int(original_seq[spike_pos]) ] ), top_k=5)
+    swap_token_id = int(top_sim_ids[1])
+    swap_token_str = tokenizer.decode([swap_token_id])
+    #swap_token_id = tokenizer.encode(swap_token_str)[0]
+
+    #construct counterfactual sequence 
+    #cf_seq = original_seq.at[spike_pos].set(swap_token_id)
+    cf_seq = original_seq.copy()
+    start_swap = max(0, spike_pos - 0) #just swap spike_pos itself 
+    cf_seq = cf_seq.at[start_swap : spike_pos + 1].set(swap_token_id)
+
+    print(f"\n--- Counterfactual Analysis at Position {spike_pos} ---")
+    #print(f"Original token: {tokenizer.decode([original_seq[spike_pos]])!r}")
+    #print(f"Swapped token:  {tokenizer.decode([swap_token_id])!r}")
+    orig_context_str = tokenizer.decode(original_seq[start_swap:spike_pos + 1].tolist())
+    print(f"Original Context (Indices {start_swap}-{spike_pos}): {orig_context_str!r}")
+    print(f"Swapping tokens from index {start_swap} to {spike_pos} with {swap_token_str!r}")
+
+    # We will look at the next 10 tokens to see if the model "recovers"
+    window = 10
+    end_pos = min(spike_pos + window, len(sequence) - 1)
+
+    print(f"{'Step':<6} | {'Target':<12} | {'Orig Loss':<10} | {'CF Loss':<10} | {'Status'}")
+    print("-" * 65)
+
+
+    def get_full_results(seq_data):
+        input_data = jnp.repeat(seq_data[None, :], 4, axis=0)
+        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data)
+        
+        return losses[0]
+
+    # Run the model only twice total
+    orig_losses = get_full_results(original_seq)
+    cf_losses = get_full_results(cf_seq)
+
+    for step in range(spike_pos, end_pos):
+            target_id = int(original_seq[step+1])
+            target_str = tokenizer.decode([target_id]).replace("\n", "\\n")
+            
+            loss_orig = float(orig_losses[step])
+            loss_cf = float(cf_losses[step])
+            # question: does swapping the token cuts loss significantly?
+            
+            print(f"{step:<6} | {target_str[:10]:<12} | {loss_orig:<10.4f} | {loss_cf:<10.4f}")
+            
+    print("\n" + "="*40)
+    print("GLOBAL SEQUENCE COMPARISON")
+    print("="*40)
+    print(f"{'Metric':<15} | {'Original':<12} | {'CF Swap':<12}")
+    print("-" * 45)
+    print(f"{'Mean Loss':<15} | {jnp.mean(orig_losses):<12.4f} | {jnp.mean(cf_losses):<12.4f}")
+    tail_orig = orig_losses[spike_pos+1:]
+    tail_cf = cf_losses[spike_pos+1:]
+    print(f"{'Tail Mean':<15} | {jnp.mean(tail_orig):<12.4f} | {jnp.mean(tail_cf):<12.4f}")
 
 def train_and_evaluate(c: DictConfig):
     # init distributed env if using multiple vms
@@ -485,7 +582,60 @@ def train_and_evaluate(c: DictConfig):
 
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
+
+    #TODO add spike step 
+    spike_step = [10, 1110, 1114, 1115, 1116, 1117, 1118] 
+
     for step in pbar:
+
+        batch = ds_train[step]
+        if step in spike_step:
+            print("SPIKE STEP HIT", step)
+            batch = ds_train[step]
+            import pickle
+            host_batch = jax.device_get(batch)  # move to CPU
+            #with open(f"spike_batch_{step}.pkl", "wb") as f:
+            #    pickle.dump(host_batch, f)
+            loss_value, (losses, qkv_stats, _) = loss_fn(
+                opt_state.model,
+                model_graphdef,
+                batch
+            )
+
+            print("Mean loss:", float(loss_value))
+
+            import numpy as np
+
+            # Move to host (very important — avoids JitTracer issues)
+            losses_host = np.array(jax.device_get(losses))
+
+            '''
+            with open(f"tmp_spike_batch_{step}.pkl", "wb") as f:
+                pickle.dump({
+                    "batch": host_batch,
+                    "losses": losses_host
+                }, f)
+            '''
+
+            flat = losses_host.reshape(-1)
+
+            top_k = 20
+            top_idx = np.argpartition(flat, -top_k)[-top_k:]
+            top_idx = top_idx[np.argsort(flat[top_idx])[::-1]]
+
+            print("\nTop 10 token losses:")
+            T = losses_host.shape[1]
+
+            for rank, idx in enumerate(top_idx):
+                b = idx // T
+                t = idx % T
+
+                print(f"\nRank {rank+1}")
+                print("  Loss:", float(flat[idx]))
+                print("  Batch index:", int(b),"  Token position:", int(t),"  Target token ID:", int(batch[b, t+1]))  # +1 due to shift
+             
+ 
+
         if c.log_logit_grad_stats:
             logit_grad_stats = get_logit_grad_sum_stats(opt_state.model, model_graphdef, ds_train[step])
         # training step
@@ -571,6 +721,19 @@ def train_and_evaluate(c: DictConfig):
                 train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
         # eval and checkpointing
+        tok = tiktoken.get_encoding("gpt2")
+
+        if step == 1620: 
+            print("testing eval")
+            val_loss, val_raw_losses, val_logits, val_mean_logit, val_stats = eval_step(
+                c, opt_state.model, model_graphdef, ds_valid, inspect_spike = True, tokenizer = tok
+            )
+            
+            print(f"Eval complete. Mean Loss: {val_loss:.4f}")
+            if step == 1630: 
+                break
+
+
         if step % c.eval_every_steps == 0:
             eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit, eval_logit_stats = eval_step(c, opt_state.model, model_graphdef, ds_valid)
             flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
@@ -580,11 +743,13 @@ def train_and_evaluate(c: DictConfig):
             metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
             metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+            '''
             if jax.process_index() == 0:
                 for k, v in logit_stats.items(): 
                     metrics[f"logits/{k}"] = float(jax.device_get(v))
 
                 wandb.log(metrics, step)
+            '''
             
             # diagnostics
             if c.diagnostics.save_raw_losses:
