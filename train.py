@@ -5,7 +5,6 @@ import optax
 import wandb
 from functools import partial
 from flax import nnx
-import optax
 from tqdm.auto import tqdm
 from omegaconf.dictconfig import DictConfig
 import data, utils
@@ -241,6 +240,108 @@ def eval_step(c, model_state, model_graphdef, dataset):
     return mean_loss, raw_losses, total_logits, mean_output_logit
 
 
+def _build_train_metrics(
+    step,
+    tokens_per_opt_step,
+    train_loss,
+    train_med_loss,
+    train_lower_90th_mean_loss,
+    opt_state,
+    model_graphdef,
+    batch,
+    grads,
+    lr_schedule,
+    qkv_stats,
+    logit_grad_stats,
+    logit_grad_scaling_stats,
+):
+    metrics = {}
+    metrics['train_loss'] = train_loss
+    metrics['train_med_loss'] = train_med_loss
+    metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss
+    metrics['train_tokens_seen'] = (step + 1) * tokens_per_opt_step
+    output_logit_mean, output_logit_norm = get_mean_and_norm_output_logit(
+        opt_state.model, model_graphdef, batch
+    )
+    metrics['train_output_logit_mean'] = output_logit_mean
+    metrics['train_output_logit_norm'] = output_logit_norm
+    metrics['lr'] = lr_schedule(step)
+    metrics.update(utils.get_layer_grad_norms_split(grads))
+    metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
+    metrics.update(utils.get_layer_moment_norms(opt_state))
+    if logit_grad_stats is not None:
+        metrics.update(logit_grad_stats)
+    if logit_grad_scaling_stats is not None:
+        metrics.update(logit_grad_scaling_stats)
+    metrics.update(qkv_stats)
+    return metrics
+
+
+def _log_metrics_if_primary(metrics, step, pbar):
+    if jax.process_index() == 0:
+        wandb.log(metrics, step)
+        pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
+
+
+def _resolve_diagnostics_dir(ckpt_dir):
+    if not ckpt_dir:
+        return None
+    diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
+    os.makedirs(diagnostics_dir, exist_ok=True)
+    return diagnostics_dir
+
+
+def _save_eval_diagnostics(
+    diagnostics_dir,
+    step,
+    train_raw_loss,
+    eval_raw_loss,
+    train_logit_gaps,
+    train_target_gaps,
+    eval_logits,
+):
+    if not diagnostics_dir:
+        return
+    utils.save_to_numpy(
+        save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss
+    )
+    utils.save_to_numpy(
+        save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss
+    )
+    utils.save_to_numpy(
+        save_dir=diagnostics_dir, name=f'train_mean_logit_gaps_step_{step}.npy', data=train_logit_gaps
+    )
+    utils.save_to_numpy(
+        save_dir=diagnostics_dir, name=f'train_target_logit_gaps_step_{step}.npy', data=train_target_gaps
+    )
+    utils.save_to_numpy(
+        save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits
+    )
+
+
+def _save_checkpoint(ckpt_mngr, step, opt_state):
+    ckpt_mngr.save(
+        step,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardSave(opt_state),
+            training_metadata=ocp.args.JsonSave({
+                'step': step,
+                'next_step': step + 1,
+            }),
+        ),
+        force=True,
+    )
+
+
+def _should_checkpoint(c, step):
+    if not c.checkpoint.turn_on:
+        return False
+    checkpoint_steps = getattr(c.checkpoint, 'checkpoint_steps', None)
+    if checkpoint_steps is not None:
+        return step in checkpoint_steps
+    return step % c.checkpoint.checkpoint_every_steps == 0
+
+
 
 def train_and_evaluate(c: DictConfig):
     # init distributed env if using multiple vms
@@ -303,6 +404,7 @@ def train_and_evaluate(c: DictConfig):
 
     # set up checkpointing
     start_step = 0
+    ckpt_dir = None
     ckpt_mngr = None
     abstract_opt_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, opt_state)
     if c.checkpoint.turn_on:
@@ -392,12 +494,9 @@ def train_and_evaluate(c: DictConfig):
         else:
             print('No checkpoint found. Starting from scratch.')
 
-    model = nnx.merge(model_graphdef, opt_state.model)
-
     if c.diagnostics.save_raw_losses:
-        if ckpt_dir:
-            diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
-            os.makedirs(diagnostics_dir, exist_ok=True)
+        diagnostics_dir = _resolve_diagnostics_dir(ckpt_dir)
+        if diagnostics_dir:
             utils.save_to_numpy(save_dir=diagnostics_dir, name='val_dataset', data=ds_valid)
             utils.save_to_numpy(save_dir=diagnostics_dir, name='train_dataset', data=ds_train[:c.diagnostics.end_step])
 
@@ -420,89 +519,79 @@ def train_and_evaluate(c: DictConfig):
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
+        batch = ds_train[step]
+        logit_grad_stats = None
+        logit_grad_scaling_stats = None
         if log_logit_grad_stats:
-            logit_grad_stats = get_logit_grad_sum_stats(opt_state.model, model_graphdef, ds_train[step])
+            logit_grad_stats = get_logit_grad_sum_stats(opt_state.model, model_graphdef, batch)
         if log_logit_grad_scaling_stats:
-            logit_grad_scaling_stats = get_logit_grad_scaling_stats(opt_state.model, model_graphdef, ds_train[step])
+            logit_grad_scaling_stats = get_logit_grad_scaling_stats(opt_state.model, model_graphdef, batch)
         # training step
         if c.opt.use_z_loss:
             if mucentering:
                 opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss_centered(
-                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                    opt_state, opt_graphdef, model_graphdef, batch
                 )
             else:
                 opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(
-                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                    opt_state, opt_graphdef, model_graphdef, batch
                 )
         else:
             if mucentering:
                 opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_centered(
-                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                    opt_state, opt_graphdef, model_graphdef, batch
                 )
             else:
                 opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(
-                    opt_state, opt_graphdef, model_graphdef, ds_train[step]
+                    opt_state, opt_graphdef, model_graphdef, batch
                 )
         # if jax.process_index() == 0:
         #     min_train_loss = float(jax.device_get(jnp.min(train_raw_loss)))
         #     assert min_train_loss >= 0.0, f"negative train loss: {min_train_loss}"
         
         if c.diagnostics.save_raw_losses:
-            train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, ds_train[step])
+            train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, batch)
 
         # logging
         if log_metrics_per_step:
-            metrics = {}
-            metrics['train_loss'] = batch_loss
-            metrics['train_med_loss'] = jnp.median(train_raw_loss)
-            metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
-            metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-            output_logit_mean, output_logit_norm = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])
-            metrics['train_output_logit_mean'] = output_logit_mean
-            metrics['train_output_logit_norm'] = output_logit_norm
-            metrics['lr'] = lr_schedule(step)
-            metrics.update(utils.get_layer_grad_norms_split(grads))
-            metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
-            metrics.update(utils.get_layer_moment_norms(opt_state))
-            if log_logit_grad_stats:
-                metrics.update(logit_grad_stats)
-            if log_logit_grad_scaling_stats:
-                metrics.update(logit_grad_scaling_stats)
-            # Add QKV stats to metrics
-            metrics.update(qkv_stats)
-
-            if jax.process_index() == 0:
-                wandb.log(metrics, step)
-                pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
+            metrics = _build_train_metrics(
+                step,
+                tokens_per_opt_step,
+                batch_loss,
+                jnp.median(train_raw_loss),
+                utils.compute_lower_90th_percentile_mean(train_raw_loss),
+                opt_state,
+                model_graphdef,
+                batch,
+                grads,
+                lr_schedule,
+                qkv_stats,
+                logit_grad_stats,
+                logit_grad_scaling_stats,
+            )
+            _log_metrics_if_primary(metrics, step, pbar)
         else:
             train_loss_sum += batch_loss
             train_med_loss_sum += jnp.median(train_raw_loss)
             train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
             train_loss_num += 1
             if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
-                metrics = {}
-                metrics['train_loss'] = train_loss_sum / train_loss_num
-                metrics['train_med_loss'] = train_med_loss_sum / train_loss_num
-                metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss_sum / train_loss_num
-                metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-                output_logit_mean, output_logit_norm = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])
-                metrics['train_output_logit_mean'] = output_logit_mean
-                metrics['train_output_logit_norm'] = output_logit_norm
-                metrics['lr'] = lr_schedule(step)
-                metrics.update(utils.get_layer_grad_norms_split(grads))
-                metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
-                metrics.update(utils.get_layer_moment_norms(opt_state))
-                if log_logit_grad_stats:
-                    metrics.update(logit_grad_stats)
-                if log_logit_grad_scaling_stats:
-                    metrics.update(logit_grad_scaling_stats)
-                
-                # Add QKV stats to metrics
-                metrics.update(qkv_stats)
-
-                if jax.process_index() == 0:
-                    wandb.log(metrics, step)
-                    pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
+                metrics = _build_train_metrics(
+                    step,
+                    tokens_per_opt_step,
+                    train_loss_sum / train_loss_num,
+                    train_med_loss_sum / train_loss_num,
+                    train_lower_90th_mean_loss_sum / train_loss_num,
+                    opt_state,
+                    model_graphdef,
+                    batch,
+                    grads,
+                    lr_schedule,
+                    qkv_stats,
+                    logit_grad_stats,
+                    logit_grad_scaling_stats,
+                )
+                _log_metrics_if_primary(metrics, step, pbar)
                 train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
         # eval and checkpointing
@@ -520,41 +609,19 @@ def train_and_evaluate(c: DictConfig):
             
             # diagnostics
             if c.diagnostics.save_raw_losses:
-                if ckpt_dir:
-                    diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
-                    os.makedirs(diagnostics_dir, exist_ok=True)
-                    
-                    # save diagnostic data
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_raw_losses_step_{step}.npy', data=train_raw_loss)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{step}.npy', data=eval_raw_loss)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_mean_logit_gaps_step_{step}.npy', data=train_logit_gaps)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'train_target_logit_gaps_step_{step}.npy', data=train_target_gaps)
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_logits_step_{step}.npy', data=eval_logits)
+                diagnostics_dir = _resolve_diagnostics_dir(ckpt_dir)
+                _save_eval_diagnostics(
+                    diagnostics_dir,
+                    step,
+                    train_raw_loss,
+                    eval_raw_loss,
+                    train_logit_gaps,
+                    train_target_gaps,
+                    eval_logits,
+                )
 
-        # Determine if we should checkpoint at this step
-        should_checkpoint = False
-        if c.checkpoint.turn_on:
-            # Check if specific checkpoint steps are configured
-            checkpoint_steps = getattr(c.checkpoint, 'checkpoint_steps', None)
-            if checkpoint_steps is not None:
-                # If checkpoint_steps is specified, only checkpoint at those exact steps
-                should_checkpoint = step in checkpoint_steps
-            else:
-                # Otherwise, use the regular interval-based checkpointing
-                should_checkpoint = step % c.checkpoint.checkpoint_every_steps == 0
-
-        if should_checkpoint:
-            ckpt_mngr.save(
-                step,
-                args=ocp.args.Composite(
-                    state=ocp.args.StandardSave(opt_state),
-                    training_metadata=ocp.args.JsonSave({
-                        'step': step,
-                        'next_step': step + 1,
-                    }),
-                ),
-                force=True,
-            )
+        if _should_checkpoint(c, step):
+            _save_checkpoint(ckpt_mngr, step, opt_state)
             # Wait for async checkpoint to complete in multihost setting
             if jax.process_count() > 1:
                 ckpt_mngr.wait_until_finished()
@@ -577,27 +644,14 @@ def train_and_evaluate(c: DictConfig):
         wandb.log(metrics)
         wandb.finish()
         if c.diagnostics.save_raw_losses:
-            if ckpt_dir:
-                diagnostics_dir = os.path.join(ckpt_dir, 'top_loss_diagnostics')
-                os.makedirs(diagnostics_dir, exist_ok=True)
-                
-                # save diagnostic data
+            diagnostics_dir = _resolve_diagnostics_dir(ckpt_dir)
+            if diagnostics_dir:
                 utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{num_opt_steps}.npy', data=eval_raw_loss)
             
     # final checkpoint
     if c.checkpoint.turn_on and not c.diagnostics.save_raw_losses:
         final_step = max(num_opt_steps - 1, 0)
-        ckpt_mngr.save(
-            final_step,
-            args=ocp.args.Composite(
-                state=ocp.args.StandardSave(opt_state),
-                training_metadata=ocp.args.JsonSave({
-                    'step': final_step,
-                    'next_step': final_step + 1,
-                }),
-            ),
-            force=True,
-        )
+        _save_checkpoint(ckpt_mngr, final_step, opt_state)
 
         ckpt_mngr.wait_until_finished()
         if jax.process_index() == 0:
