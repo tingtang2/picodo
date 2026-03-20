@@ -3,12 +3,12 @@ defaults:
   - override hydra/hydra_logging: disabled
   - override hydra/job_logging: disabled
 
-seed: 0
+seed: 1 # 0 is orig 
 ds_path: null
 tokens_params_ratio: 20 # chinchilla scaling
 num_tokens_train: null
 log_every_tokens: 1_000_000
-log_metrics_per_step: false
+log_metrics_per_step: true
 eval_every_steps: 100
 num_tokens_valid: 20_000_000
 wandb_project: 'picodo-loss-spikes'
@@ -32,8 +32,8 @@ model:
   # use_qk_norm: [0, 1, 2, 3, 4, 9, 10, 11]
   
 opt:
-  batch_size: 32
-  peak_lr: 0.075
+  batch_size: 256
+  peak_lr: 0.17
   warmup_frac: 0.05
   b1: 0.9
   b2: 0.95
@@ -44,12 +44,13 @@ opt:
   eps: 1e-8
 
 checkpoint:
-  turn_on: false
-  workdir: ""
-  checkpoint_every_steps: 2000
+  turn_on: true
+  workdir: "/home/sophieli/picodo/checkpoints"
+  checkpoint_every_steps: 10000
   max_to_keep: 100
-  start_step: null # pick a specific checkpoint to start off from
-  checkpoint_steps: [5467, 5468, 5469, 5470, 5471, 5472, 5473, 5474, 5475, 5476, 5477, 5503, 5504, 5505, 5506, 5507, 5508, 5509, 5510]
+  start_step: 1605 # pick a specific checkpoint to start off from
+  #checkpoint_steps: [1605, 1617, 1618, 1619, 1620, 1622, 1625]
+  checkpoint_steps: []
 
 diagnostics:
   end_step: null # to specific end step
