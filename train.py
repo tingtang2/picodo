@@ -246,9 +246,9 @@ def _build_train_metrics(
     train_loss,
     train_med_loss,
     train_lower_90th_mean_loss,
+    output_logit_mean,
+    output_logit_norm,
     opt_state,
-    model_graphdef,
-    batch,
     grads,
     lr_schedule,
     qkv_stats,
@@ -260,9 +260,6 @@ def _build_train_metrics(
     metrics['train_med_loss'] = train_med_loss
     metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss
     metrics['train_tokens_seen'] = (step + 1) * tokens_per_opt_step
-    output_logit_mean, output_logit_norm = get_mean_and_norm_output_logit(
-        opt_state.model, model_graphdef, batch
-    )
     metrics['train_output_logit_mean'] = output_logit_mean
     metrics['train_output_logit_norm'] = output_logit_norm
     metrics['lr'] = lr_schedule(step)
@@ -520,6 +517,15 @@ def train_and_evaluate(c: DictConfig):
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
         batch = ds_train[step]
+        will_log_train_metrics = log_metrics_per_step or (
+            (train_loss_num + 1) * tokens_per_opt_step >= c.log_every_tokens
+        )
+        pre_output_logit_mean = None
+        pre_output_logit_norm = None
+        if will_log_train_metrics:
+            pre_output_logit_mean, pre_output_logit_norm = get_mean_and_norm_output_logit(
+                opt_state.model, model_graphdef, batch
+            )
         logit_grad_stats = None
         logit_grad_scaling_stats = None
         if log_logit_grad_stats:
@@ -560,9 +566,9 @@ def train_and_evaluate(c: DictConfig):
                 batch_loss,
                 jnp.median(train_raw_loss),
                 utils.compute_lower_90th_percentile_mean(train_raw_loss),
+                pre_output_logit_mean,
+                pre_output_logit_norm,
                 opt_state,
-                model_graphdef,
-                batch,
                 grads,
                 lr_schedule,
                 qkv_stats,
@@ -582,9 +588,9 @@ def train_and_evaluate(c: DictConfig):
                     train_loss_sum / train_loss_num,
                     train_med_loss_sum / train_loss_num,
                     train_lower_90th_mean_loss_sum / train_loss_num,
+                    pre_output_logit_mean,
+                    pre_output_logit_norm,
                     opt_state,
-                    model_graphdef,
-                    batch,
                     grads,
                     lr_schedule,
                     qkv_stats,
