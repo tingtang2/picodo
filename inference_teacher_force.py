@@ -57,6 +57,47 @@ def get_next_token_logits(model_state, model_graphdef, x, attention_mask):
     # Return logits for the very last token in the sequence
     return logits[:, -1, :].astype(jnp.float32) # [B, V]
 
+def counterfactual_analysis(model_state, model_graphdef, tokenizer, sequence, spike_pos, swap_token_str=" "):
+    """
+    Compares logits of a spiky sequence vs a sequence where the spike-inducing 
+    token is swapped out for `swap_token_str`.
+    """
+    swap_token_id = tokenizer.encode(swap_token_str)[0]
+    
+    # 1. Original (Spiky) Sequence
+    original_seq = jnp.array(sequence)
+    
+    # 2. Counterfactual (Swapped) Sequence
+    cf_seq = original_seq.at[spike_pos].set(swap_token_id)
+    
+    print(f"\n--- Counterfactual Analysis at Position {spike_pos} ---")
+    print(f"Original token: {tokenizer.decode([original_seq[spike_pos]])!r}")
+    print(f"Swapped token:  {tokenizer.decode([swap_token_id])!r}")
+
+    # We only care about the steps IMMEDIATELY after the spike
+    for step in range(spike_pos, min(spike_pos + 5, len(sequence) - 1)):
+        # Get logits for both
+        def get_logits(s):
+            prefix = s[:step+1][None, :]
+            # (Insert your existing padding/mask logic here)
+            return get_next_token_logits(model_state, model_graphdef, prefix, mask)
+
+        logits_orig = get_logits(original_seq)
+        logits_cf = get_logits(cf_seq)
+        
+        target_id = int(original_seq[step+1])
+        
+        # Calculate Rank and Logit for the TRUE target in both scenarios
+        def get_stats(l):
+            rank = int(jnp.where(jnp.argsort(l[0])[::-1] == target_id)[0][0]) + 1
+            return rank, float(l[0, target_id])
+
+        rank_o, logit_o = get_stats(logits_orig)
+        rank_cf, logit_cf = get_stats(logits_cf)
+
+        print(f"Step {step+1} | Target: {tokenizer.decode([target_id])!r}")
+        print(f"  ORIGINAL: Rank {rank_o:<3} Logit {logit_o:.2f}")
+        print(f"  SWAPPED:  Rank {rank_cf:<3} Logit {logit_cf:.2f}")
 
 def teacher_force_sequence(model_state, model_graphdef, tokenizer, sequence, top_k, context_size, diagnostics_dir, step_to_load):
     """
@@ -96,11 +137,15 @@ def teacher_force_sequence(model_state, model_graphdef, tokenizer, sequence, top
 
         target_token_id = int(seq[step + 1])
         target_token_str = tokenizer.decode([target_token_id])
+        targ_logit = logits[0, target_token_id]
+        all_ranks = jnp.argsort(logits[0])[::-1]
+        target_rank = int(jnp.where(all_ranks == target_token_id)[0][0] + 1)
+
 
         values_np = jax.device_get(values)
         indices_np = jax.device_get(indices)
 
-        print(f"\nStep {step + 1}/{seq_len - 1} -> target id={target_token_id} token={target_token_str!r}")
+        print(f"\nStep {step + 1}/{seq_len - 1} -> target id={target_token_id} token={target_token_str!r}, targ_rank = {target_rank}")
         for rank, (token_id, logit_val) in enumerate(zip(indices_np.tolist(), values_np.tolist()), start=1):
             decoded_token = tokenizer.decode([token_id])
             decoded_token = decoded_token.replace("\n", "\\n")

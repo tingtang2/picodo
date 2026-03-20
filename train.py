@@ -111,8 +111,9 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     return losses.mean(), (losses, qkv_stats)
 '''
 
-@partial(jax.jit, static_argnames=('model_graphdef'))
-def loss_fn(model_state, model_graphdef, x):
+#@partial(jax.jit, static_argnames=('model_graphdef'))
+@partial(jax.jit, static_argnames=('model_graphdef', 'tmp'))
+def loss_fn(model_state, model_graphdef, x, tmp = False):
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
 
@@ -134,6 +135,35 @@ def loss_fn(model_state, model_graphdef, x):
         logits_fp32,
         #logits_bf16
     )
+
+    if tmp:
+        # We look at 922 because it predicts the target at 923 (" against")
+        # We look at 923 because it predicts the target at 924 (" end" or "End")
+        for spike_pos in [922, 923]: 
+            jax.debug.print("\n--- POSITION {p} ANALYSIS (PREDICTING TARGET AT {t}) ---", p=spike_pos, t=spike_pos+1)
+            jax.debug.print("Target ID: {tid}", tid=y[0, spike_pos])
+            vals, idxs = jax.lax.top_k(logits_fp32[0, spike_pos], k=5)
+            jax.debug.print("Top 5 IDs: {i}", i=idxs)
+            jax.debug.print("Top 5 Logits: {v}", v=vals)
+
+            #mean = jnp.mean(logits_fp32[0, spike_pos])
+            #norm = jnp.linalg.norm(logits_fp32[0, spike_pos])
+            l_pos = logits_fp32[0, spike_pos]
+            mean = jnp.mean(l_pos)
+            std = jnp.std(l_pos)
+            norm = jnp.linalg.norm(l_pos)
+            
+            # 5-Number Summary + Min/Max
+            minimum = jnp.min(l_pos)
+            maximum = jnp.max(l_pos)
+            q1, median, q3 = jnp.percentile(l_pos, jnp.array([25, 50, 75]))
+
+            #jax.debug.print("Mean Logit: {m:.4f} | Logit Norm: {n:.4f}", m=mean, n=norm)
+            jax.debug.print("Min: {mi:.2f} | Q1: {q1:.2f} | Med: {med:.2f} | Q3: {q3:.2f} | Max: {ma:.2f}", mi=minimum, q1=q1, med=median, q3=q3, ma=maximum)
+            jax.debug.print("Mean: {m:.4f} | Std: {s:.4f} | Norm: {n:.4f}", m=mean, s=std, n=norm)
+
+        #import pdb; pdb.set_trace()
+
 
     qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
     qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
@@ -343,6 +373,7 @@ def find_similar_tokens(model_state, tokenizer, trigger_str=" end", top_k=5):
     print(f"Tokens most similar to {trigger_str!r}:")
     for tid in top_ids:
         print(f"ID: {tid:<6} | Token: {tokenizer.decode([int(tid)])!r} | Sim: {cos_sim[tid]:.4f}")
+    import pdb; pdb.set_trace()
     
     return top_ids
 
@@ -376,10 +407,10 @@ def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence,
     print(f"{'Step':<6} | {'Target':<12} | {'Orig Loss':<10} | {'CF Loss':<10} | {'Status'}")
     print("-" * 65)
 
-
     def get_full_results(seq_data):
         input_data = jnp.repeat(seq_data[None, :], 4, axis=0)
-        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data)
+        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data, tmp = True)
+        #_, (losses, qkv, stats) = loss_fn.__wrapped__(model_state, model_graphdef, input_data, tmp=True)
         
         return losses[0]
 
