@@ -5,6 +5,7 @@ import optax
 import wandb
 from functools import partial
 from flax import nnx
+from jax.experimental import multihost_utils
 from tqdm.auto import tqdm
 from omegaconf.dictconfig import DictConfig
 import data, utils
@@ -450,8 +451,18 @@ def train_and_evaluate(c: DictConfig):
                     primary_host=0,
                     active_processes=set(range(jax.process_count()))
                 )
+                # Newer Orbax does not allow create=True when active_processes is set.
+                mngr_options_kwargs['create'] = False
             if jax.process_index() == 0:
                 print(f'Multihost checkpointing enabled with {jax.process_count()} processes')
+
+        # If create=False (required for some multihost Orbax versions),
+        # ensure root directory exists before CheckpointManager construction.
+        if not mngr_options_kwargs.get('create', True):
+            if jax.process_index() == 0:
+                epath.Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+            if is_multihost:
+                multihost_utils.sync_global_devices('ckpt_root_dir_ready')
 
         mngr_options = ocp.CheckpointManagerOptions(**mngr_options_kwargs)
 
