@@ -63,7 +63,6 @@ def compute_logit_distribution_stats(logits_bf16):
         "logit_abs_max": jnp.max(jnp.abs(flat)),
     }
 
-    # Optional but VERY good
     probs = jax.nn.softmax(flat, axis=-1)
     entropy = -jnp.sum(probs * jnp.log(probs + 1e-9), axis=-1)
     stats["softmax_entropy_mean"] = jnp.mean(entropy)
@@ -113,15 +112,13 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
 
 #@partial(jax.jit, static_argnames=('model_graphdef'))
 @partial(jax.jit, static_argnames=('model_graphdef', 'tmp'))
-def loss_fn(model_state, model_graphdef, x, tmp = False):
+def loss_fn(model_state, model_graphdef, x, tmp = False, pos = None):
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
-
     logits_bf16, qkv_dict = model(x, return_qkv=True)
-    #print("loss fn logits ", logits_bf16)
     logits_fp32 = logits_bf16.astype(jnp.float32)
 
-    #TODO change precision here (either bf16 or fp32)
+    #change precision here (either bf16 or fp32)
     losses = optax.softmax_cross_entropy_with_integer_labels(
         logits_fp32, y
     )
@@ -139,35 +136,37 @@ def loss_fn(model_state, model_graphdef, x, tmp = False):
     if tmp:
         # We look at 922 because it predicts the target at 923 (" against")
         # We look at 923 because it predicts the target at 924 (" end" or "End")
-        for spike_pos in [922, 923]: 
-            jax.debug.print("\n--- POSITION {p} ANALYSIS (PREDICTING TARGET AT {t}) ---", p=spike_pos, t=spike_pos+1)
-            jax.debug.print("Target ID: {tid}", tid=y[0, spike_pos])
-            vals, idxs = jax.lax.top_k(logits_fp32[0, spike_pos], k=5)
-            jax.debug.print("Top 5 IDs: {i}", i=idxs)
-            jax.debug.print("Top 5 Logits: {v}", v=vals)
-
-            #mean = jnp.mean(logits_fp32[0, spike_pos])
-            #norm = jnp.linalg.norm(logits_fp32[0, spike_pos])
+        for spike_pos in [pos-3, pos-2, pos-1, pos]: 
             l_pos = logits_fp32[0, spike_pos]
+                    
+            # Calculate everything first
             mean = jnp.mean(l_pos)
             std = jnp.std(l_pos)
             norm = jnp.linalg.norm(l_pos)
-            
-            # 5-Number Summary + Min/Max
             minimum = jnp.min(l_pos)
             maximum = jnp.max(l_pos)
-            q1, median, q3 = jnp.percentile(l_pos, jnp.array([25, 50, 75]))
+            q1, med, q3 = jnp.percentile(l_pos, jnp.array([25, 50, 75]))
+            vals, idxs = jax.lax.top_k(l_pos, k=5)
+            target_id = y[0, spike_pos]
 
-            #jax.debug.print("Mean Logit: {m:.4f} | Logit Norm: {n:.4f}", m=mean, n=norm)
-            jax.debug.print("Min: {mi:.2f} | Q1: {q1:.2f} | Med: {med:.2f} | Q3: {q3:.2f} | Max: {ma:.2f}", mi=minimum, q1=q1, med=median, q3=q3, ma=maximum)
-            jax.debug.print("Mean: {m:.4f} | Std: {s:.4f} | Norm: {n:.4f}", m=mean, s=std, n=norm)
-
-        #import pdb; pdb.set_trace()
-
+            # Build one giant format string so the output stays atomic
+            report = (
+                "\n--- POSITION {p} ANALYSIS (TARGET AT {t}) ---\n"
+                "Target ID: {tid}\n"
+                "Top 5 IDs: {i}\n"
+                "Top 5 Logits: {v}\n"
+                "Min: {mi:.2f} | Q1: {q1:.2f} | Med: {med:.2f} | Q3: {q3:.2f} | Max: {ma:.2f}\n"
+                "Mean: {m:.4f} | Std: {s:.4f} | Norm: {n:.4f}\n"
+                "------------------------------------------"
+            )
+            
+            jax.debug.print(report, 
+                            p=spike_pos, t=spike_pos+1, tid=target_id, 
+                            i=idxs, v=vals, mi=minimum, q1=q1, med=med, 
+                            q3=q3, ma=maximum, m=mean, s=std, n=norm)
 
     qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
     qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
-
     return losses.mean(), (losses, qkv_stats, logit_stats)
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
@@ -333,31 +332,51 @@ def eval_step(c, model_state, model_graphdef, dataset, inspect_spike = False, to
     
     if inspect_spike: 
         all_raw_losses = jnp.concatenate(raw_losses, axis=0) # [TotalSamples, SeqLen]
-        
-        # find the absolute biggest loss value
-        max_loss_val = jnp.max(all_raw_losses)
-        max_idx = jnp.argmax(all_raw_losses)
-        
-        # math to get the exact sequence and position
         num_sequences, seq_len = all_raw_losses.shape
-        spike_seq_idx = max_idx // seq_len
-        spike_pos = max_idx % seq_len
 
-        # need the actual tokens for that specific sequence
-        spiky_batch = dataset[int(spike_seq_idx // c.opt.batch_size)]
-        spiky_sequence = spiky_batch[int(spike_seq_idx % c.opt.batch_size)]
+        flat_losses = all_raw_losses.flatten()
+        top_k = 5
+        idx_dec = jnp.argsort(flat_losses)[::-1][:top_k]
 
-        print(f"\n[DIAGNOSTIC] Global Max Loss: {max_loss_val:.2f}")
-        print(f"[DIAGNOSTIC] Sequence Index: {spike_seq_idx}, Position: {spike_pos}")
+        top_k_seqs = []
+        top_k_pos = []
+        print(f"\n--- [DIAGNOSTIC] TOP {top_k} HIGHEST LOSS POSITIONS ---")
+        for i, glob_idx in enumerate(idx_dec):
+            loss_val = flat_losses[glob_idx]
+            seq_idx, pos = glob_idx // seq_len, glob_idx % seq_len
+            top_k_pos.append(pos)
+
+            batch_idx = int(seq_idx // c.opt.batch_size)
+            sample_in_batch = int(seq_idx % c.opt.batch_size)
+
+            spiky_batch = dataset[batch_idx]
+            spiky_seq = spiky_batch[sample_in_batch]
+            top_k_seqs.append(spiky_seq)
+
+            target_token_id = spiky_seq[pos + 1]
+            target_token = tokenizer.decode([int(target_token_id)])
+
+            # The context leading UP TO the prediction (includes the "trigger" token)
+            trigger_token = tokenizer.decode([int(spiky_seq[pos])]) 
+            context_window = tokenizer.decode(spiky_seq[max(0, pos-5):pos])
+
+            print(f"Rank {i+1} | Loss: {loss_val:.2f} | Sequence Index: {seq_idx}")
+            print(f"  Context: \"...{context_window}\"")
+            print(f"  Trigger Token (at pos {pos}): '{trigger_token}'")
+            print(f"  Target Token (at pos {pos+1}): '{target_token}'")
+
 
         #CALL COUNTERFACTUAL ANALYSIS HERE
-        counterfactual_analysis(
-            c =c, model_state=model_state,
-            model_graphdef=model_graphdef,
-            tokenizer=tokenizer, # Make sure tokenizer is passed into eval_step or is global
-            sequence=spiky_sequence,
-            spike_pos=int(spike_pos)
-        )
+        for i in range(top_k):
+            counterfactual_analysis(
+                c =c, model_state=model_state,
+                model_graphdef=model_graphdef,
+                tokenizer=tokenizer, # Make sure tokenizer is passed into eval_step or is global
+                #sequence=spiky_sequence,
+                #spike_pos=int(spike_pos)
+                sequence= top_k_seqs[i],
+                spike_pos= int(top_k_pos[i])
+            )
     return mean_loss, raw_losses, total_logits, mean_output_logit, mean_logit_stats
 
 def find_similar_tokens(model_state, tokenizer, trigger_str=" end", top_k=5):
@@ -370,12 +389,28 @@ def find_similar_tokens(model_state, tokenizer, trigger_str=" end", top_k=5):
     cos_sim = jnp.dot(embs_norm, trigger_vec)
     
     top_ids = jnp.argsort(cos_sim)[-(top_k+1):-1][::-1]
+    '''
     print(f"Tokens most similar to {trigger_str!r}:")
     for tid in top_ids:
         print(f"ID: {tid:<6} | Token: {tokenizer.decode([int(tid)])!r} | Sim: {cos_sim[tid]:.4f}")
-    import pdb; pdb.set_trace()
-    
+    '''
     return top_ids
+
+def find_critical_context_length(model_state, model_graphdef, tokenizer, full_seq, spike_pos):
+    pad_id = 50256 
+    step_size = 50
+    res = [] 
+
+    for n in range(0, spike_pos, step_size):
+        #mask everything until spike_pos - n - tail of context
+        test_seq = jnp.array(full_seq)
+        test_seq = test_seq.at[:spike_pos - n].set(pad_id)
+        input_data = jnp.repeat( test_seq[None, :], 4, axis = 0)
+        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data, tmp = False)
+        current_loss, current_norm = losses[0, spike_pos], logit_stats['norm'][0, spike_pos]
+        res.append((n, current_loss, current_norm))
+
+    return res 
 
 def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence, spike_pos, swap_token_str=" "):
     context_size = c.model.T
@@ -383,42 +418,46 @@ def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence,
     original_seq = jnp.array(sequence)
     
     top_sim_ids = find_similar_tokens(model_state, tokenizer, trigger_str=tokenizer.decode([ int(original_seq[spike_pos]) ] ), top_k=5)
-    swap_token_id = int(top_sim_ids[1])
+    swap_token_id = int(top_sim_ids[0])
     swap_token_str = tokenizer.decode([swap_token_id])
     #swap_token_id = tokenizer.encode(swap_token_str)[0]
 
     #construct counterfactual sequence 
-    #cf_seq = original_seq.at[spike_pos].set(swap_token_id)
     cf_seq = original_seq.copy()
     start_swap = max(0, spike_pos - 0) #just swap spike_pos itself 
-    cf_seq = cf_seq.at[start_swap : spike_pos + 1].set(swap_token_id)
+    #cf_seq = cf_seq.at[start_swap : spike_pos + 1].set(swap_token_id)
 
     print(f"\n--- Counterfactual Analysis at Position {spike_pos} ---")
-    #print(f"Original token: {tokenizer.decode([original_seq[spike_pos]])!r}")
-    #print(f"Swapped token:  {tokenizer.decode([swap_token_id])!r}")
     orig_context_str = tokenizer.decode(original_seq[start_swap:spike_pos + 1].tolist())
     print(f"Original Context (Indices {start_swap}-{spike_pos}): {orig_context_str!r}")
     print(f"Swapping tokens from index {start_swap} to {spike_pos} with {swap_token_str!r}")
+
+    start_idx = max(0, spike_pos - 2)
+    for i in range(start_idx, spike_pos):
+        top_sim_ids = find_similar_tokens(model_state, tokenizer, trigger_str=tokenizer.decode([ int(original_seq[i]) ] ), top_k=5)
+        swap_token_id = int(top_sim_ids[0])
+        swap_token_str = tokenizer.decode([swap_token_id])
+
+        cf_seq = cf_seq.at[i].set(swap_token_id)
+        jax.debug.print("Position {pos}: Swapped '{orig}' -> '{new}'", pos=i, orig= tokenizer.decode([ int(original_seq[i]) ] ), new=swap_token_str)
 
     # We will look at the next 10 tokens to see if the model "recovers"
     window = 10
     end_pos = min(spike_pos + window, len(sequence) - 1)
 
-    print(f"{'Step':<6} | {'Target':<12} | {'Orig Loss':<10} | {'CF Loss':<10} | {'Status'}")
-    print("-" * 65)
-
     def get_full_results(seq_data):
         input_data = jnp.repeat(seq_data[None, :], 4, axis=0)
-        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data, tmp = True)
-        #_, (losses, qkv, stats) = loss_fn.__wrapped__(model_state, model_graphdef, input_data, tmp=True)
-        
+        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data, tmp = True, pos = spike_pos)
         return losses[0]
 
     # Run the model only twice total
     orig_losses = get_full_results(original_seq)
     cf_losses = get_full_results(cf_seq)
 
-    for step in range(spike_pos, end_pos):
+    print("-" * 65)
+    print(f"{'Step':<6} | {'Target':<12} | {'Orig Loss':<10} | {'CF Loss':<10} | {'Status'}")
+
+    for step in range(spike_pos-3, end_pos):
             target_id = int(original_seq[step+1])
             target_str = tokenizer.decode([target_id]).replace("\n", "\\n")
             
@@ -437,6 +476,31 @@ def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence,
     tail_orig = orig_losses[spike_pos+1:]
     tail_cf = cf_losses[spike_pos+1:]
     print(f"{'Tail Mean':<15} | {jnp.mean(tail_orig):<12.4f} | {jnp.mean(tail_cf):<12.4f}")
+
+    res = find_critical_context_length(model_state, model_graphdef, tokenizer, original_seq, spike_pos)
+    import pdb; pdb.set_trace()
+
+
+    #--------
+    '''
+    eos_id = tokenizer.eos_id  # or whatever your EOS token ID is
+    indices = jnp.where(current_seq == eos_id)[0]
+    if len(indices) > 0:
+        start_pos = indices[0] + 1
+        # Slice from the start of the second doc to the trigger token (' end')
+        # spike_pos is the index of ' end' we found earlier
+        isolated_seq = current_seq[start_pos : spike_pos + 1]
+        new_pos = len(isolated_seq) - 1
+        
+        jax.debug.print("Isolated Sequence Length: {l}", l=len(isolated_seq))
+        jax.debug.print("First 3 Tokens of Isolated Doc: {t}", 
+                        t=tok.decode(isolated_seq[:3].tolist()))
+
+        loss_eos = get_full_results(isolated_seq)
+        print("new loss is ", )
+    '''
+    #do this stress testing - how little of context feed in to get spike 
+
 
 def train_and_evaluate(c: DictConfig):
     # init distributed env if using multiple vms
