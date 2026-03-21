@@ -436,10 +436,20 @@ def train_and_evaluate(c: DictConfig):
         is_multihost = jax.process_count() > 1
         if is_multihost:
             mngr_options_kwargs['enable_async_checkpointing'] = True
-            mngr_options_kwargs['multiprocessing_options'] = ocp.multiprocessing.MultiprocessingOptions(
-                primary_host=0,
-                active_processes=set(range(jax.process_count()))
-            )
+            # Orbax API changed across versions:
+            # newer versions expose options under ocp.options.*,
+            # older versions use ocp.multiprocessing.*.
+            mp_options_cls = None
+            if hasattr(ocp, 'options') and hasattr(ocp.options, 'MultiprocessingOptions'):
+                mp_options_cls = ocp.options.MultiprocessingOptions
+            elif hasattr(ocp, 'multiprocessing') and hasattr(ocp.multiprocessing, 'MultiprocessingOptions'):
+                mp_options_cls = ocp.multiprocessing.MultiprocessingOptions
+
+            if mp_options_cls is not None:
+                mngr_options_kwargs['multiprocessing_options'] = mp_options_cls(
+                    primary_host=0,
+                    active_processes=set(range(jax.process_count()))
+                )
             if jax.process_index() == 0:
                 print(f'Multihost checkpointing enabled with {jax.process_count()} processes')
 
