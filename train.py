@@ -46,27 +46,38 @@ class _StandardNameFormatHNS(step_lib._StandardNameFormat):
 
 
 
-@partial(jax.jit, static_argnames=('model_graphdef'))
-def loss_fn(model_state, model_graphdef, x): # [B, T]
+@partial(jax.jit, static_argnames=('model_graphdef', 'collect_qkv_stats'))
+def loss_fn(model_state, model_graphdef, x, collect_qkv_stats: bool = True): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
-    logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
+    if collect_qkv_stats:
+        logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
+    else:
+        logits = model(x, return_qkv=False) # [B, T, V]
+        qkv_dict = None
 
     logits = logits.astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
 
-    qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
-    qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
+    if collect_qkv_stats:
+        qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
+        qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
+    else:
+        qkv_stats = {}
     
     return losses.mean(), (losses, qkv_stats)
 
-@partial(jax.jit, static_argnames=('model_graphdef'))
-def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
+@partial(jax.jit, static_argnames=('model_graphdef', 'collect_qkv_stats'))
+def loss_fn_z_loss(model_state, model_graphdef, x, collect_qkv_stats: bool = True): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
-    logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
+    if collect_qkv_stats:
+        logits, qkv_dict = model(x, return_qkv=True) # [B, T, V]
+    else:
+        logits = model(x, return_qkv=False) # [B, T, V]
+        qkv_dict = None
     log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
     losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
@@ -76,15 +87,20 @@ def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
     z_loss = (z**2).mean()
     lam = 1e-4
 
-    qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
-    qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
+    if collect_qkv_stats:
+        qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
+        qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
+    else:
+        qkv_stats = {}
     
     return losses.mean() + lam * z_loss, (losses, qkv_stats)
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
-def train_step(opt_state, opt_graphdef, model_graphdef, batch):
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats'), donate_argnames=('opt_state'))
+def train_step(opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats: bool = True):
     # Use has_aux=True to get the raw losses
-    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+        opt_state.model, model_graphdef, batch, collect_qkv_stats
+    )
     
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
@@ -92,10 +108,12 @@ def train_step(opt_state, opt_graphdef, model_graphdef, batch):
     
     return opt_state, loss, raw_loss, grads
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
-def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats'), donate_argnames=('opt_state'))
+def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats: bool = True):
     # Use has_aux=True to get the raw losses
-    (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(opt_state.model, model_graphdef, batch)
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(
+        opt_state.model, model_graphdef, batch, collect_qkv_stats
+    )
     
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
@@ -103,10 +121,12 @@ def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch):
     
     return opt_state, loss, raw_loss, grads
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
-def train_step_centered(opt_state, opt_graphdef, model_graphdef, batch):
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats'), donate_argnames=('opt_state'))
+def train_step_centered(opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats: bool = True):
     # Use has_aux=True to get the raw losses
-    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(opt_state.model, model_graphdef, batch)
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+        opt_state.model, model_graphdef, batch, collect_qkv_stats
+    )
     
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
@@ -115,10 +135,12 @@ def train_step_centered(opt_state, opt_graphdef, model_graphdef, batch):
     
     return opt_state, loss, raw_loss, grads
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state'))
-def train_step_z_loss_centered(opt_state, opt_graphdef, model_graphdef, batch):
+@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats'), donate_argnames=('opt_state'))
+def train_step_z_loss_centered(opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats: bool = True):
     # Use has_aux=True to get the raw losses
-    (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(opt_state.model, model_graphdef, batch)
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(
+        opt_state.model, model_graphdef, batch, collect_qkv_stats
+    )
     
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
@@ -216,7 +238,7 @@ def get_logit_grad_scaling_stats(model_state, model_graphdef, x): # [B, T]
     }
 
 
-def eval_step(c, model_state, model_graphdef, dataset):
+def eval_step(c, model_state, model_graphdef, dataset, collect_qkv_stats: bool = True):
     loss_sum = jnp.zeros([], dtype=jnp.float32)
     raw_losses = []
     total_logits = []
@@ -226,9 +248,13 @@ def eval_step(c, model_state, model_graphdef, dataset):
     for i in range(len(dataset)):
         batch = dataset[i]
         if c.opt.use_z_loss:
-            batch_loss, (raw_loss, _) = loss_fn_z_loss(model_state, model_graphdef, batch)
+            batch_loss, (raw_loss, _) = loss_fn_z_loss(
+                model_state, model_graphdef, batch, collect_qkv_stats
+            )
         else:
-            batch_loss, (raw_loss, _) = loss_fn(model_state, model_graphdef, batch)
+            batch_loss, (raw_loss, _) = loss_fn(
+                model_state, model_graphdef, batch, collect_qkv_stats
+            )
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
         logit_mean_sum += get_mean_and_norm_output_logit(model_state, model_graphdef, batch)[0]
@@ -528,6 +554,7 @@ def train_and_evaluate(c: DictConfig):
     log_metrics_per_step = bool(getattr(c, "log_metrics_per_step", False))
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
+    collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
@@ -557,20 +584,20 @@ def train_and_evaluate(c: DictConfig):
         if c.opt.use_z_loss:
             if mucentering:
                 opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss_centered(
-                    opt_state, opt_graphdef, model_graphdef, batch
+                    opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
                 )
             else:
                 opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(
-                    opt_state, opt_graphdef, model_graphdef, batch
+                    opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
                 )
         else:
             if mucentering:
                 opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_centered(
-                    opt_state, opt_graphdef, model_graphdef, batch
+                    opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
                 )
             else:
                 opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(
-                    opt_state, opt_graphdef, model_graphdef, batch
+                    opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
                 )
         # if jax.process_index() == 0:
         #     min_train_loss = float(jax.device_get(jnp.min(train_raw_loss)))
@@ -623,7 +650,9 @@ def train_and_evaluate(c: DictConfig):
         
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
-            eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(c, opt_state.model, model_graphdef, ds_valid)
+            eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(
+                c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats
+            )
             flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
             metrics = {}
             metrics['eval_loss'] = eval_loss
@@ -660,7 +689,9 @@ def train_and_evaluate(c: DictConfig):
         sys.exit(1)
 
     # eval at end of training
-    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(c, opt_state.model, model_graphdef, ds_valid)
+    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(
+        c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats
+    )
     metrics = {}
     flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
     metrics['eval_loss'] = eval_loss

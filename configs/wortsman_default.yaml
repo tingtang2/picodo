@@ -57,3 +57,4 @@ checkpoint:
 diagnostics:
   end_step: null # to specific end step
   save_raw_losses: false
+  collect_qkv_stats: false
