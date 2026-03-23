@@ -22,38 +22,99 @@ def load_data_shard(file):
     return tokens
 
 
+def get_num_tokens(file):
+    header = np.fromfile(file, dtype=np.int32, count=256)
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    return int(header[2])
+
+
 def download_dataset(
         dataset: Literal['fineweb', 'finewebedu'] = 'fineweb',
         num_chunks: Optional[int] = None,
+        full_fineweb100b: bool = False,
+        stream_write: bool = False,
+        shard_dir: Optional[str] = None,
+        hf_cache_dir: Optional[str] = None,
+        keep_shards: bool = False,
     ):
     """download dataset, save it as a np.memmap binary file"""
 
+    # full_fineweb100b is only available for fineweb.
+    if full_fineweb100b and dataset != 'fineweb':
+        raise ValueError("full_fineweb100b=True is only supported when dataset='fineweb'.")
+
+    repo_id = f'kjj0/{dataset}10B-gpt2'
+    default_chunks = 103 if dataset == 'fineweb' else 99
+    output_name = f'{dataset}_gpt2.bin'
+
+    if full_fineweb100b:
+        repo_id = 'kjj0/fineweb100B-gpt2'
+        default_chunks = 1030
+        output_name = 'fineweb100B_gpt2.bin'
+
     # get num. chunks
-    # by default, download all chunnks (10B tokens)
     # each chunk is 100M tokens
     if num_chunks is None:
-        if dataset == 'fineweb': num_chunks = 103
-        if dataset == 'finewebedu': num_chunks = 99
-
-    # load chunks into memory
-    print('downloading...')
-    shards = []
-    for i in tqdm(range(1, num_chunks+1)):
-        shard_path = hf_hub_download(repo_id=f'kjj0/{dataset}10B-gpt2', filename=f'{dataset}_train_{i:06}.bin', repo_type="dataset")
-        shards += [load_data_shard(shard_path)]
+        num_chunks = default_chunks
 
     # save to disk
-    print('saving...')
     out_dir = os.path.expanduser('~/datasets')
-    out_path = f'{out_dir}/{dataset}_gpt2.bin'
+    out_path = f'{out_dir}/{output_name}'
     os.makedirs(out_dir, exist_ok=True)
-    n_tokens = sum(map(len, shards))
-    out = np.memmap(out_path, dtype=np.uint16, mode='w+', shape=[n_tokens])
-    i = 0
-    for shard in tqdm(shards):
-        out[i:i+len(shard)] = shard
-        i += len(shard)
-    out.flush()
+
+    if stream_write:
+        if shard_dir is None:
+            shard_dir = '/dev/shm/fineweb_shards' if os.path.isdir('/dev/shm') else '/tmp/fineweb_shards'
+        if hf_cache_dir is None:
+            hf_cache_dir = '/dev/shm/hf_cache' if os.path.isdir('/dev/shm') else None
+
+        shard_dir = os.path.expanduser(shard_dir)
+        os.makedirs(shard_dir, exist_ok=True)
+        if hf_cache_dir is not None:
+            hf_cache_dir = os.path.expanduser(hf_cache_dir)
+            os.makedirs(hf_cache_dir, exist_ok=True)
+
+        print('downloading + streaming to output...')
+        with Path(out_path).open('wb') as fout:
+            for i in tqdm(range(1, num_chunks + 1)):
+                download_kwargs = dict(
+                    repo_id=repo_id,
+                    filename=f'{dataset}_train_{i:06}.bin',
+                    repo_type='dataset',
+                    local_dir=shard_dir,
+                )
+                if hf_cache_dir is not None:
+                    download_kwargs['cache_dir'] = hf_cache_dir
+                shard_path = hf_hub_download(**download_kwargs)
+                shard = load_data_shard(shard_path)
+                shard.tofile(fout)
+                if not keep_shards and os.path.exists(shard_path):
+                    os.remove(shard_path)
+    else:
+        # download all shard paths first
+        print('downloading...')
+        shard_paths = []
+        for i in tqdm(range(1, num_chunks+1)):
+            download_kwargs = dict(
+                repo_id=repo_id,
+                filename=f'{dataset}_train_{i:06}.bin',
+                repo_type='dataset',
+            )
+            if hf_cache_dir is not None:
+                download_kwargs['cache_dir'] = os.path.expanduser(hf_cache_dir)
+            shard_path = hf_hub_download(**download_kwargs)
+            shard_paths.append(shard_path)
+
+        print('saving...')
+        n_tokens = sum(get_num_tokens(path) for path in shard_paths)
+        out = np.memmap(out_path, dtype=np.uint16, mode='w+', shape=[n_tokens])
+        i = 0
+        for shard_path in tqdm(shard_paths):
+            shard = load_data_shard(shard_path)
+            out[i:i+len(shard)] = shard
+            i += len(shard)
+        out.flush()
 
 
 if __name__ == '__main__':
