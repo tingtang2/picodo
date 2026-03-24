@@ -174,7 +174,7 @@ def get_mean_and_norm_output_logit(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
     logits = model(x) # [B, T, V]
     logits = logits[:, :-1].astype(jnp.float32)
-    return logits.mean(), utils.get_l2_norm(logits)
+    return logits.mean(), utils.get_l2_norm(logits), logits.std()
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
@@ -243,6 +243,7 @@ def eval_step(c, model_state, model_graphdef, dataset, collect_qkv_stats: bool =
     raw_losses = []
     total_logits = []
     logit_mean_sum = jnp.zeros([], dtype=jnp.float32)
+    logit_std_sum = jnp.zeros([], dtype=jnp.float32)
 
     
     for i in range(len(dataset)):
@@ -257,14 +258,19 @@ def eval_step(c, model_state, model_graphdef, dataset, collect_qkv_stats: bool =
             )
         loss_sum += batch_loss
         raw_losses.append(raw_loss)
-        logit_mean_sum += get_mean_and_norm_output_logit(model_state, model_graphdef, batch)[0]
+        output_logit_mean, _, output_logit_std = get_mean_and_norm_output_logit(
+            model_state, model_graphdef, batch
+        )
+        logit_mean_sum += output_logit_mean
+        logit_std_sum += output_logit_std
         if c.diagnostics.save_raw_losses:
             total_logits.append(get_logits_by_lm_head(model_state, model_graphdef, batch).astype(jnp.float32))
 
     mean_loss = loss_sum / len(dataset)
     mean_output_logit = logit_mean_sum / len(dataset)
+    mean_output_logit_std = logit_std_sum / len(dataset)
     
-    return mean_loss, raw_losses, total_logits, mean_output_logit
+    return mean_loss, raw_losses, total_logits, mean_output_logit, mean_output_logit_std
 
 
 def _build_train_metrics(
@@ -275,6 +281,7 @@ def _build_train_metrics(
     train_lower_90th_mean_loss,
     output_logit_mean,
     output_logit_norm,
+    output_logit_std,
     opt_state,
     grads,
     lr_schedule,
@@ -289,6 +296,7 @@ def _build_train_metrics(
     metrics['train_tokens_seen'] = (step + 1) * tokens_per_opt_step
     metrics['train_output_logit_mean'] = output_logit_mean
     metrics['train_output_logit_norm'] = output_logit_norm
+    metrics['train_output_logit_std'] = output_logit_std
     metrics['lr'] = lr_schedule(step)
     metrics.update(utils.get_layer_grad_norms_split(grads))
     metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
@@ -570,8 +578,9 @@ def train_and_evaluate(c: DictConfig):
         )
         pre_output_logit_mean = None
         pre_output_logit_norm = None
+        pre_output_logit_std = None
         if will_log_train_metrics:
-            pre_output_logit_mean, pre_output_logit_norm = get_mean_and_norm_output_logit(
+            pre_output_logit_mean, pre_output_logit_norm, pre_output_logit_std = get_mean_and_norm_output_logit(
                 opt_state.model, model_graphdef, batch
             )
         logit_grad_stats = None
@@ -616,6 +625,7 @@ def train_and_evaluate(c: DictConfig):
                 utils.compute_lower_90th_percentile_mean(train_raw_loss),
                 pre_output_logit_mean,
                 pre_output_logit_norm,
+                pre_output_logit_std,
                 opt_state,
                 grads,
                 lr_schedule,
@@ -638,6 +648,7 @@ def train_and_evaluate(c: DictConfig):
                     train_lower_90th_mean_loss_sum / train_loss_num,
                     pre_output_logit_mean,
                     pre_output_logit_norm,
+                    pre_output_logit_std,
                     opt_state,
                     grads,
                     lr_schedule,
@@ -650,13 +661,14 @@ def train_and_evaluate(c: DictConfig):
         
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
-            eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(
+            eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit, mean_eval_output_logit_std = eval_step(
                 c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats
             )
             flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
             metrics = {}
             metrics['eval_loss'] = eval_loss
             metrics['eval_output_logit_mean'] = mean_eval_output_logit
+            metrics['eval_output_logit_std'] = mean_eval_output_logit_std
             metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
             metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
@@ -689,13 +701,14 @@ def train_and_evaluate(c: DictConfig):
         sys.exit(1)
 
     # eval at end of training
-    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(
+    eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit, mean_eval_output_logit_std = eval_step(
         c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats
     )
     metrics = {}
     flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
     metrics['eval_loss'] = eval_loss
     metrics['eval_output_logit_mean'] = mean_eval_output_logit
+    metrics['eval_output_logit_std'] = mean_eval_output_logit_std
     metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
     metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
     if jax.process_index() == 0:
