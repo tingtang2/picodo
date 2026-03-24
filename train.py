@@ -398,19 +398,77 @@ def find_similar_tokens(model_state, tokenizer, trigger_str=" end", top_k=5):
 
 def find_critical_context_length(model_state, model_graphdef, tokenizer, full_seq, spike_pos):
     pad_id = 50256 
-    step_size = 50
+    step_size = spike_pos // 16
     res = [] 
 
     for n in range(0, spike_pos, step_size):
-        #mask everything until spike_pos - n - tail of context
+        #pad everything until spike_pos - n - tail of context
         test_seq = jnp.array(full_seq)
         test_seq = test_seq.at[:spike_pos - n].set(pad_id)
         input_data = jnp.repeat( test_seq[None, :], 4, axis = 0)
         _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data, tmp = False)
-        current_loss, current_norm = losses[0, spike_pos], logit_stats['norm'][0, spike_pos]
-        res.append((n, current_loss, current_norm))
+        current_loss = losses[0, spike_pos]
+        res.append((n, current_loss))
 
     return res 
+
+def one_pass_ablation(c, model_state, model_graphdef, tokenizer, full_seq, spike_pos):
+    # NOTE: original batched approach below is buggy — batching different sequences
+    # together produces incorrect results due to FSDP sharding. When we patch flash
+    # attention out (needed for masking), jax.nn.dot_product_attention doesn't
+    # coordinate the parameter all-gather across data-parallel devices. With identical
+    # sequences per core the bug is invisible; with different sequences it corrupts
+    # the logits. We now loop with 4 identical copies per context length instead.
+    #
+    # --- original batched code (broken) ---
+    # batch_seqs = []
+    # batch_masks = []
+    # for l in lengths:
+    #     seq = jnp.array(full_seq)
+    #     mask = jnp.ones(seq_len, dtype=jnp.int32)
+    #     pad_until = max(0, spike_pos - l)
+    #     if pad_until > 0:
+    #         seq = seq.at[:pad_until].set(pad_token_id)
+    #         mask = mask.at[:pad_until].set(0)
+    #     batch_seqs.append(seq)
+    #     batch_masks.append(mask)
+    # batch = jnp.stack(batch_seqs)
+    # attention_mask = jnp.stack(batch_masks)
+    # model = nnx.merge(model_graphdef, model_state)
+    # for block in model.blocks:
+    #     block.attn.use_flash_attn = False
+    #     block.attn.attention = partial(jax.nn.dot_product_attention, is_causal=False)
+    # logits = model(batch, attention_mask=attention_mask)
+    # --- end original batched code ---
+
+    pad_token_id = tokenizer.eot_token
+    step = spike_pos // 16
+    lengths = [step * i for i in range(1, 16)] + [spike_pos]
+    seq_len = len(full_seq)
+
+    model = nnx.merge(model_graphdef, model_state)
+    for block in model.blocks:
+        block.attn.use_flash_attn = False
+        block.attn.attention = partial(jax.nn.dot_product_attention, is_causal=False)
+
+    results = []
+    for l in lengths:
+        seq = jnp.array(full_seq)
+        mask = jnp.ones(seq_len, dtype=jnp.int32)
+        pad_until = max(0, spike_pos - l)
+        if pad_until > 0:
+            seq = seq.at[:pad_until].set(pad_token_id)
+            mask = mask.at[:pad_until].set(0)
+        batch = jnp.repeat(seq[None, :], 4, axis=0)
+        attention_mask = jnp.repeat(mask[None, :], 4, axis=0)
+        logits = model(batch, attention_mask=attention_mask)
+        logits_fp32 = logits[0].astype(jnp.float32)
+        targets = jnp.roll(jnp.array(full_seq), -1)
+        losses = optax.softmax_cross_entropy_with_integer_labels(logits_fp32, targets)
+        losses = losses.at[-1].set(0)
+        results.append(losses)
+
+    return lengths, results
 
 def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence, spike_pos, swap_token_str=" "):
     context_size = c.model.T
@@ -480,26 +538,37 @@ def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence,
     res = find_critical_context_length(model_state, model_graphdef, tokenizer, original_seq, spike_pos)
     import pdb; pdb.set_trace()
 
+    #DEBUGGING 
+    #########################
+    # 1. Get the "ground truth" loss at spike_pos via loss_fn (flash attn ON)           
 
-    #--------
-    '''
-    eos_id = tokenizer.eos_id  # or whatever your EOS token ID is
-    indices = jnp.where(current_seq == eos_id)[0]
-    if len(indices) > 0:
-        start_pos = indices[0] + 1
-        # Slice from the start of the second doc to the trigger token (' end')
-        # spike_pos is the index of ' end' we found earlier
-        isolated_seq = current_seq[start_pos : spike_pos + 1]
-        new_pos = len(isolated_seq) - 1
-        
-        jax.debug.print("Isolated Sequence Length: {l}", l=len(isolated_seq))
-        jax.debug.print("First 3 Tokens of Isolated Doc: {t}", 
-                        t=tok.decode(isolated_seq[:3].tolist()))
+    #FLASH ON (ORIGINAL) 
+    input_data = jnp.repeat(original_seq[None, :], 4, axis = 0)
+    _, (ref_losses, _, _) = loss_fn(model_state, model_graphdef, input_data, tmp=False)
+    print("loss_fn (flash ON):", float(ref_losses[0, spike_pos]))                       
+    #FLASH OFF
+    model = nnx.merge(model_graphdef, model_state)                                       
+    for block in model.blocks:               
+        block.attn.use_flash_attn = False
+        block.attn.attention = partial(jax.nn.dot_product_attention, is_causal=False)
+    logits = model(original_seq[None, :].repeat(4, axis=0))
+    logits_fp32 = logits.astype(jnp.float32)
+    spike_logits = logits_fp32[0, spike_pos, :]                                         
+    log_probs = jax.nn.log_softmax(spike_logits, axis=-1)
+    targ_id = original_seq[spike_pos + 1]    
+    print("patched model (flash OFF):", float(-log_probs[targ_id]))
+    #########################
 
-        loss_eos = get_full_results(isolated_seq)
-        print("new loss is ", )
-    '''
-    #do this stress testing - how little of context feed in to get spike 
+
+    #do this stress testing - how little of context feed in to get spike
+    lengths, mask_losses = one_pass_ablation(c, model_state, model_graphdef, tokenizer, original_seq, spike_pos)
+    print("\n" + "="*40)
+    print("ONE-PASS CONTEXT ABLATION")
+    print("="*40)
+    print(f"{'Context Len':<12} | {'Loss at spike':<12}")
+    print("-" * 30)
+    for l, lo in zip(lengths, mask_losses):
+        print(f"{int(l):<12} | {float(lo[spike_pos]):<12.4f}")
 
 
 def train_and_evaluate(c: DictConfig):
