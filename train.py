@@ -401,7 +401,8 @@ def find_critical_context_length(model_state, model_graphdef, tokenizer, full_se
     step_size = spike_pos // 16
     res = [] 
 
-    for n in range(0, spike_pos, step_size):
+    trials = [i for i in range(0, spike_pos, step_size)] + [spike_pos - 1] + [spike_pos]
+    for n in trials:
         #pad everything until spike_pos - n - tail of context
         test_seq = jnp.array(full_seq)
         test_seq = test_seq.at[:spike_pos - n].set(pad_id)
@@ -536,12 +537,8 @@ def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence,
     print(f"{'Tail Mean':<15} | {jnp.mean(tail_orig):<12.4f} | {jnp.mean(tail_cf):<12.4f}")
 
     res = find_critical_context_length(model_state, model_graphdef, tokenizer, original_seq, spike_pos)
-    import pdb; pdb.set_trace()
-
     #DEBUGGING 
     #########################
-    # 1. Get the "ground truth" loss at spike_pos via loss_fn (flash attn ON)           
-
     #FLASH ON (ORIGINAL) 
     input_data = jnp.repeat(original_seq[None, :], 4, axis = 0)
     _, (ref_losses, _, _) = loss_fn(model_state, model_graphdef, input_data, tmp=False)
@@ -772,15 +769,6 @@ def train_and_evaluate(c: DictConfig):
 
             # Move to host (very important — avoids JitTracer issues)
             losses_host = np.array(jax.device_get(losses))
-
-            '''
-            with open(f"tmp_spike_batch_{step}.pkl", "wb") as f:
-                pickle.dump({
-                    "batch": host_batch,
-                    "losses": losses_host
-                }, f)
-            '''
-
             flat = losses_host.reshape(-1)
 
             top_k = 20
@@ -894,9 +882,6 @@ def train_and_evaluate(c: DictConfig):
             )
             
             print(f"Eval complete. Mean Loss: {val_loss:.4f}")
-            if step == 1630: 
-                break
-
 
         if step % c.eval_every_steps == 0:
             eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit, eval_logit_stats = eval_step(c, opt_state.model, model_graphdef, ds_valid)
