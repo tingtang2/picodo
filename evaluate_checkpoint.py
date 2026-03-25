@@ -414,6 +414,7 @@ def main(c: DictConfig):
         seq = batch_np[ex_idx]
 
         if pos + 1 >= seq.shape[0]:
+            print(f'pos is either invalid or last token in sequence: {pos}')
             continue
 
         target_id = int(seq[pos + 1])
@@ -471,6 +472,7 @@ def main(c: DictConfig):
             for rel, new_token in zip(swap_relative_positions, swap_replacement_token_ids):
                 token_pos = pos + rel
                 if token_pos < 0 or token_pos >= edited_seq.shape[0]:
+                    print(f'swap pos is invalid: {token_pos}')
                     continue
                 old_token = int(edited_seq[token_pos])
                 edited_seq[token_pos] = int(new_token)
