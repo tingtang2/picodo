@@ -110,9 +110,8 @@ def loss_fn(model_state, model_graphdef, x): # [B, T]
     return losses.mean(), (losses, qkv_stats)
 '''
 
-#@partial(jax.jit, static_argnames=('model_graphdef'))
-@partial(jax.jit, static_argnames=('model_graphdef', 'tmp'))
-def loss_fn(model_state, model_graphdef, x, tmp = False, pos = None):
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def loss_fn(model_state, model_graphdef, x):
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
     logits_bf16, qkv_dict = model(x, return_qkv=True)
@@ -126,48 +125,45 @@ def loss_fn(model_state, model_graphdef, x, tmp = False, pos = None):
 
     # Drop last token
     logits_fp32 = logits_fp32[:, :-1, :]
-    #logits_bf16 = logits_bf16[:, :-1, :]
 
     logit_stats = compute_logit_distribution_stats(
         logits_fp32,
-        #logits_bf16
     )
-
-    if tmp:
-        # We look at 922 because it predicts the target at 923 (" against")
-        # We look at 923 because it predicts the target at 924 (" end" or "End")
-        for spike_pos in [pos-3, pos-2, pos-1, pos]: 
-            l_pos = logits_fp32[0, spike_pos]
-                    
-            # Calculate everything first
-            mean = jnp.mean(l_pos)
-            std = jnp.std(l_pos)
-            norm = jnp.linalg.norm(l_pos)
-            minimum = jnp.min(l_pos)
-            maximum = jnp.max(l_pos)
-            q1, med, q3 = jnp.percentile(l_pos, jnp.array([25, 50, 75]))
-            vals, idxs = jax.lax.top_k(l_pos, k=5)
-            target_id = y[0, spike_pos]
-
-            # Build one giant format string so the output stays atomic
-            report = (
-                "\n--- POSITION {p} ANALYSIS (TARGET AT {t}) ---\n"
-                "Target ID: {tid}\n"
-                "Top 5 IDs: {i}\n"
-                "Top 5 Logits: {v}\n"
-                "Min: {mi:.2f} | Q1: {q1:.2f} | Med: {med:.2f} | Q3: {q3:.2f} | Max: {ma:.2f}\n"
-                "Mean: {m:.4f} | Std: {s:.4f} | Norm: {n:.4f}\n"
-                "------------------------------------------"
-            )
-            
-            jax.debug.print(report, 
-                            p=spike_pos, t=spike_pos+1, tid=target_id, 
-                            i=idxs, v=vals, mi=minimum, q1=q1, med=med, 
-                            q3=q3, ma=maximum, m=mean, s=std, n=norm)
 
     qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
     qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
     return losses.mean(), (losses, qkv_stats, logit_stats)
+
+def diagnose_spike_position(model_state, model_graphdef, input_data, pos):
+    """Non-JIT diagnostic printing for spike analysis. Call separately from loss_fn."""
+    _, (losses, _, _) = loss_fn(model_state, model_graphdef, input_data)
+    y = jnp.roll(input_data, -1, axis=1)
+
+    # Recompute logits for diagnostic stats (not JIT-compiled, runs once)
+    model = nnx.merge(model_graphdef, model_state)
+    logits_bf16, _ = model(input_data, return_qkv=True)
+    logits_fp32 = logits_bf16.astype(jnp.float32)[:, :-1, :]
+
+    for spike_pos in [pos-3, pos-2, pos-1, pos]:
+        l_pos = logits_fp32[0, spike_pos]
+        mean = jnp.mean(l_pos)
+        std = jnp.std(l_pos)
+        norm = jnp.linalg.norm(l_pos)
+        minimum = jnp.min(l_pos)
+        maximum = jnp.max(l_pos)
+        q1, med, q3 = jnp.percentile(l_pos, jnp.array([25, 50, 75]))
+        vals, idxs = jax.lax.top_k(l_pos, k=5)
+        target_id = y[0, spike_pos]
+
+        print(f"\n--- POSITION {spike_pos} ANALYSIS (TARGET AT {spike_pos+1}) ---")
+        print(f"Target ID: {int(target_id)}")
+        print(f"Top 5 IDs: {idxs}")
+        print(f"Top 5 Logits: {vals}")
+        print(f"Min: {minimum:.2f} | Q1: {q1:.2f} | Med: {med:.2f} | Q3: {q3:.2f} | Max: {maximum:.2f}")
+        print(f"Mean: {mean:.4f} | Std: {std:.4f} | Norm: {norm:.4f}")
+        print("------------------------------------------")
+
+    return losses
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def loss_fn_z_loss(model_state, model_graphdef, x): # [B, T]
@@ -407,7 +403,7 @@ def find_critical_context_length(model_state, model_graphdef, tokenizer, full_se
         test_seq = jnp.array(full_seq)
         test_seq = test_seq.at[:spike_pos - n].set(pad_id)
         input_data = jnp.repeat( test_seq[None, :], 4, axis = 0)
-        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data, tmp = False)
+        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data)
         current_loss = losses[0, spike_pos]
         res.append((n, current_loss))
 
@@ -506,12 +502,15 @@ def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence,
 
     def get_full_results(seq_data):
         input_data = jnp.repeat(seq_data[None, :], 4, axis=0)
-        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data, tmp = True, pos = spike_pos)
+        _, (losses, qkv_stats, logit_stats) = loss_fn(model_state, model_graphdef, input_data)
         return losses[0]
 
-    # Run the model only twice total
+    #Run model twice and diagnose distributions
     orig_losses = get_full_results(original_seq)
+    diagnose_spike_position(model_state, model_graphdef, jnp.repeat(original_seq[None, :], 4, axis=0), spike_pos)
+
     cf_losses = get_full_results(cf_seq)
+    diagnose_spike_position(model_state, model_graphdef, jnp.repeat(cf_seq[None, :], 4, axis=0), spike_pos)
 
     print("-" * 65)
     print(f"{'Step':<6} | {'Target':<12} | {'Orig Loss':<10} | {'CF Loss':<10} | {'Status'}")
@@ -537,11 +536,13 @@ def counterfactual_analysis(c, model_state, model_graphdef, tokenizer, sequence,
     print(f"{'Tail Mean':<15} | {jnp.mean(tail_orig):<12.4f} | {jnp.mean(tail_cf):<12.4f}")
 
     res = find_critical_context_length(model_state, model_graphdef, tokenizer, original_seq, spike_pos)
+    #import pdb; pdb.set_trace()
+
     #DEBUGGING 
     #########################
     #FLASH ON (ORIGINAL) 
     input_data = jnp.repeat(original_seq[None, :], 4, axis = 0)
-    _, (ref_losses, _, _) = loss_fn(model_state, model_graphdef, input_data, tmp=False)
+    _, (ref_losses, _, _) = loss_fn(model_state, model_graphdef, input_data)
     print("loss_fn (flash ON):", float(ref_losses[0, spike_pos]))                       
     #FLASH OFF
     model = nnx.merge(model_graphdef, model_state)                                       
