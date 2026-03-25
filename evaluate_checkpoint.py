@@ -9,6 +9,7 @@ import optax
 import orbax.checkpoint as ocp
 import os
 import time
+from dataclasses import asdict
 from etils import epath
 from orbax.checkpoint._src.path import gcs_utils, step as step_lib
 from omegaconf import DictConfig, OmegaConf
@@ -16,6 +17,19 @@ from flax import nnx
 from functools import partial
 import json
 
+from analysis_records import (
+    AnalysisReport,
+    AnalysisSettingsRecord,
+    AppliedSwapRecord,
+    IterativeContextSwapResult,
+    IterativeModeResult,
+    IterativeStepRecord,
+    TokenEventRecord,
+    TopBatchRecord,
+    TopEventRecord,
+    TopLogitRecord,
+    SwapAnalysisRecord,
+)
 from configs import resolver_setup
 import data
 import model as model_lib
@@ -390,12 +404,12 @@ def main(c: DictConfig):
     top_batch_records = []
     for rank, (mean_loss, batch_idx, max_token_loss) in enumerate(top_batches_sorted, start=1):
         top_batch_records.append(
-            {
-                'rank': rank,
-                'batch_index': int(batch_idx),
-                'mean_loss': float(mean_loss),
-                'max_token_loss': float(max_token_loss),
-            }
+            TopBatchRecord(
+                rank=int(rank),
+                batch_index=int(batch_idx),
+                mean_loss=float(mean_loss),
+                max_token_loss=float(max_token_loss),
+            )
         )
 
     token_event_records = []
@@ -432,32 +446,32 @@ def main(c: DictConfig):
         top_logits = []
         for token_id, logit in _topk_logits(logits_np, top_logits_k):
             top_logits.append(
-                {
-                    'token_id': token_id,
-                    'logit': logit,
-                    'token': _decode_token(tokenizer, token_id),
-                }
+                TopLogitRecord(
+                    token_id=int(token_id),
+                    logit=float(logit),
+                    token=_decode_token(tokenizer, token_id),
+                )
             )
 
         context_start = max(0, pos - context_window + 1)
         context_ids = seq[context_start:pos + 1].tolist()
 
-        record = {
-            'rank': rank,
-            'loss': float(loss),
-            'recomputed_loss': base_loss,
-            'batch_index': int(batch_idx),
-            'example_index': int(ex_idx),
-            'position': int(pos),
-            'input_token_id': input_token_id,
-            'input_token': _decode_token(tokenizer, input_token_id),
-            'target_token_id': target_id,
-            'target_token': _decode_token(tokenizer, target_id),
-            'context_start': int(context_start),
-            'context_ids': [int(x) for x in context_ids],
-            'context_text': _decode_span(tokenizer, context_ids),
-            'top_logits': top_logits,
-        }
+        record = TokenEventRecord(
+            rank=int(rank),
+            loss=float(loss),
+            recomputed_loss=float(base_loss),
+            batch_index=int(batch_idx),
+            example_index=int(ex_idx),
+            position=int(pos),
+            input_token_id=int(input_token_id),
+            input_token=_decode_token(tokenizer, input_token_id),
+            target_token_id=int(target_id),
+            target_token=_decode_token(tokenizer, target_id),
+            context_start=int(context_start),
+            context_ids=[int(x) for x in context_ids],
+            context_text=_decode_span(tokenizer, context_ids),
+            top_logits=top_logits,
+        )
 
         if save_full_logits:
             full_logits_before.append(logits_np.astype(full_logits_dtype))
@@ -477,14 +491,14 @@ def main(c: DictConfig):
                 old_token = int(edited_seq[token_pos])
                 edited_seq[token_pos] = int(new_token)
                 applied_swaps.append(
-                    {
-                        'relative_position': int(rel),
-                        'absolute_position': int(token_pos),
-                        'old_token_id': old_token,
-                        'old_token': _decode_token(tokenizer, old_token),
-                        'new_token_id': int(new_token),
-                        'new_token': _decode_token(tokenizer, int(new_token)),
-                    }
+                    AppliedSwapRecord(
+                        relative_position=int(rel),
+                        absolute_position=int(token_pos),
+                        old_token_id=int(old_token),
+                        old_token=_decode_token(tokenizer, old_token),
+                        new_token_id=int(new_token),
+                        new_token=_decode_token(tokenizer, int(new_token)),
+                    )
                 )
 
             if applied_swaps:
@@ -503,22 +517,22 @@ def main(c: DictConfig):
                 edited_top_logits = []
                 for token_id, logit in _topk_logits(edited_logits_np, top_logits_k):
                     edited_top_logits.append(
-                        {
-                            'token_id': token_id,
-                            'logit': logit,
-                            'token': _decode_token(tokenizer, token_id),
-                        }
+                        TopLogitRecord(
+                            token_id=int(token_id),
+                            logit=float(logit),
+                            token=_decode_token(tokenizer, token_id),
+                        )
                     )
 
-                record['swap_analysis'] = {
-                    'applied_swaps': applied_swaps,
-                    'loss_after_swap': edited_loss,
-                    'loss_delta': edited_loss - base_loss,
-                    'target_logit_before': float(logits_np[target_id]),
-                    'target_logit_after': float(edited_logits_np[target_id]),
-                    'target_logit_delta': float(edited_logits_np[target_id] - logits_np[target_id]),
-                    'top_logits_after_swap': edited_top_logits,
-                }
+                record.swap_analysis = SwapAnalysisRecord(
+                    applied_swaps=applied_swaps,
+                    loss_after_swap=float(edited_loss),
+                    loss_delta=float(edited_loss - base_loss),
+                    target_logit_before=float(logits_np[target_id]),
+                    target_logit_after=float(edited_logits_np[target_id]),
+                    target_logit_delta=float(edited_logits_np[target_id] - logits_np[target_id]),
+                    top_logits_after_swap=edited_top_logits,
+                )
                 if save_full_logits:
                     full_logits_after.append(edited_logits_np.astype(full_logits_dtype))
                     full_logits_after_rank.append(int(rank))
@@ -575,96 +589,98 @@ def main(c: DictConfig):
                     target_id=top_target_id,
                     data_axis_size=data_axis_size,
                 )
-                step_record = {
-                    'step': int(i),
-                    'token_position': int(token_pos),
-                    'old_token_id': old_token_id,
-                    'old_token': _decode_token(tokenizer, old_token_id),
-                    'new_token_id': int(new_token_id),
-                    'new_token': _decode_token(tokenizer, int(new_token_id)),
-                    'loss_before_step': float(prev_loss_local if mode_name == 'cumulative' else base_event_loss),
-                    'loss_after_step': float(new_loss),
-                    'loss_delta_vs_prev': float(new_loss - prev_loss_local),
-                    'loss_delta_vs_base': float(new_loss - base_event_loss),
-                    'went_down_vs_prev': bool(new_loss <= prev_loss_local),
-                    'went_down_vs_base': bool(new_loss <= base_event_loss),
-                }
+                step_record = IterativeStepRecord(
+                    step=int(i),
+                    token_position=int(token_pos),
+                    old_token_id=int(old_token_id),
+                    old_token=_decode_token(tokenizer, old_token_id),
+                    new_token_id=int(new_token_id),
+                    new_token=_decode_token(tokenizer, int(new_token_id)),
+                    loss_before_step=float(prev_loss_local if mode_name == 'cumulative' else base_event_loss),
+                    loss_after_step=float(new_loss),
+                    loss_delta_vs_prev=float(new_loss - prev_loss_local),
+                    loss_delta_vs_base=float(new_loss - base_event_loss),
+                    went_down_vs_prev=bool(new_loss <= prev_loss_local),
+                    went_down_vs_base=bool(new_loss <= base_event_loss),
+                )
                 steps_local.append(step_record)
                 if mode_name == 'cumulative':
                     edited_seq_local = candidate_seq
                 prev_loss_local = new_loss
 
-            monotonic_nonincreasing_local = all(s['went_down_vs_prev'] for s in steps_local)
-            always_down_vs_base_local = all(s['went_down_vs_base'] for s in steps_local)
-            return {
-                'mode': mode_name,
-                'final_loss': float(prev_loss_local),
-                'monotonic_nonincreasing_loss': bool(monotonic_nonincreasing_local),
-                'always_down_vs_base_loss': bool(always_down_vs_base_local),
-                'steps': steps_local,
-            }
+            monotonic_nonincreasing_local = all(s.went_down_vs_prev for s in steps_local)
+            always_down_vs_base_local = all(s.went_down_vs_base for s in steps_local)
+            return IterativeModeResult(
+                mode=mode_name,
+                final_loss=float(prev_loss_local),
+                monotonic_nonincreasing_loss=bool(monotonic_nonincreasing_local),
+                always_down_vs_base_loss=bool(always_down_vs_base_local),
+                steps=steps_local,
+            )
 
         cumulative_result = _run_iterative_mode('cumulative')
         non_cumulative_result = _run_iterative_mode('non_cumulative')
         selected_mode_result = cumulative_result if iterative_swap_mode == 'cumulative' else non_cumulative_result
-        iterative_context_swap_result = {
-            'enabled': True,
-            'scope': iterative_swap_scope,
-            'mode': iterative_swap_mode,
-            'replacement_token_id': int(iterative_swap_token_id),
-            'alternate_replacement_token_id': int(iterative_swap_alternate_token_id),
-            'top_event': {
-                'rank': 1,
-                'loss': float(top_loss),
-                'batch_index': int(top_batch_idx),
-                'example_index': int(top_ex_idx),
-                'position': int(top_pos),
-                'target_token_id': int(top_target_id),
-                'target_token': _decode_token(tokenizer, int(top_target_id)),
-            },
-            'context_positions': [int(p) for p in context_positions],
-            'base_loss': float(base_event_loss),
-            'final_loss': selected_mode_result['final_loss'],
-            'monotonic_nonincreasing_loss': selected_mode_result['monotonic_nonincreasing_loss'],
-            'always_down_vs_base_loss': selected_mode_result['always_down_vs_base_loss'],
-            'steps': selected_mode_result['steps'],
-            'modes': {
+        iterative_context_swap_result = IterativeContextSwapResult(
+            enabled=True,
+            scope=iterative_swap_scope,
+            mode=iterative_swap_mode,
+            replacement_token_id=int(iterative_swap_token_id),
+            alternate_replacement_token_id=int(iterative_swap_alternate_token_id),
+            top_event=TopEventRecord(
+                rank=1,
+                loss=float(top_loss),
+                batch_index=int(top_batch_idx),
+                example_index=int(top_ex_idx),
+                position=int(top_pos),
+                target_token_id=int(top_target_id),
+                target_token=_decode_token(tokenizer, int(top_target_id)),
+            ),
+            context_positions=[int(p) for p in context_positions],
+            base_loss=float(base_event_loss),
+            final_loss=float(selected_mode_result.final_loss),
+            monotonic_nonincreasing_loss=bool(selected_mode_result.monotonic_nonincreasing_loss),
+            always_down_vs_base_loss=bool(selected_mode_result.always_down_vs_base_loss),
+            steps=selected_mode_result.steps,
+            modes={
                 'cumulative': cumulative_result,
                 'non_cumulative': non_cumulative_result,
             },
-        }
+        )
 
-    report = {
-        'run_name': run_name,
-        'checkpoint_step': int(step_to_load),
-        'checkpoint_dir': ckpt_dir,
-        'split': split,
-        'num_batches': int(len(dataset)),
-        'analysis': {
-            'top_batches': int(top_batches),
-            'top_token_events': int(top_token_events),
-            'context_window': int(context_window),
-            'top_logits_k': int(top_logits_k),
-            'tokenizer_name': tokenizer_name,
-            'save_full_logits': bool(save_full_logits),
-            'full_logits_dtype': full_logits_dtype_name,
-            'iterative_context_swap_enabled': bool(iterative_swap_enabled),
-            'iterative_context_swap_token_id': int(iterative_swap_token_id),
-            'iterative_context_swap_alternate_token_id': int(iterative_swap_alternate_token_id),
-            'iterative_context_swap_scope': iterative_swap_scope,
-            'iterative_context_swap_mode': iterative_swap_mode,
-            'swap_relative_positions': [int(x) for x in swap_relative_positions],
-            'swap_replacement_token_ids': [int(x) for x in swap_replacement_token_ids],
-        },
-        'top_batches_by_mean_loss': top_batch_records,
-        'top_token_events': token_event_records,
-    }
-    if iterative_context_swap_result is not None:
-        report['iterative_context_swap_top_event'] = iterative_context_swap_result
+    report = AnalysisReport(
+        run_name=run_name,
+        checkpoint_step=int(step_to_load),
+        checkpoint_dir=ckpt_dir,
+        split=split,
+        num_batches=int(len(dataset)),
+        analysis=AnalysisSettingsRecord(
+            top_batches=int(top_batches),
+            top_token_events=int(top_token_events),
+            context_window=int(context_window),
+            top_logits_k=int(top_logits_k),
+            tokenizer_name=tokenizer_name,
+            save_full_logits=bool(save_full_logits),
+            full_logits_dtype=full_logits_dtype_name,
+            iterative_context_swap_enabled=bool(iterative_swap_enabled),
+            iterative_context_swap_token_id=int(iterative_swap_token_id),
+            iterative_context_swap_alternate_token_id=int(iterative_swap_alternate_token_id),
+            iterative_context_swap_scope=iterative_swap_scope,
+            iterative_context_swap_mode=iterative_swap_mode,
+            swap_relative_positions=[int(x) for x in swap_relative_positions],
+            swap_replacement_token_ids=[int(x) for x in swap_replacement_token_ids],
+        ),
+        top_batches_by_mean_loss=top_batch_records,
+        top_token_events=token_event_records,
+        iterative_context_swap_top_event=iterative_context_swap_result,
+    )
 
     report_path = save_dir_path / f'loss_trigger_analysis_step_{step_to_load}_{split}.json'
     with report_path.open('w') as f:
-        json.dump(report, f, indent=2)
+        report_payload = asdict(report)
+        if iterative_context_swap_result is None:
+            report_payload.pop('iterative_context_swap_top_event', None)
+        json.dump(report_payload, f, indent=2)
 
     full_logits_path = None
     if save_full_logits:
@@ -693,26 +709,26 @@ def main(c: DictConfig):
     print('\nTop batches (mean loss):')
     for row in top_batch_records[: min(10, len(top_batch_records))]:
         print(
-            f"  rank={row['rank']:<3} batch={row['batch_index']:<6} "
-            f"mean_loss={row['mean_loss']:.6f} max_token_loss={row['max_token_loss']:.6f}"
+            f"  rank={row.rank:<3} batch={row.batch_index:<6} "
+            f"mean_loss={row.mean_loss:.6f} max_token_loss={row.max_token_loss:.6f}"
         )
 
     print('\nTop token events:')
     for row in token_event_records[: min(10, len(token_event_records))]:
         print(
-            f"  rank={row['rank']:<3} loss={row['loss']:.6f} "
-            f"batch={row['batch_index']:<6} ex={row['example_index']:<4} pos={row['position']:<4} "
-            f"input={row['input_token_id']} target={row['target_token_id']}"
+            f"  rank={row.rank:<3} loss={row.loss:.6f} "
+            f"batch={row.batch_index:<6} ex={row.example_index:<4} pos={row.position:<4} "
+            f"input={row.input_token_id} target={row.target_token_id}"
         )
-        if row.get('context_text'):
-            print(f"    context: {row['context_text']!r}")
+        if row.context_text:
+            print(f"    context: {row.context_text!r}")
 
     print(f"\nSaved analysis report to: {report_path}")
     if full_logits_path is not None:
         print(f"Saved full-logits artifact to: {full_logits_path}")
     if iterative_context_swap_result is not None:
-        cumulative_always_down = iterative_context_swap_result['modes']['cumulative']['monotonic_nonincreasing_loss']
-        non_cumulative_always_down = iterative_context_swap_result['modes']['non_cumulative']['always_down_vs_base_loss']
+        cumulative_always_down = iterative_context_swap_result.modes['cumulative'].monotonic_nonincreasing_loss
+        non_cumulative_always_down = iterative_context_swap_result.modes['non_cumulative'].always_down_vs_base_loss
         print(f"Iterative swap check (cumulative): loss always went down = {cumulative_always_down}")
         print(f"Iterative swap check (non_cumulative): loss always went down = {non_cumulative_always_down}")
 
