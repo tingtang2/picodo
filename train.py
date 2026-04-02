@@ -162,6 +162,7 @@ def loss_fn_with_skip(
     )
     denom = jnp.maximum(weights.sum(), 1.0)
     masked_loss = (losses * weights).sum() / denom
+    unmasked_loss = losses.mean()
 
     if collect_qkv_stats:
         qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
@@ -172,6 +173,8 @@ def loss_fn_with_skip(
     skip_stats = {
         'loss_skip_keep_frac': jnp.mean(weights > 0),
         'loss_skip_weight_mean': jnp.mean(weights),
+        'loss_skip_masked_loss': masked_loss,
+        'loss_skip_unmasked_loss': unmasked_loss,
     }
 
     return masked_loss, (losses, qkv_stats, skip_stats)
@@ -211,6 +214,7 @@ def loss_fn_z_loss_with_skip(
     )
     denom = jnp.maximum(weights.sum(), 1.0)
     masked_ce = (losses * weights).sum() / denom
+    unmasked_ce = losses.mean()
 
     z = jax.nn.logsumexp(logits[:, :-1].astype(jnp.float32), axis=-1)
     z_loss = (z**2).mean()
@@ -225,6 +229,8 @@ def loss_fn_z_loss_with_skip(
     skip_stats = {
         'loss_skip_keep_frac': jnp.mean(weights > 0),
         'loss_skip_weight_mean': jnp.mean(weights),
+        'loss_skip_masked_loss': masked_ce,
+        'loss_skip_unmasked_loss': unmasked_ce,
     }
 
     return masked_ce + lam * z_loss, (losses, qkv_stats, skip_stats)
@@ -1044,6 +1050,11 @@ def train_and_evaluate(c: DictConfig):
                 keep = np.ones_like(stats_np, dtype=bool)
             if keep.any():
                 loss_skip_history.extend(stats_np[keep].tolist())
+        batch_loss_to_log = (
+            jnp.asarray(loss_skip_stats['loss_skip_unmasked_loss'], dtype=jnp.float32)
+            if (loss_skip_enabled and loss_skip_stats is not None and 'loss_skip_unmasked_loss' in loss_skip_stats)
+            else batch_loss
+        )
         # if jax.process_index() == 0:
         #     min_train_loss = float(jax.device_get(jnp.min(train_raw_loss)))
         #     assert min_train_loss >= 0.0, f"negative train loss: {min_train_loss}"
@@ -1056,7 +1067,7 @@ def train_and_evaluate(c: DictConfig):
             metrics = _build_train_metrics(
                 step,
                 tokens_per_opt_step,
-                batch_loss,
+                batch_loss_to_log,
                 jnp.median(train_raw_loss),
                 utils.compute_lower_90th_percentile_mean(train_raw_loss),
                 pre_output_logit_mean,
@@ -1073,7 +1084,7 @@ def train_and_evaluate(c: DictConfig):
             )
             _log_metrics_if_primary(metrics, step, pbar)
         else:
-            train_loss_sum += batch_loss
+            train_loss_sum += batch_loss_to_log
             train_med_loss_sum += jnp.median(train_raw_loss)
             train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
             train_loss_num += 1
