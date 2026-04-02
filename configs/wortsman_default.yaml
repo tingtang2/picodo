@@ -45,6 +45,18 @@ opt:
   clip_by_global_norm: 1.0
   use_z_loss: false
   eps: 1e-8
+  loss_skip:
+    enabled: false
+    warmup_steps: 1000
+    window_size: 1000
+    min_history: 256
+    z_soft: 5.0
+    z_hard: 8.0
+    soft_weight: 1.0
+    eps: 1e-6
+    use_log_loss: false
+    abs_hard: null
+    abs_hard_quantile: 0.999
 
 checkpoint:
   turn_on: true

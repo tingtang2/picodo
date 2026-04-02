@@ -39,3 +39,15 @@ opt:
   b2: 0.999
   weight_decay: 0.02
   exclude_input_embedding_weight_decay: false
+  loss_skip:
+    enabled: false
+    warmup_steps: 1000
+    window_size: 1000
+    min_history: 256
+    z_soft: 5.0
+    z_hard: 8.0
+    soft_weight: 1.0
+    eps: 1e-6
+    use_log_loss: false
+    abs_hard: null
+    abs_hard_quantile: 0.999
