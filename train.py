@@ -1012,7 +1012,6 @@ def train_and_evaluate(c: DictConfig):
             skip_stats_host['loss_skip_center'] = float(gate_center)
             skip_stats_host['loss_skip_mad'] = float(gate_mad)
             skip_stats_host['loss_skip_abs_hard'] = float(gate_abs_hard)
-            skip_stats_host['loss_skip_use_log_loss'] = float(loss_skip_use_log_loss)
             loss_skip_stats = skip_stats_host
         else:
             if c.opt.use_z_loss:
