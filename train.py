@@ -110,7 +110,12 @@ def _build_loss_skip_weights(
     apply_gate,
     use_log_loss,
 ):
-    stats_losses = jnp.log1p(jnp.maximum(losses, 0.0)) if use_log_loss else losses
+    use_log_loss = jnp.asarray(use_log_loss, dtype=jnp.bool_)
+    stats_losses = jnp.where(
+        use_log_loss,
+        jnp.log1p(jnp.maximum(losses, 0.0)),
+        losses,
+    )
     scale = jnp.maximum(1.4826 * mad, eps)
     z = (stats_losses - center) / scale
     weights = jnp.ones_like(losses, dtype=jnp.float32)
