@@ -215,6 +215,8 @@ def main(c: DictConfig):
     context_window = int(_cfg_get(c, 'analysis.context_window', 32))
     top_logits_k = int(_cfg_get(c, 'analysis.top_logits_k', 10))
     tokenizer_name = str(_cfg_get(c, 'analysis.tokenizer_name', 'gpt2'))
+    include_next_train_batch_analysis = bool(_cfg_get(c, 'analysis.include_next_train_batch_analysis', True))
+    next_train_top_token_events = int(_cfg_get(c, 'analysis.next_train_top_token_events', top_token_events))
     save_full_logits = bool(_cfg_get(c, 'analysis.save_full_logits', False))
     full_logits_dtype_name = str(_cfg_get(c, 'analysis.full_logits_dtype', 'float16'))
     iterative_swap_enabled = bool(_cfg_get(c, 'analysis.iterative_context_swap_enabled', False))
@@ -349,9 +351,16 @@ def main(c: DictConfig):
         ),
     )
     opt_state = restored_data['state']
+    training_metadata = restored_data.get('training_metadata', {})
+    next_train_step = training_metadata.get('next_step')
+    if next_train_step is None:
+        next_train_step = int(step_to_load) + 1
+    else:
+        next_train_step = int(next_train_step)
     ckpt_mngr.close()
     model_state = opt_state.model
     print('Checkpoint restored successfully.')
+    print(f'next_train_step={next_train_step}')
 
     if gcp_bucket:
         default_save_dir = f"{ckpt_dir.rstrip('/')}/evaluation_metrics/step_{step_to_load}"
@@ -542,6 +551,79 @@ def main(c: DictConfig):
 
         token_event_records.append(record)
 
+    next_train_batch_analysis = None
+    if include_next_train_batch_analysis:
+        if 0 <= next_train_step < len(ds_train):
+            train_batch = ds_train[next_train_step]
+            train_batch_mean_loss, train_per_example_loss, train_token_losses = batch_loss_stats(
+                model_state, model_graphdef, train_batch
+            )
+            train_batch_np = np.asarray(jax.device_get(train_batch), dtype=np.int32)
+            train_token_losses_np = np.asarray(jax.device_get(train_token_losses), dtype=np.float32)
+            train_top_candidates = _top_token_candidates(train_token_losses_np, next_train_top_token_events)
+
+            train_top_event_records = []
+            for rank, (loss, ex_idx, pos) in enumerate(train_top_candidates, start=1):
+                seq = train_batch_np[ex_idx]
+                if pos + 1 >= seq.shape[0]:
+                    continue
+                target_id = int(seq[pos + 1])
+                input_token_id = int(seq[pos])
+                base_loss, logits_np = _eval_single_event_loss(
+                    model_state=model_state,
+                    model_graphdef=model_graphdef,
+                    seq=seq,
+                    pos=pos,
+                    target_id=target_id,
+                    data_axis_size=data_axis_size,
+                )
+                top_logits = []
+                for token_id, logit in _topk_logits(logits_np, top_logits_k):
+                    top_logits.append(
+                        TopLogitRecord(
+                            token_id=int(token_id),
+                            logit=float(logit),
+                            token=_decode_token(tokenizer, token_id),
+                        )
+                    )
+                context_start = max(0, pos - context_window + 1)
+                context_ids = seq[context_start:pos + 1].tolist()
+                train_top_event_records.append(
+                    TokenEventRecord(
+                        rank=int(rank),
+                        loss=float(loss),
+                        recomputed_loss=float(base_loss),
+                        batch_index=int(next_train_step),
+                        example_index=int(ex_idx),
+                        position=int(pos),
+                        input_token_id=int(input_token_id),
+                        input_token=_decode_token(tokenizer, input_token_id),
+                        target_token_id=int(target_id),
+                        target_token=_decode_token(tokenizer, target_id),
+                        context_start=int(context_start),
+                        context_ids=[int(x) for x in context_ids],
+                        context_text=_decode_span(tokenizer, context_ids),
+                        top_logits=top_logits,
+                    )
+                )
+
+            next_train_batch_analysis = {
+                'train_step': int(next_train_step),
+                'batch_shape': [int(x) for x in train_batch_np.shape],
+                'batch_mean_loss': float(jax.device_get(train_batch_mean_loss)),
+                'batch_med_example_loss': float(jax.device_get(jnp.median(train_per_example_loss))),
+                'batch_lower_90th_mean_loss': float(
+                    jax.device_get(utils.compute_lower_90th_percentile_mean(train_token_losses))
+                ),
+                'batch_max_token_loss': float(train_token_losses_np.max()) if train_token_losses_np.size else float('-inf'),
+                'top_token_events': [asdict(x) for x in train_top_event_records],
+            }
+        else:
+            next_train_batch_analysis = {
+                'train_step': int(next_train_step),
+                'error': f'next_train_step out of range for ds_train len={len(ds_train)}',
+            }
+
     iterative_context_swap_result = None
     if iterative_swap_enabled and top_tokens_sorted:
         top_loss, top_batch_idx, top_ex_idx, top_pos = top_tokens_sorted[0]
@@ -678,8 +760,13 @@ def main(c: DictConfig):
     report_path = save_dir_path / f'loss_trigger_analysis_step_{step_to_load}_{split}.json'
     with report_path.open('w') as f:
         report_payload = asdict(report)
+        report_payload['analysis']['include_next_train_batch_analysis'] = bool(include_next_train_batch_analysis)
+        report_payload['analysis']['next_train_top_token_events'] = int(next_train_top_token_events)
+        report_payload['analysis']['next_train_step'] = int(next_train_step)
         if iterative_context_swap_result is None:
             report_payload.pop('iterative_context_swap_top_event', None)
+        if next_train_batch_analysis is not None:
+            report_payload['next_train_batch_analysis'] = next_train_batch_analysis
         json.dump(report_payload, f, indent=2)
 
     full_logits_path = None
@@ -726,6 +813,16 @@ def main(c: DictConfig):
     print(f"\nSaved analysis report to: {report_path}")
     if full_logits_path is not None:
         print(f"Saved full-logits artifact to: {full_logits_path}")
+    if next_train_batch_analysis is not None:
+        if 'error' in next_train_batch_analysis:
+            print(f"Next-train-batch analysis skipped: {next_train_batch_analysis['error']}")
+        else:
+            print(
+                "Next-train-batch analysis: "
+                f"step={next_train_batch_analysis['train_step']} "
+                f"mean_loss={next_train_batch_analysis['batch_mean_loss']:.6f} "
+                f"max_token_loss={next_train_batch_analysis['batch_max_token_loss']:.6f}"
+            )
     if iterative_context_swap_result is not None:
         cumulative_always_down = iterative_context_swap_result.modes['cumulative'].monotonic_nonincreasing_loss
         non_cumulative_always_down = iterative_context_swap_result.modes['non_cumulative'].always_down_vs_base_loss
