@@ -247,6 +247,7 @@ def loss_fn_with_soft_cap(
     model_graphdef,
     x,
     soft_cap,
+    apply_cap,
     collect_qkv_stats: bool = True,
 ):
     model = nnx.merge(model_graphdef, model_state)
@@ -263,6 +264,8 @@ def loss_fn_with_soft_cap(
     losses = losses[:, :-1]
 
     capped_losses = _apply_tanh_soft_cap(losses, soft_cap)
+    apply_cap_f = jnp.asarray(apply_cap, dtype=capped_losses.dtype)
+    capped_losses = apply_cap_f * capped_losses + (1.0 - apply_cap_f) * losses
     capped_loss = capped_losses.mean()
     uncapped_loss = losses.mean()
 
@@ -273,6 +276,7 @@ def loss_fn_with_soft_cap(
         qkv_stats = {}
 
     cap_stats = {
+        'loss_cap_applied': jnp.asarray(apply_cap, dtype=jnp.float32),
         'loss_cap_capped_loss': capped_loss,
         'loss_cap_uncapped_loss': uncapped_loss,
     }
@@ -286,6 +290,7 @@ def loss_fn_z_loss_with_soft_cap(
     model_graphdef,
     x,
     soft_cap,
+    apply_cap,
     collect_qkv_stats: bool = True,
 ):
     model = nnx.merge(model_graphdef, model_state)
@@ -302,6 +307,8 @@ def loss_fn_z_loss_with_soft_cap(
     losses = losses[:, :-1]
 
     capped_losses = _apply_tanh_soft_cap(losses, soft_cap)
+    apply_cap_f = jnp.asarray(apply_cap, dtype=capped_losses.dtype)
+    capped_losses = apply_cap_f * capped_losses + (1.0 - apply_cap_f) * losses
     capped_ce = capped_losses.mean()
     uncapped_ce = losses.mean()
 
@@ -316,6 +323,7 @@ def loss_fn_z_loss_with_soft_cap(
         qkv_stats = {}
 
     cap_stats = {
+        'loss_cap_applied': jnp.asarray(apply_cap, dtype=jnp.float32),
         'loss_cap_capped_loss': capped_ce,
         'loss_cap_uncapped_loss': uncapped_ce,
     }
@@ -539,6 +547,7 @@ def train_step_with_soft_cap(
     model_graphdef,
     batch,
     soft_cap,
+    apply_cap,
     collect_qkv_stats: bool = True,
 ):
     (loss, aux), grads = jax.value_and_grad(loss_fn_with_soft_cap, has_aux=True)(
@@ -546,6 +555,7 @@ def train_step_with_soft_cap(
         model_graphdef,
         batch,
         soft_cap,
+        apply_cap,
         collect_qkv_stats,
     )
     optimizer = nnx.merge(opt_graphdef, opt_state)
@@ -561,6 +571,7 @@ def train_step_z_loss_with_soft_cap(
     model_graphdef,
     batch,
     soft_cap,
+    apply_cap,
     collect_qkv_stats: bool = True,
 ):
     (loss, aux), grads = jax.value_and_grad(loss_fn_z_loss_with_soft_cap, has_aux=True)(
@@ -568,6 +579,7 @@ def train_step_z_loss_with_soft_cap(
         model_graphdef,
         batch,
         soft_cap,
+        apply_cap,
         collect_qkv_stats,
     )
     optimizer = nnx.merge(opt_graphdef, opt_state)
@@ -583,6 +595,7 @@ def train_step_with_soft_cap_centered(
     model_graphdef,
     batch,
     soft_cap,
+    apply_cap,
     collect_qkv_stats: bool = True,
 ):
     (loss, aux), grads = jax.value_and_grad(loss_fn_with_soft_cap, has_aux=True)(
@@ -590,6 +603,7 @@ def train_step_with_soft_cap_centered(
         model_graphdef,
         batch,
         soft_cap,
+        apply_cap,
         collect_qkv_stats,
     )
     optimizer = nnx.merge(opt_graphdef, opt_state)
@@ -606,6 +620,7 @@ def train_step_z_loss_with_soft_cap_centered(
     model_graphdef,
     batch,
     soft_cap,
+    apply_cap,
     collect_qkv_stats: bool = True,
 ):
     (loss, aux), grads = jax.value_and_grad(loss_fn_z_loss_with_soft_cap, has_aux=True)(
@@ -613,6 +628,7 @@ def train_step_z_loss_with_soft_cap_centered(
         model_graphdef,
         batch,
         soft_cap,
+        apply_cap,
         collect_qkv_stats,
     )
     optimizer = nnx.merge(opt_graphdef, opt_state)
@@ -1070,6 +1086,7 @@ def train_and_evaluate(c: DictConfig):
     loss_cap_cfg = getattr(c.opt, "loss_cap", None)
     loss_cap_enabled = bool(getattr(loss_cap_cfg, "enabled", False))
     loss_cap_soft_cap = float(getattr(loss_cap_cfg, "soft_cap", 30.0))
+    loss_cap_warmup_steps = int(getattr(loss_cap_cfg, "warmup_steps", 0))
     if loss_skip_enabled and loss_cap_enabled:
         raise ValueError("opt.loss_skip.enabled and opt.loss_cap.enabled cannot both be True.")
     if loss_skip_enabled and jax.process_index() == 0:
@@ -1081,7 +1098,7 @@ def train_and_evaluate(c: DictConfig):
             f"{loss_skip_abs_hard_fixed if loss_skip_abs_hard_fixed is not None else f'quantile({loss_skip_abs_hard_quantile})'}"
         )
     if loss_cap_enabled and jax.process_index() == 0:
-        print(f"loss-cap enabled: soft_cap={loss_cap_soft_cap}")
+        print(f"loss-cap enabled: soft_cap={loss_cap_soft_cap}, warmup_steps={loss_cap_warmup_steps}")
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
@@ -1206,6 +1223,7 @@ def train_and_evaluate(c: DictConfig):
             skip_stats_host['loss_skip_use_log_loss'] = float(loss_skip_use_log_loss)
             loss_skip_stats = skip_stats_host
         elif loss_cap_enabled:
+            cap_apply = step >= loss_cap_warmup_steps
             if c.opt.use_z_loss:
                 if mucentering:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats, cap_stats_device), grads = train_step_z_loss_with_soft_cap_centered(
@@ -1214,6 +1232,7 @@ def train_and_evaluate(c: DictConfig):
                         model_graphdef,
                         batch,
                         loss_cap_soft_cap,
+                        cap_apply,
                         collect_qkv_stats,
                     )
                 else:
@@ -1223,6 +1242,7 @@ def train_and_evaluate(c: DictConfig):
                         model_graphdef,
                         batch,
                         loss_cap_soft_cap,
+                        cap_apply,
                         collect_qkv_stats,
                     )
             else:
@@ -1233,6 +1253,7 @@ def train_and_evaluate(c: DictConfig):
                         model_graphdef,
                         batch,
                         loss_cap_soft_cap,
+                        cap_apply,
                         collect_qkv_stats,
                     )
                 else:
@@ -1242,6 +1263,7 @@ def train_and_evaluate(c: DictConfig):
                         model_graphdef,
                         batch,
                         loss_cap_soft_cap,
+                        cap_apply,
                         collect_qkv_stats,
                     )
             loss_skip_stats = {k: float(v) for k, v in jax.device_get(cap_stats_device).items()}
