@@ -57,6 +57,9 @@ opt:
     use_log_loss: false
     abs_hard: null
     abs_hard_quantile: 0.999
+  loss_cap:
+    enabled: false
+    soft_cap: 30.0
 
 checkpoint:
   turn_on: true
