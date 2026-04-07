@@ -56,7 +56,6 @@ opt:
     eps: 1e-6
     use_log_loss: false
     abs_hard: null
-    abs_hard_quantile: 0.999
   loss_cap:
     enabled: false
     soft_cap: 30.0

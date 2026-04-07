@@ -1079,10 +1079,10 @@ def train_and_evaluate(c: DictConfig):
     loss_skip_soft_weight = float(getattr(loss_skip_cfg, "soft_weight", 1.0))
     loss_skip_eps = float(getattr(loss_skip_cfg, "eps", 1e-6))
     loss_skip_use_log_loss = bool(getattr(loss_skip_cfg, "use_log_loss", False))
-    loss_skip_abs_hard_quantile = float(getattr(loss_skip_cfg, "abs_hard_quantile", 0.999))
     loss_skip_abs_hard_cfg = getattr(loss_skip_cfg, "abs_hard", None)
     loss_skip_abs_hard_fixed = None if loss_skip_abs_hard_cfg is None else float(loss_skip_abs_hard_cfg)
     loss_skip_history = deque(maxlen=loss_skip_window_size)
+    loss_skip_cutoff_logged = False
     loss_cap_cfg = getattr(c.opt, "loss_cap", None)
     loss_cap_enabled = bool(getattr(loss_cap_cfg, "enabled", False))
     loss_cap_soft_cap = float(getattr(loss_cap_cfg, "soft_cap", 30.0))
@@ -1095,7 +1095,7 @@ def train_and_evaluate(c: DictConfig):
             f"warmup_steps={loss_skip_warmup_steps}, window_size={loss_skip_window_size}, "
             f"min_history={loss_skip_min_history}, z_soft={loss_skip_z_soft}, z_hard={loss_skip_z_hard}, "
             f"soft_weight={loss_skip_soft_weight}, use_log_loss={loss_skip_use_log_loss}, abs_hard="
-            f"{loss_skip_abs_hard_fixed if loss_skip_abs_hard_fixed is not None else f'quantile({loss_skip_abs_hard_quantile})'}"
+            f"{loss_skip_abs_hard_fixed if loss_skip_abs_hard_fixed is not None else 'inf'}"
         )
     if loss_cap_enabled and jax.process_index() == 0:
         print(f"loss-cap enabled: soft_cap={loss_cap_soft_cap}, warmup_steps={loss_cap_warmup_steps}")
@@ -1141,8 +1141,18 @@ def train_and_evaluate(c: DictConfig):
             if loss_skip_abs_hard_fixed is not None:
                 gate_abs_hard = float(loss_skip_abs_hard_fixed)
             else:
-                gate_abs_hard = float(np.quantile(hist, loss_skip_abs_hard_quantile))
+                gate_abs_hard = float("inf")
             gate_apply = True
+            if (not loss_skip_cutoff_logged) and jax.process_index() == 0:
+                scale = max(1.4826 * gate_mad, loss_skip_eps)
+                z_hard_cutoff = gate_center + loss_skip_z_hard * scale
+                domain = "log1p(loss)" if loss_skip_use_log_loss else "loss"
+                print(
+                    "loss-skip z_hard cutoff active: "
+                    f"domain={domain}, z_hard={loss_skip_z_hard}, "
+                    f"cutoff={z_hard_cutoff:.6f}, abs_hard={gate_abs_hard}"
+                )
+                loss_skip_cutoff_logged = True
         # training step
         if loss_skip_enabled:
             if c.opt.use_z_loss:
@@ -1221,6 +1231,9 @@ def train_and_evaluate(c: DictConfig):
             skip_stats_host['loss_skip_mad'] = float(gate_mad)
             skip_stats_host['loss_skip_abs_hard'] = float(gate_abs_hard)
             skip_stats_host['loss_skip_use_log_loss'] = float(loss_skip_use_log_loss)
+            skip_stats_host['loss_skip_z_hard_cutoff'] = float(
+                gate_center + loss_skip_z_hard * max(1.4826 * gate_mad, loss_skip_eps)
+            )
             loss_skip_stats = skip_stats_host
         elif loss_cap_enabled:
             cap_apply = step >= loss_cap_warmup_steps
