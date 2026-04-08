@@ -38,6 +38,20 @@ def _compute_cosines_pytree(prev_state, cur_state):
     return jax.tree.map(_per_leaf_cosine, prev_state, cur_state)
 
 
+@jax.jit
+def _make_fp32_snapshot(state):
+    """Materialize a fresh fp32 copy of every leaf with no aliasing to the
+    input. Wrapping in jit makes the output a JAX-owned buffer that cannot
+    be donated by any other jit (e.g. train_step's donate_argnames). The
+    ``jnp.zeros_like + astype`` form prevents XLA from short-circuiting the
+    allocation when source and target dtypes already coincide.
+    """
+    return jax.tree.map(
+        lambda x: jnp.zeros_like(x, dtype=jnp.float32) + x.astype(jnp.float32),
+        state,
+    )
+
+
 def _flatten_cosine_tree(tree, prefix: str = "cosine") -> Dict[str, float]:
     """Walk an nnx.State / nested-dict of scalar cosines into a flat
     {'<prefix>/<dotted.path>': float} dict suitable for wandb.log.
@@ -77,8 +91,15 @@ class CosineTracker:
         replace the snapshot with the current parameters.
 
         Returns an empty dict on the very first call (no previous snapshot).
+
+        Note on buffer ownership: train_step is jit-compiled with
+        donate_argnames=('opt_state'), so each training step donates and frees
+        the previous step's bf16 parameter buffers. We must build the snapshot
+        as a fresh, JAX-owned fp32 copy and force materialization (block) so
+        the next train_step donation cannot invalidate it.
         """
-        cur_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), cur_state)
+        cur_f32 = _make_fp32_snapshot(cur_state)
+        jax.block_until_ready(cur_f32)
         if self._prev is None:
             self._prev = cur_f32
             return {}
