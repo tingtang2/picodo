@@ -38,6 +38,7 @@ sharpness-direction predominantly lives.
 """
 
 from __future__ import annotations
+from functools import partial
 from typing import Any, Dict, List
 
 import jax
@@ -128,6 +129,13 @@ def make_hvp(model_graphdef):
 
     def loss_of_params(params, batch):
         model = nnx.merge(model_graphdef, params)
+        # TPU Splash flash attention's pallas_call has no jvp rule, so a
+        # forward-over-reverse HVP through it raises NotImplementedError.
+        # Force the HVP-time forward to take the model's non-flash attention
+        # path. The merged model is fresh each call, so this mutation is local.
+        for block in model.blocks:
+            block.attn.use_flash_attn = False
+            block.attn.attention = partial(jax.nn.dot_product_attention, is_causal=False)
         y = jnp.roll(batch, -1, axis=1)
         logits = model(batch, return_qkv=False)
         logits = logits.astype(jnp.float32)
