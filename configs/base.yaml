@@ -54,3 +54,14 @@ opt:
     enabled: false
     soft_cap: 30.0
     warmup_steps: 0
+
+# Per-step per-tensor cosine(W_t, W_{t-1}). Off by default.
+cosine:
+  enabled: false
+
+# Per-step top-K Hessian eigenvalues + per-tensor eigenvector mass.
+# Off by default. K=5 means 5 HVPs per logged step (forward-over-reverse).
+hessian:
+  enabled: false
+  k: 5
+  every_n_steps: 1

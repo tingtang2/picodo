@@ -12,6 +12,8 @@ from tqdm.auto import tqdm
 from omegaconf.dictconfig import DictConfig
 import data, utils
 import model as model_lib
+import param_tracking
+import hessian as hessian_lib
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
 from etils import epath
@@ -939,6 +941,27 @@ def train_and_evaluate(c: DictConfig):
     optimizer = nnx.ModelAndOptimizer(model, tx)
     opt_graphdef, opt_state = nnx.split(optimizer)
 
+    # per-step diagnostics: cosine(W_t, W_{t-1}) and Hessian top-K + mass
+    cosine_cfg = getattr(c, "cosine", None)
+    cosine_enabled = bool(getattr(cosine_cfg, "enabled", False))
+    cosine_tracker = param_tracking.CosineTracker() if cosine_enabled else None
+
+    hessian_cfg = getattr(c, "hessian", None)
+    hessian_enabled = bool(getattr(hessian_cfg, "enabled", False))
+    hessian_every_n_steps = int(getattr(hessian_cfg, "every_n_steps", 1))
+    hessian_k = int(getattr(hessian_cfg, "k", 5))
+    hessian_tracker = (
+        hessian_lib.HessianTracker(model_graphdef, k=hessian_k, seed=int(c.seed))
+        if hessian_enabled else None
+    )
+    if jax.process_index() == 0:
+        if cosine_enabled:
+            print("cosine tracker enabled: per-tensor cos(W_t, W_{t-1}) every step")
+        if hessian_enabled:
+            print(
+                f"hessian tracker enabled: top-{hessian_k} eigenvalues + per-tensor mass "
+                f"every {hessian_every_n_steps} step(s)"
+            )
 
     # set up checkpointing
     start_step = 0
@@ -1324,6 +1347,18 @@ def train_and_evaluate(c: DictConfig):
         
         if c.diagnostics.save_raw_losses:
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, batch)
+
+        # per-step diagnostics: cosine + Hessian (logged independently of the
+        # main metric path so they fire on every step regardless of
+        # log_every_tokens / log_metrics_per_step settings).
+        if cosine_enabled or hessian_enabled:
+            diag_metrics: dict = {}
+            if cosine_enabled:
+                diag_metrics.update(cosine_tracker.step(opt_state.model))
+            if hessian_enabled and (step % hessian_every_n_steps == 0):
+                diag_metrics.update(hessian_tracker.step(opt_state.model, batch))
+            if diag_metrics and jax.process_index() == 0:
+                wandb.log(diag_metrics, step)
 
         # logging
         if log_metrics_per_step:
