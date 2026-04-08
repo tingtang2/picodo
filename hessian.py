@@ -38,8 +38,9 @@ sharpness-direction predominantly lives.
 """
 
 from __future__ import annotations
+import re
 from functools import partial
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import jax
 import jax.numpy as jnp
@@ -91,6 +92,75 @@ def gram_schmidt(vs: List[Any]) -> List[Any]:
     return out
 
 
+def _path_to_dotted(path) -> str:
+    """Convert a jax tree path (sequence of key entries) into the dotted form
+    used by utils.get_layer_weight_norms_split (e.g. ``blocks.3.attn.qkv_proj.kernel``)."""
+    parts: List[str] = []
+    for entry in path:
+        if hasattr(entry, "key"):
+            parts.append(str(entry.key))
+        elif hasattr(entry, "name"):
+            parts.append(str(entry.name))
+        elif hasattr(entry, "idx"):
+            parts.append(str(entry.idx))
+        else:
+            parts.append(str(entry))
+    return ".".join(parts)
+
+
+def build_param_mask(template, param_filter: Optional[str]) -> Any:
+    """Build a pytree of bool scalars matching ``template``'s structure.
+
+    A leaf is True iff its dotted path matches ``param_filter`` (regex
+    ``re.search``). When ``param_filter`` is None, every leaf is True.
+    """
+    if param_filter is None:
+        return jax.tree_util.tree_map(lambda _: True, template)
+    pattern = re.compile(param_filter)
+
+    def per_leaf(path, _leaf):
+        return bool(pattern.search(_path_to_dotted(path)))
+
+    return jax.tree_util.tree_map_with_path(per_leaf, template)
+
+
+def list_filter_matches(template, param_filter: Optional[str]) -> List[str]:
+    """Return the list of dotted param paths matched by ``param_filter``."""
+    matches: List[str] = []
+
+    def visit(path, _leaf):
+        dotted = _path_to_dotted(path)
+        if param_filter is None or re.search(param_filter, dotted):
+            matches.append(dotted)
+        return _leaf
+
+    jax.tree_util.tree_map_with_path(visit, template)
+    return matches
+
+
+def apply_stop_gradient_mask(params, mask):
+    """Wrap each non-matching leaf in jax.lax.stop_gradient.
+
+    Matching leaves pass through unchanged. The forward pass uses the same
+    values either way, but the backward (and hence the JVP-of-grad used for
+    HVPs) sees zero on the stop_gradient'd leaves, so XLA dead-code
+    elimination drops the corresponding intermediate activations from the
+    backward graph.
+    """
+    return jax.tree_util.tree_map(
+        lambda leaf, m: leaf if m else jax.lax.stop_gradient(leaf),
+        params, mask,
+    )
+
+
+def zero_out_unmasked(tree, mask):
+    """Set every non-matching leaf of ``tree`` to zero (preserving dtype/sharding)."""
+    return jax.tree_util.tree_map(
+        lambda leaf, m: leaf if m else jnp.zeros_like(leaf),
+        tree, mask,
+    )
+
+
 def random_pytree_like(key: jax.Array, template: Any) -> Any:
     """Sample a random pytree with the same structure (and sharding) as
     `template`. Each leaf is iid standard normal in the leaf's own dtype.
@@ -116,7 +186,7 @@ def random_pytree_like(key: jax.Array, template: Any) -> Any:
 # irrelevant to the Hessian).
 # ---------------------------------------------------------------------------
 
-def make_hvp(model_graphdef):
+def make_hvp(model_graphdef, mask=None):
     """Build a JIT-compiled Hessian-vector product closure.
 
     Returns a function `hvp(params, batch, v) -> H @ v` where `params`, `v`,
@@ -125,9 +195,19 @@ def make_hvp(model_graphdef):
     compiled HVP is keyed on it -- as long as we reuse the same graphdef
     object across training (we do; it is created once in train.py), the JIT
     cache hits on every call after the first.
+
+    If ``mask`` is provided (a pytree of bool with the same structure as
+    ``params``), every non-True leaf is wrapped in ``jax.lax.stop_gradient``
+    inside the loss. The HVP then sees zero gradient through those leaves,
+    so the result is the diagonal block of H restricted to the True leaves.
+    XLA's dead-code elimination drops the backward-pass activations belonging
+    to the masked-out parameters, which is what makes the per-subgroup HVP
+    cheap enough to fit in HBM when the full HVP would not.
     """
 
     def loss_of_params(params, batch):
+        if mask is not None:
+            params = apply_stop_gradient_mask(params, mask)
         model = nnx.merge(model_graphdef, params)
         # TPU Splash flash attention's pallas_call has no jvp rule, so a
         # forward-over-reverse HVP through it raises NotImplementedError.
@@ -201,16 +281,34 @@ class HessianTracker:
             (K * num_params floats; per-eigenvector mass distributions sum to 1)
     """
 
-    def __init__(self, model_graphdef, k: int, seed: int = 0) -> None:
+    def __init__(
+        self,
+        model_graphdef,
+        k: int,
+        seed: int = 0,
+        param_filter: Optional[str] = None,
+    ) -> None:
         self.k = int(k)
-        self.hvp = make_hvp(model_graphdef)
+        self.param_filter = param_filter
+        self._model_graphdef = model_graphdef
         self._rng = jax.random.key(int(seed))
         self.V: List[Any] = []  # lazily initialized on first .step() call
+        # Mask is built lazily once we see the actual params pytree, then the
+        # HVP closure is constructed against that mask.
+        self._mask: Any = None
+        self.hvp = None  # type: ignore[assignment]
 
     def _init_basis(self, params_template) -> None:
+        # Build the mask and the masked HVP closure now that we have a real
+        # params template (we need its pytree structure).
+        self._mask = build_param_mask(params_template, self.param_filter)
+        self.hvp = make_hvp(self._model_graphdef, mask=self._mask)
         keys = jax.random.split(self._rng, self.k + 1)
         self._rng = keys[0]
+        # Initial random basis, then zero out leaves outside the masked
+        # subspace so the basis lives entirely within the subgroup.
         vs = [random_pytree_like(keys[i + 1], params_template) for i in range(self.k)]
+        vs = [zero_out_unmasked(v, self._mask) for v in vs]
         self.V = gram_schmidt(vs)
 
     def step(self, params, batch) -> Dict[str, float]:

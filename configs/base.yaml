@@ -65,3 +65,4 @@ hessian:
   enabled: false
   k: 5
   every_n_steps: 1
+  param_filter: null  # regex over param paths; null = all params

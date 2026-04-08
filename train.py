@@ -950,8 +950,12 @@ def train_and_evaluate(c: DictConfig):
     hessian_enabled = bool(getattr(hessian_cfg, "enabled", False))
     hessian_every_n_steps = int(getattr(hessian_cfg, "every_n_steps", 1))
     hessian_k = int(getattr(hessian_cfg, "k", 5))
+    hessian_param_filter = getattr(hessian_cfg, "param_filter", None)
     hessian_tracker = (
-        hessian_lib.HessianTracker(model_graphdef, k=hessian_k, seed=int(c.seed))
+        hessian_lib.HessianTracker(
+            model_graphdef, k=hessian_k, seed=int(c.seed),
+            param_filter=hessian_param_filter,
+        )
         if hessian_enabled else None
     )
     if jax.process_index() == 0:
