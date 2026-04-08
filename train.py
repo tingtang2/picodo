@@ -1087,8 +1087,23 @@ def train_and_evaluate(c: DictConfig):
     loss_cap_enabled = bool(getattr(loss_cap_cfg, "enabled", False))
     loss_cap_soft_cap = float(getattr(loss_cap_cfg, "soft_cap", 30.0))
     loss_cap_warmup_steps = int(getattr(loss_cap_cfg, "warmup_steps", 0))
+    loss_rewrite_cfg = getattr(c.opt, "loss_rewrite", None)
+    loss_rewrite_enabled = bool(getattr(loss_rewrite_cfg, "enabled", False))
+    loss_rewrite_replacement_token_id = int(getattr(loss_rewrite_cfg, "replacement_token_id", 11))
+    loss_rewrite_warmup_steps = int(getattr(loss_rewrite_cfg, "warmup_steps", 1000))
+    loss_rewrite_window_size = int(getattr(loss_rewrite_cfg, "window_size", 1000))
+    loss_rewrite_min_history = int(getattr(loss_rewrite_cfg, "min_history", 256))
+    loss_rewrite_z_hard = float(getattr(loss_rewrite_cfg, "z_hard", 8.0))
+    loss_rewrite_eps = float(getattr(loss_rewrite_cfg, "eps", 1e-6))
+    loss_rewrite_use_log_loss = bool(getattr(loss_rewrite_cfg, "use_log_loss", False))
+    loss_rewrite_history = deque(maxlen=loss_rewrite_window_size)
+    loss_rewrite_cutoff_logged = False
     if loss_skip_enabled and loss_cap_enabled:
         raise ValueError("opt.loss_skip.enabled and opt.loss_cap.enabled cannot both be True.")
+    if (loss_skip_enabled and loss_rewrite_enabled) or (loss_cap_enabled and loss_rewrite_enabled):
+        raise ValueError(
+            "opt.loss_rewrite.enabled cannot be combined with opt.loss_skip.enabled or opt.loss_cap.enabled."
+        )
     if loss_skip_enabled and jax.process_index() == 0:
         print(
             "loss-skip enabled: "
@@ -1099,6 +1114,14 @@ def train_and_evaluate(c: DictConfig):
         )
     if loss_cap_enabled and jax.process_index() == 0:
         print(f"loss-cap enabled: soft_cap={loss_cap_soft_cap}, warmup_steps={loss_cap_warmup_steps}")
+    if loss_rewrite_enabled and jax.process_index() == 0:
+        print(
+            "loss-rewrite enabled: "
+            f"replacement_token_id={loss_rewrite_replacement_token_id}, "
+            f"warmup_steps={loss_rewrite_warmup_steps}, window_size={loss_rewrite_window_size}, "
+            f"min_history={loss_rewrite_min_history}, z_hard={loss_rewrite_z_hard}, "
+            f"use_log_loss={loss_rewrite_use_log_loss}"
+        )
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
@@ -1134,6 +1157,12 @@ def train_and_evaluate(c: DictConfig):
         gate_center = 0.0
         gate_mad = 1.0
         gate_abs_hard = float("inf")
+        rewrite_gate_apply = False
+        rewrite_gate_center = 0.0
+        rewrite_gate_mad = 1.0
+        rewrite_hard_mask_np = None
+        rewrite_probe_raw_np = None
+        rewrite_probe_loss = None
         if loss_skip_enabled and step >= loss_skip_warmup_steps and len(loss_skip_history) >= loss_skip_min_history:
             hist = np.asarray(loss_skip_history, dtype=np.float32)
             gate_center = float(np.median(hist))
@@ -1153,6 +1182,25 @@ def train_and_evaluate(c: DictConfig):
                     f"cutoff={z_hard_cutoff:.6f}, abs_hard={gate_abs_hard}"
                 )
                 loss_skip_cutoff_logged = True
+        if (
+            loss_rewrite_enabled
+            and step >= loss_rewrite_warmup_steps
+            and len(loss_rewrite_history) >= loss_rewrite_min_history
+        ):
+            hist = np.asarray(loss_rewrite_history, dtype=np.float32)
+            rewrite_gate_center = float(np.median(hist))
+            rewrite_gate_mad = float(np.median(np.abs(hist - rewrite_gate_center)))
+            rewrite_gate_apply = True
+            if (not loss_rewrite_cutoff_logged) and jax.process_index() == 0:
+                scale = max(1.4826 * rewrite_gate_mad, loss_rewrite_eps)
+                z_hard_cutoff = rewrite_gate_center + loss_rewrite_z_hard * scale
+                domain = "log1p(loss)" if loss_rewrite_use_log_loss else "loss"
+                print(
+                    "loss-rewrite z_hard cutoff active: "
+                    f"domain={domain}, z_hard={loss_rewrite_z_hard}, "
+                    f"cutoff={z_hard_cutoff:.6f}"
+                )
+                loss_rewrite_cutoff_logged = True
         # training step
         if loss_skip_enabled:
             if c.opt.use_z_loss:
@@ -1280,6 +1328,66 @@ def train_and_evaluate(c: DictConfig):
                         collect_qkv_stats,
                     )
             loss_skip_stats = {k: float(v) for k, v in jax.device_get(cap_stats_device).items()}
+        elif loss_rewrite_enabled:
+            if c.opt.use_z_loss:
+                rewrite_probe_loss, (rewrite_probe_raw_loss, _) = loss_fn_z_loss(
+                    opt_state.model, model_graphdef, batch, False
+                )
+            else:
+                rewrite_probe_loss, (rewrite_probe_raw_loss, _) = loss_fn(
+                    opt_state.model, model_graphdef, batch, False
+                )
+            rewrite_probe_raw_np = np.asarray(jax.device_get(rewrite_probe_raw_loss), dtype=np.float32)
+            rewrite_stats_np = (
+                np.log1p(np.maximum(rewrite_probe_raw_np, 0.0))
+                if loss_rewrite_use_log_loss
+                else rewrite_probe_raw_np
+            )
+            if rewrite_gate_apply:
+                scale = max(1.4826 * rewrite_gate_mad, loss_rewrite_eps)
+                rewrite_z = (rewrite_stats_np - rewrite_gate_center) / scale
+                rewrite_hard_mask_np = rewrite_z > loss_rewrite_z_hard
+            else:
+                rewrite_hard_mask_np = np.zeros_like(rewrite_stats_np, dtype=bool)
+
+            rewrite_hard_mask = jnp.asarray(rewrite_hard_mask_np, dtype=jnp.bool_)
+            replacement_token = jnp.asarray(loss_rewrite_replacement_token_id, dtype=batch.dtype)
+            rewritten_inputs = jnp.where(rewrite_hard_mask, replacement_token, batch[:, :-1])
+            rewritten_batch = batch.at[:, :-1].set(rewritten_inputs)
+
+            if c.opt.use_z_loss:
+                if mucentering:
+                    opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss_centered(
+                        opt_state, opt_graphdef, model_graphdef, rewritten_batch, collect_qkv_stats
+                    )
+                else:
+                    opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(
+                        opt_state, opt_graphdef, model_graphdef, rewritten_batch, collect_qkv_stats
+                    )
+            else:
+                if mucentering:
+                    opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_centered(
+                        opt_state, opt_graphdef, model_graphdef, rewritten_batch, collect_qkv_stats
+                    )
+                else:
+                    opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(
+                        opt_state, opt_graphdef, model_graphdef, rewritten_batch, collect_qkv_stats
+                    )
+            num_replaced = int(np.count_nonzero(rewrite_hard_mask_np))
+            total_rewrite_tokens = int(rewrite_hard_mask_np.size)
+            loss_skip_stats = {
+                'loss_rewrite_gate_applied': float(rewrite_gate_apply),
+                'loss_rewrite_center': float(rewrite_gate_center),
+                'loss_rewrite_mad': float(rewrite_gate_mad),
+                'loss_rewrite_z_hard': float(loss_rewrite_z_hard),
+                'loss_rewrite_z_hard_cutoff': float(
+                    rewrite_gate_center + loss_rewrite_z_hard * max(1.4826 * rewrite_gate_mad, loss_rewrite_eps)
+                ),
+                'loss_rewrite_num_replaced': float(num_replaced),
+                'loss_rewrite_frac_replaced': float(num_replaced / max(total_rewrite_tokens, 1)),
+                'loss_rewrite_probe_loss': float(jax.device_get(rewrite_probe_loss)),
+                'loss_rewrite_use_log_loss': float(loss_rewrite_use_log_loss),
+            }
         else:
             if c.opt.use_z_loss:
                 if mucentering:
@@ -1311,11 +1419,25 @@ def train_and_evaluate(c: DictConfig):
                 keep = np.ones_like(stats_np, dtype=bool)
             if keep.any():
                 loss_skip_history.extend(stats_np[keep].tolist())
+        if loss_rewrite_enabled and rewrite_probe_raw_np is not None:
+            rewrite_stats_np = (
+                np.log1p(np.maximum(rewrite_probe_raw_np, 0.0))
+                if loss_rewrite_use_log_loss
+                else rewrite_probe_raw_np
+            ).reshape(-1)
+            rewrite_keep = np.logical_not(rewrite_hard_mask_np.reshape(-1))
+            if rewrite_gate_apply:
+                if rewrite_keep.any():
+                    loss_rewrite_history.extend(rewrite_stats_np[rewrite_keep].tolist())
+            else:
+                loss_rewrite_history.extend(rewrite_stats_np.tolist())
         batch_loss_to_log = (
             jnp.asarray(loss_skip_stats['loss_skip_unmasked_loss'], dtype=jnp.float32)
             if (loss_skip_enabled and loss_skip_stats is not None and 'loss_skip_unmasked_loss' in loss_skip_stats)
             else jnp.asarray(loss_skip_stats['loss_cap_uncapped_loss'], dtype=jnp.float32)
             if (loss_cap_enabled and loss_skip_stats is not None and 'loss_cap_uncapped_loss' in loss_skip_stats)
+            else jnp.asarray(loss_skip_stats['loss_rewrite_probe_loss'], dtype=jnp.float32)
+            if (loss_rewrite_enabled and loss_skip_stats is not None and 'loss_rewrite_probe_loss' in loss_skip_stats)
             else batch_loss
         )
         # if jax.process_index() == 0:

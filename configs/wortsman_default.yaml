@@ -60,6 +60,15 @@ opt:
     enabled: false
     soft_cap: 30.0
     warmup_steps: 0
+  loss_rewrite:
+    enabled: false
+    replacement_token_id: 11
+    warmup_steps: 1000
+    window_size: 1000
+    min_history: 256
+    z_hard: 8.0
+    eps: 1e-6
+    use_log_loss: false
 
 checkpoint:
   turn_on: true
