@@ -360,7 +360,7 @@ def plot_attention_weights(attn_weights_spike, attn_weights_normal,
     print(f"Saved attention weight plot to {save_path}")
 
 
-def compute_spike_score(series, window=1000, threshold=5.0):
+def compute_spike_score(series, window=1000, threshold=7.0):
     """
     Compute spike score: percentage of values that are >= `threshold` standard
     deviations from a rolling average of the last `window` values.
