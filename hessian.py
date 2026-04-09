@@ -186,7 +186,7 @@ def random_pytree_like(key: jax.Array, template: Any) -> Any:
 # irrelevant to the Hessian).
 # ---------------------------------------------------------------------------
 
-def make_hvp(model_graphdef, mask=None):
+def make_hvp(model_graphdef, mask=None, use_remat: bool = True):
     """Build a JIT-compiled Hessian-vector product closure.
 
     Returns a function `hvp(params, batch, v) -> H @ v` where `params`, `v`,
@@ -200,9 +200,13 @@ def make_hvp(model_graphdef, mask=None):
     ``params``), every non-True leaf is wrapped in ``jax.lax.stop_gradient``
     inside the loss. The HVP then sees zero gradient through those leaves,
     so the result is the diagonal block of H restricted to the True leaves.
-    XLA's dead-code elimination drops the backward-pass activations belonging
-    to the masked-out parameters, which is what makes the per-subgroup HVP
-    cheap enough to fit in HBM when the full HVP would not.
+
+    If ``use_remat`` is True (default), each transformer block's forward is
+    wrapped in ``jax.checkpoint``. This drops the per-block attention
+    activations (the [B, N, T, T] tensor, its softmax, etc.) from the forward
+    graph and recomputes them during the backward / JVP pass. At any moment
+    during backward, only one block's attention tensors are resident, so the
+    full-Hessian HVP fits in HBM where the non-checkpointed version OOMs.
     """
 
     def loss_of_params(params, batch):
@@ -216,8 +220,27 @@ def make_hvp(model_graphdef, mask=None):
         for block in model.blocks:
             block.attn.use_flash_attn = False
             block.attn.attention = partial(jax.nn.dot_product_attention, is_causal=False)
+
         y = jnp.roll(batch, -1, axis=1)
-        logits = model(batch, return_qkv=False)
+
+        # Manual forward pass mirroring TransformerDecoder.__call__ so we can
+        # wrap each transformer block in jax.checkpoint individually. Keep in
+        # sync with model.py if the forward ever grows new stages.
+        h = model.token_embed_in(batch)
+        if use_remat:
+            def _run_block(h_in, b):
+                return b(h_in)
+            for block in model.blocks:
+                h = jax.checkpoint(_run_block)(h, block)
+        else:
+            for block in model.blocks:
+                h = block(h)
+        h = model.out_ln(h)
+        if getattr(model, "final_hidden_mean_centering", False):
+            coeff = getattr(model, "final_hidden_mean_centering_coeff", 1.0)
+            h = h - coeff * jnp.mean(h, axis=-1, keepdims=True)
+        logits = model.token_embed_out.attend(h)
+
         logits = logits.astype(jnp.float32)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
@@ -287,9 +310,11 @@ class HessianTracker:
         k: int,
         seed: int = 0,
         param_filter: Optional[str] = None,
+        use_remat: bool = True,
     ) -> None:
         self.k = int(k)
         self.param_filter = param_filter
+        self.use_remat = bool(use_remat)
         self._model_graphdef = model_graphdef
         self._rng = jax.random.key(int(seed))
         self.V: List[Any] = []  # lazily initialized on first .step() call
@@ -302,7 +327,7 @@ class HessianTracker:
         # Build the mask and the masked HVP closure now that we have a real
         # params template (we need its pytree structure).
         self._mask = build_param_mask(params_template, self.param_filter)
-        self.hvp = make_hvp(self._model_graphdef, mask=self._mask)
+        self.hvp = make_hvp(self._model_graphdef, mask=self._mask, use_remat=self.use_remat)
         keys = jax.random.split(self._rng, self.k + 1)
         self._rng = keys[0]
         # Initial random basis, then zero out leaves outside the masked

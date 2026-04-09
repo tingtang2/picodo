@@ -66,3 +66,4 @@ hessian:
   k: 5
   every_n_steps: 1
   param_filter: null  # regex over param paths; null = all params
+  use_remat: true  # gradient checkpoint each transformer block during HVP (required for full-Hessian to fit in HBM)

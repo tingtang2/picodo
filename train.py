@@ -951,10 +951,12 @@ def train_and_evaluate(c: DictConfig):
     hessian_every_n_steps = int(getattr(hessian_cfg, "every_n_steps", 1))
     hessian_k = int(getattr(hessian_cfg, "k", 5))
     hessian_param_filter = getattr(hessian_cfg, "param_filter", None)
+    hessian_use_remat = bool(getattr(hessian_cfg, "use_remat", True))
     hessian_tracker = (
         hessian_lib.HessianTracker(
             model_graphdef, k=hessian_k, seed=int(c.seed),
             param_filter=hessian_param_filter,
+            use_remat=hessian_use_remat,
         )
         if hessian_enabled else None
     )
