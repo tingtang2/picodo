@@ -14,6 +14,7 @@ import data, utils
 import model as model_lib
 import param_tracking
 import hessian as hessian_lib
+import wu_diagnostics
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
 from etils import epath
@@ -960,6 +961,10 @@ def train_and_evaluate(c: DictConfig):
         )
         if hessian_enabled else None
     )
+    wu_diag_cfg = getattr(c, "wu_diagnostics", None)
+    wu_diag_enabled = bool(getattr(wu_diag_cfg, "enabled", False))
+    wu_diag_tracker = wu_diagnostics.WUDiagnostics() if wu_diag_enabled else None
+
     if jax.process_index() == 0:
         if cosine_enabled:
             print("cosine tracker enabled: per-tensor cos(W_t, W_{t-1}) every step")
@@ -968,6 +973,8 @@ def train_and_evaluate(c: DictConfig):
                 f"hessian tracker enabled: top-{hessian_k} eigenvalues + per-tensor mass "
                 f"every {hessian_every_n_steps} step(s)"
             )
+        if wu_diag_enabled:
+            print("W_U diagnostics enabled: mu_W tracking + spectral metrics every step")
 
     # set up checkpointing
     start_step = 0
@@ -1354,15 +1361,17 @@ def train_and_evaluate(c: DictConfig):
         if c.diagnostics.save_raw_losses:
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, batch)
 
-        # per-step diagnostics: cosine + Hessian (logged independently of the
-        # main metric path so they fire on every step regardless of
+        # per-step diagnostics: cosine + Hessian + W_U (logged independently
+        # of the main metric path so they fire on every step regardless of
         # log_every_tokens / log_metrics_per_step settings).
-        if cosine_enabled or hessian_enabled:
+        if cosine_enabled or hessian_enabled or wu_diag_enabled:
             diag_metrics: dict = {}
             if cosine_enabled:
                 diag_metrics.update(cosine_tracker.step(opt_state.model))
             if hessian_enabled and (step % hessian_every_n_steps == 0):
                 diag_metrics.update(hessian_tracker.step(opt_state.model, batch))
+            if wu_diag_enabled:
+                diag_metrics.update(wu_diag_tracker.step(opt_state.model))
             if diag_metrics and jax.process_index() == 0:
                 wandb.log(diag_metrics, step)
 

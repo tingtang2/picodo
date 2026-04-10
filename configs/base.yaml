@@ -67,3 +67,8 @@ hessian:
   every_n_steps: 1
   param_filter: null  # regex over param paths; null = all params
   use_remat: true  # gradient checkpoint each transformer block during HVP (required for full-Hessian to fit in HBM)
+
+# Per-step mu_W (flat-direction) tracking + spectral health of W_U.
+# Off by default. Negligible cost (one 768x768 eigh per step).
+wu_diagnostics:
+  enabled: false
