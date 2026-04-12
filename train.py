@@ -131,7 +131,7 @@ def _build_loss_skip_weights(
 def _to_host_numpy(x, dtype=np.float32, flatten: bool = False):
     """Converts possibly non-addressable JAX arrays to host NumPy arrays."""
     if isinstance(x, jax.Array) and not x.is_fully_addressable:
-        host_value = multihost_utils.process_allgather(x)
+        host_value = multihost_utils.process_allgather(x, tiled=True)
     else:
         host_value = jax.device_get(x)
     arr = np.asarray(host_value, dtype=dtype)
