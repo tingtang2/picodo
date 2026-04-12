@@ -128,6 +128,16 @@ def _build_loss_skip_weights(
     return weights
 
 
+def _to_host_numpy(x, dtype=np.float32, flatten: bool = False):
+    """Converts possibly non-addressable JAX arrays to host NumPy arrays."""
+    if isinstance(x, jax.Array) and not x.is_fully_addressable:
+        host_value = multihost_utils.process_allgather(x)
+    else:
+        host_value = jax.device_get(x)
+    arr = np.asarray(host_value, dtype=dtype)
+    return arr.reshape(-1) if flatten else arr
+
+
 @partial(jax.jit, static_argnames=('model_graphdef', 'collect_qkv_stats'))
 def loss_fn_with_skip(
     model_state,
@@ -1338,7 +1348,7 @@ def train_and_evaluate(c: DictConfig):
                 rewrite_probe_loss, (rewrite_probe_raw_loss, _) = loss_fn(
                     opt_state.model, model_graphdef, batch, False
                 )
-            rewrite_probe_raw_np = np.asarray(jax.device_get(rewrite_probe_raw_loss), dtype=np.float32)
+            rewrite_probe_raw_np = _to_host_numpy(rewrite_probe_raw_loss, dtype=np.float32)
             rewrite_stats_np = (
                 np.log1p(np.maximum(rewrite_probe_raw_np, 0.0))
                 if loss_rewrite_use_log_loss
@@ -1409,7 +1419,7 @@ def train_and_evaluate(c: DictConfig):
                         opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
                     )
         if loss_skip_enabled:
-            raw_np = np.asarray(jax.device_get(train_raw_loss), dtype=np.float32).reshape(-1)
+            raw_np = _to_host_numpy(train_raw_loss, dtype=np.float32, flatten=True)
             stats_np = np.log1p(np.maximum(raw_np, 0.0)) if loss_skip_use_log_loss else raw_np
             if gate_apply:
                 scale = max(1.4826 * gate_mad, loss_skip_eps)
