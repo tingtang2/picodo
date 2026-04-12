@@ -125,31 +125,37 @@ def get_layer_weight_norms_split(params):
     return norms
 
 
-def get_layer_moment_norms(opt_state):
-    def find_adam_state(tree):
-        # Recursively search for a node containing 'mu' and 'nu'
+def _find_moment_state(opt_state):
+    def visit(tree):
         if isinstance(tree, Mapping):
-            if 'mu' in tree and 'nu' in tree:
+            if "mu" in tree and "nu" in tree:
                 return tree
-            for v in tree.values():
-                found = find_adam_state(v)
-                if found: return found
-        elif hasattr(tree, 'mu') and hasattr(tree, 'nu'):
+            for value in tree.values():
+                found = visit(value)
+                if found is not None:
+                    return found
+        elif hasattr(tree, "mu") and hasattr(tree, "nu"):
             return tree
         elif isinstance(tree, (list, tuple)):
-            for v in tree:
-                found = find_adam_state(v)
-                if found: return found
+            for value in tree:
+                found = visit(value)
+                if found is not None:
+                    return found
         return None
 
-    adam_state = find_adam_state(opt_state)
+    return visit(opt_state)
+
+
+def _get_state_component(state, key):
+    if isinstance(state, Mapping):
+        return state[key]
+    return getattr(state, key)
+
+
+def get_layer_moment_norms(opt_state):
+    adam_state = _find_moment_state(opt_state)
     if adam_state is None:
         return {}
-
-    def get_component(state, key):
-        if isinstance(state, Mapping):
-            return state[key]
-        return getattr(state, key)
 
     metrics = {}
     # Helper to traverse the tree with a specific prefix
@@ -174,14 +180,70 @@ def get_layer_moment_norms(opt_state):
         visit("", tree)
     
     # Process First Moment (mu)
-    mu = get_component(adam_state, 'mu')
+    mu = _get_state_component(adam_state, "mu")
     metrics['moment1_norm/global'] = float(get_l2_norm(mu))
     log_tree(mu, 'moment1_norm')
 
     # Process Second Moment (nu)
-    nu = get_component(adam_state, 'nu')
+    nu = _get_state_component(adam_state, "nu")
     metrics['moment2_norm/global'] = float(get_l2_norm(nu))
     log_tree(nu, 'moment2_norm')
+
+    return metrics
+
+
+def _collect_array_leaves(tree):
+    leaves = {}
+
+    def visit(path, node):
+        if hasattr(node, "value"):
+            leaves[path] = jnp.asarray(node.value, dtype=jnp.float32)
+            return
+        if hasattr(node, "items"):
+            for key, value in node.items():
+                key = str(key)
+                child_path = key if path == "" else f"{path}.{key}"
+                visit(child_path, value)
+            return
+        if isinstance(node, (jnp.ndarray, np.ndarray)):
+            leaves[path] = jnp.asarray(node, dtype=jnp.float32)
+            return
+
+    visit("", tree)
+    return leaves
+
+
+def get_layer_second_moment_rms_metrics(grads, opt_state, eps: float = 1e-30):
+    """Per-leaf RMS diagnostics of normalized updates: sqrt(mean(g^2 / v))."""
+    moment_state = _find_moment_state(opt_state)
+    if moment_state is None:
+        return {}
+
+    second_moment = _get_state_component(moment_state, "nu")
+    grad_leaves = _collect_array_leaves(grads)
+    moment_leaves = _collect_array_leaves(second_moment)
+    common_paths = sorted(set(grad_leaves) & set(moment_leaves))
+
+    if not common_paths:
+        return {}
+
+    metrics = {}
+    eps_arr = jnp.asarray(eps, dtype=jnp.float32)
+    whitened_vals = []
+
+    for path in common_paths:
+        grad = grad_leaves[path]
+        moment = moment_leaves[path]
+        if grad.shape != moment.shape:
+            continue
+
+        whitened_rms = jnp.sqrt(jnp.mean(jnp.square(grad) / jnp.maximum(moment, eps_arr)))
+
+        metrics[f"rms_grad_sq_over_second_moment/{path}"] = float(whitened_rms)
+        whitened_vals.append(float(whitened_rms))
+
+    if whitened_vals:
+        metrics["rms_grad_sq_over_second_moment/global_mean"] = float(np.mean(whitened_vals))
 
     return metrics
 

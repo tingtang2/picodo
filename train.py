@@ -805,6 +805,7 @@ def _build_train_metrics(
     metrics.update(utils.get_layer_grad_norms_split(grads))
     metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
     metrics.update(utils.get_layer_moment_norms(opt_state))
+    metrics.update(utils.get_layer_second_moment_rms_metrics(grads, opt_state))
     if logit_grad_stats is not None:
         metrics.update(logit_grad_stats)
     if logit_grad_scaling_stats is not None:
