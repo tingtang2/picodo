@@ -797,6 +797,7 @@ def _build_train_metrics(
     opt_state,
     grads,
     lr_schedule,
+    b2_schedule,
     qkv_stats,
     logit_grad_stats,
     logit_grad_scaling_stats,
@@ -812,6 +813,8 @@ def _build_train_metrics(
     metrics['train_output_logit_std'] = output_logit_std
     metrics['train_output_logit_entropy'] = output_logit_entropy
     metrics['lr'] = lr_schedule(step)
+    if b2_schedule is not None:
+        metrics['b2'] = b2_schedule(step)
     metrics.update(utils.get_layer_grad_norms_split(grads))
     metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
     metrics.update(utils.get_layer_moment_norms(opt_state))
@@ -932,11 +935,30 @@ def train_and_evaluate(c: DictConfig):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
+    b2_schedule = None
+    b2_hparam = c.opt.b2
+    b2_cosine_cfg = getattr(c.opt, "b2_cosine_anneal", None)
+    b2_cosine_enabled = bool(getattr(b2_cosine_cfg, "enabled", False))
+    if b2_cosine_enabled:
+        final_b2 = float(getattr(b2_cosine_cfg, "final_b2", c.opt.b2))
+        b2_schedule = optax.schedules.warmup_cosine_decay_schedule(
+            init_value=c.opt.b2,
+            peak_value=c.opt.b2,
+            warmup_steps=0,
+            decay_steps=num_opt_steps,
+            end_value=final_b2,
+        )
+        b2_hparam = b2_schedule
+        if jax.process_index() == 0:
+            print(
+                "b2 cosine annealing enabled: "
+                f"start_b2={c.opt.b2}, final_b2={final_b2}, warmup_steps=0"
+            )
     wd_mask = utils.build_weight_decay_mask(model, c.opt.exclude_input_embedding_weight_decay)
     tx = optax.inject_hyperparams(optax.adamw)(
         lr_schedule,
         c.opt.b1,
-        c.opt.b2,
+        b2_hparam,
         eps=c.opt.eps,
         weight_decay=c.opt.weight_decay,
         mask=wd_mask,
@@ -1473,6 +1495,7 @@ def train_and_evaluate(c: DictConfig):
                 opt_state,
                 grads,
                 lr_schedule,
+                b2_schedule,
                 qkv_stats,
                 logit_grad_stats,
                 logit_grad_scaling_stats,
@@ -1498,6 +1521,7 @@ def train_and_evaluate(c: DictConfig):
                     opt_state,
                     grads,
                     lr_schedule,
+                    b2_schedule,
                     qkv_stats,
                     logit_grad_stats,
                     logit_grad_scaling_stats,

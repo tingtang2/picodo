@@ -40,6 +40,9 @@ opt:
   warmup_frac: 0.05
   b1: 0.9
   b2: 0.95
+  b2_cosine_anneal:
+    enabled: false
+    final_b2: 0.95
   weight_decay: 1e-4
   exclude_input_embedding_weight_decay: false
   clip_by_global_norm: 1.0
