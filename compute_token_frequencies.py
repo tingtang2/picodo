@@ -34,17 +34,23 @@ def compute_frequencies(
     if output_path is None:
         output_path = ds_path.replace(".bin", "_freqs.npy")
 
-    # Read header
+    # Try to read header; fall back to headerless raw uint16 if magic doesn't match.
     header = np.fromfile(ds_path, dtype=np.int32, count=256)
-    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-    assert header[1] == 1, "unsupported version"
-    num_tokens = int(header[2])
+    has_header = (len(header) >= 3 and int(header[0]) == 20240520 and int(header[1]) == 1)
+    if has_header:
+        num_tokens = int(header[2])
+        token_offset = 256 * 4  # skip header
+    else:
+        file_size = os.path.getsize(ds_path)
+        num_tokens = file_size // 2  # uint16 = 2 bytes
+        token_offset = 0
     print(f"Dataset: {ds_path}")
     print(f"Tokens:  {num_tokens:_}")
     print(f"Vocab:   {vocab_size}")
+    print(f"Header:  {'yes' if has_header else 'no (raw uint16)'}")
 
     # Memory-map the token data (avoids loading the full file into RAM).
-    tokens = np.memmap(ds_path, dtype=np.uint16, mode="r", offset=256 * 4)
+    tokens = np.memmap(ds_path, dtype=np.uint16, mode="r", offset=token_offset)
     assert len(tokens) >= num_tokens
 
     # Compute histogram in chunks to keep memory bounded.
