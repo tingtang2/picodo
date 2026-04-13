@@ -58,6 +58,11 @@ opt:
     enabled: false
     start: 0.99
     end: 0.95
+  freq_scale:
+    enabled: false
+    freq_path: null  # path to .npy from compute_token_frequencies.py
+    alpha: 0.5       # exponent: f_i^alpha per row. 0.5 = theoretically optimal
+    freq_floor: 1e-8 # clamp frequencies above this to avoid div-by-zero
 
 # Per-step per-tensor cosine(W_t, W_{t-1}). Off by default.
 cosine:

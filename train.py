@@ -942,7 +942,7 @@ def train_and_evaluate(c: DictConfig):
         b2_schedule = None
         b2_value = c.opt.b2
 
-    tx = optax.inject_hyperparams(optax.adamw)(
+    adamw_tx = optax.inject_hyperparams(optax.adamw)(
         lr_schedule,
         c.opt.b1,
         b2_value,
@@ -950,12 +950,62 @@ def train_and_evaluate(c: DictConfig):
         weight_decay=c.opt.weight_decay,
         mask=wd_mask,
     )
-    
+
+    # Frequency-weighted update scaling on W_U (Variant 1).
+    # After Adam produces an update, multiply each row i of
+    # token_embed_out.embedding by f_i^alpha, where f_i is the normalised
+    # token frequency. This damps Adam's amplification of rare-token rows
+    # (whose v_t is near-floor) without changing the gradient that Adam sees.
+    freq_scale_cfg = getattr(c.opt, "freq_scale", None)
+    freq_scale_enabled = bool(getattr(freq_scale_cfg, "enabled", False))
+    freq_scale_tx = None
+    if freq_scale_enabled:
+        import os as _os
+        freq_path = _os.path.expanduser(str(getattr(freq_scale_cfg, "freq_path")))
+        freq_alpha = float(getattr(freq_scale_cfg, "alpha", 0.5))
+        freq_raw = jnp.asarray(np.load(freq_path), dtype=jnp.float32)  # [V_tokenizer]
+        # Pad to model's V (rounded up for sharding) with zeros.
+        if len(freq_raw) < c.model.V:
+            freq_raw = jnp.pad(freq_raw, (0, c.model.V - len(freq_raw)))
+        freq_raw = freq_raw[:c.model.V]
+        # Avoid division by zero: clamp to a small positive floor.
+        freq_floor = float(getattr(freq_scale_cfg, "freq_floor", 1e-8))
+        freq_clamped = jnp.maximum(freq_raw, freq_floor)
+        # Per-row scale: f_i^alpha. Shape [V, 1] for broadcasting over D.
+        freq_row_scales = (freq_clamped ** freq_alpha)[:, None]  # [V, 1]
+
+        def _freq_scale_init(params):
+            # Build a scale pytree matching params: 1.0 everywhere except
+            # token_embed_out.embedding which gets freq_row_scales.
+            def _build(path, leaf):
+                key = jax.tree_util.keystr(path, simple=True, separator='/')
+                if 'token_embed_out' in key and 'embedding' in key:
+                    return jnp.broadcast_to(freq_row_scales, leaf.shape).astype(leaf.dtype)
+                return jnp.ones((), dtype=leaf.dtype)
+            return jax.tree_util.tree_map_with_path(_build, params)
+
+        def _freq_scale_update(updates, state, params=None):
+            return jax.tree.map(jnp.multiply, updates, state), state
+
+        freq_scale_tx = optax.GradientTransformation(_freq_scale_init, _freq_scale_update)
+        if jax.process_index() == 0:
+            print(
+                f"freq-weighted W_U scaling enabled: alpha={freq_alpha}, "
+                f"freq_floor={freq_floor}, path={freq_path}"
+            )
+
+    # Assemble the optimizer chain: [clip] -> adamw -> [freq_scale].
+    # Frequency scaling goes AFTER Adam so it damps the preconditioned update,
+    # not the raw gradient (which Adam would normalise away).
+    transforms = []
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:
-        tx = optax.chain(
-            optax.clip_by_global_norm(clip_by_global_norm), tx)
-    
+        transforms.append(optax.clip_by_global_norm(clip_by_global_norm))
+    transforms.append(adamw_tx)
+    if freq_scale_tx is not None:
+        transforms.append(freq_scale_tx)
+    tx = optax.chain(*transforms) if len(transforms) > 1 else transforms[0]
+
     optimizer = nnx.ModelAndOptimizer(model, tx)
     opt_graphdef, opt_state = nnx.split(optimizer)
 
