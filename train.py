@@ -925,10 +925,27 @@ def train_and_evaluate(c: DictConfig):
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
     wd_mask = utils.build_weight_decay_mask(model, c.opt.exclude_input_embedding_weight_decay)
+
+    # b2 annealing: cosine decay from b2_start to b2_end over training.
+    b2_anneal_cfg = getattr(c.opt, "b2_anneal", None)
+    b2_anneal_enabled = bool(getattr(b2_anneal_cfg, "enabled", False))
+    if b2_anneal_enabled:
+        b2_start = float(getattr(b2_anneal_cfg, "start", 0.99))
+        b2_end = float(getattr(b2_anneal_cfg, "end", 0.95))
+        def b2_schedule(step):
+            progress = jnp.minimum(step / num_opt_steps, 1.0)
+            return b2_end + 0.5 * (b2_start - b2_end) * (1.0 + jnp.cos(jnp.pi * progress))
+        b2_value = b2_schedule
+        if jax.process_index() == 0:
+            print(f"b2 annealing enabled: {b2_start} -> {b2_end} (cosine, {num_opt_steps} steps)")
+    else:
+        b2_schedule = None
+        b2_value = c.opt.b2
+
     tx = optax.inject_hyperparams(optax.adamw)(
         lr_schedule,
         c.opt.b1,
-        c.opt.b2,
+        b2_value,
         eps=c.opt.eps,
         weight_decay=c.opt.weight_decay,
         mask=wd_mask,
@@ -1364,8 +1381,10 @@ def train_and_evaluate(c: DictConfig):
         # per-step diagnostics: cosine + Hessian + W_U (logged independently
         # of the main metric path so they fire on every step regardless of
         # log_every_tokens / log_metrics_per_step settings).
-        if cosine_enabled or hessian_enabled or wu_diag_enabled:
+        if cosine_enabled or hessian_enabled or wu_diag_enabled or b2_anneal_enabled:
             diag_metrics: dict = {}
+            if b2_anneal_enabled:
+                diag_metrics["b2"] = float(b2_schedule(step))
             if cosine_enabled:
                 diag_metrics.update(cosine_tracker.step(opt_state.model))
             if hessian_enabled and (step % hessian_every_n_steps == 0):

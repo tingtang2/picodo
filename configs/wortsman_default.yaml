@@ -60,6 +60,10 @@ opt:
     enabled: false
     soft_cap: 30.0
     warmup_steps: 0
+  b2_anneal:
+    enabled: false
+    start: 0.99
+    end: 0.95
 
 checkpoint:
   turn_on: true
