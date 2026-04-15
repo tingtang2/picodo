@@ -981,7 +981,16 @@ def train_and_evaluate(c: DictConfig):
     v_init = float(getattr(c.opt, "v_init", 0.0) or 0.0)
     if v_init < 0.0:
         raise ValueError(f"opt.v_init must be >= 0, got {v_init}")
-    adamw_ctor = partial(_adamw_with_v_init, v_init=v_init)
+
+    # A closure (not functools.partial) is used to hide v_init from
+    # inject_hyperparams' signature inspection. With partial, v_init would
+    # remain in inspect.signature(...) with a default, causing
+    # inject_hyperparams to promote it to a traced hyperparam and fail when
+    # the init path tries to compare / cast it to a Python float.
+    def adamw_ctor(learning_rate, b1, b2, eps, weight_decay, mask):
+        return _adamw_with_v_init(
+            learning_rate, b1, b2, eps, weight_decay, mask, v_init=v_init,
+        )
     if jax.process_index() == 0 and v_init != 0.0:
         print(f"v_t warm-start enabled: nu init = {v_init}")
 
