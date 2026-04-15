@@ -28,10 +28,6 @@ for eps in "${UNEMBED_EPS_VALUES[@]}"; do
         opt.use_z_loss=False \
         opt.unembed_eps="${eps}" \
         checkpoint.turn_on=false \
-        cosine.enabled=true \
-        hessian.enabled=true \
-        hessian.k=5 \
-        hessian.every_n_steps=50 \
         wu_diagnostics.enabled=true \
         log_metrics_per_step=true \
         wandb_mode=online \
