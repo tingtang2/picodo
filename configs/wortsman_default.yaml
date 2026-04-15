@@ -49,6 +49,11 @@ opt:
   # this eps and every other parameter keeps `eps` above. Leave null to use
   # a single global eps (existing behavior).
   unembed_eps: null
+  # Constant initialisation for Adam's second-moment estimate (nu). 0.0
+  # matches standard optax.adamw. A positive value (e.g. 1e-4) gives every
+  # coordinate a baseline denominator from step 0 so rare rows are never
+  # in the eps-dominated regime at initialisation.
+  v_init: 0.0
   loss_skip:
     enabled: false
     warmup_steps: 1000

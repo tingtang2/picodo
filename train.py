@@ -52,6 +52,37 @@ class _StandardNameFormatHNS(step_lib._StandardNameFormat):
 
 
 
+def _scale_by_adam_with_v_init(b1, b2, eps, v_init):
+    """optax.scale_by_adam with a constant initialisation for nu.
+
+    When v_init == 0.0, behaviour is byte-identical to optax.scale_by_adam
+    (nu starts at zero). When v_init > 0, every coordinate of nu is
+    initialised to v_init so rare rows have a non-zero denominator from
+    step 0 — tests whether the rare-row failure mode is driven by nu
+    starting at zero rather than eps being fundamentally too small.
+    """
+    base = optax.scale_by_adam(b1=b1, b2=b2, eps=eps)
+    v_init_f = float(v_init)
+
+    def init_fn(params):
+        state = base.init(params)
+        if v_init_f == 0.0:
+            return state
+        new_nu = jax.tree.map(lambda x: jnp.full_like(x, v_init_f), state.nu)
+        return state._replace(nu=new_nu)
+
+    return optax.GradientTransformation(init_fn, base.update)
+
+
+def _adamw_with_v_init(learning_rate, b1, b2, eps, weight_decay, mask, v_init):
+    """optax.adamw drop-in with a controllable nu initialisation."""
+    return optax.chain(
+        _scale_by_adam_with_v_init(b1, b2, eps, v_init),
+        optax.add_decayed_weights(weight_decay, mask=mask),
+        optax.scale_by_learning_rate(learning_rate),
+    )
+
+
 @partial(jax.jit, static_argnames=('model_graphdef', 'collect_qkv_stats'))
 def loss_fn(model_state, model_graphdef, x, collect_qkv_stats: bool = True): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
@@ -943,6 +974,17 @@ def train_and_evaluate(c: DictConfig):
         b2_schedule = None
         b2_value = c.opt.b2
 
+    # v_init: constant initialisation for Adam's second-moment estimate
+    # (nu). 0.0 matches standard optax.adamw. A positive value gives every
+    # coordinate a baseline denominator from step 0, testing whether the
+    # rare-row failure mode is caused by nu starting at zero.
+    v_init = float(getattr(c.opt, "v_init", 0.0) or 0.0)
+    if v_init < 0.0:
+        raise ValueError(f"opt.v_init must be >= 0, got {v_init}")
+    adamw_ctor = partial(_adamw_with_v_init, v_init=v_init)
+    if jax.process_index() == 0 and v_init != 0.0:
+        print(f"v_t warm-start enabled: nu init = {v_init}")
+
     # Per-group eps: optionally give the unembedding matrix (W_U,
     # i.e. token_embed_out.embedding) its own Adam epsilon while leaving
     # every other parameter on c.opt.eps. Set c.opt.unembed_eps=null to
@@ -951,7 +993,7 @@ def train_and_evaluate(c: DictConfig):
     unembed_eps = getattr(c.opt, "unembed_eps", None)
     if unembed_eps is not None:
         unembed_eps = float(unembed_eps)
-        unembed_adamw = optax.inject_hyperparams(optax.adamw)(
+        unembed_adamw = optax.inject_hyperparams(adamw_ctor)(
             lr_schedule,
             c.opt.b1,
             b2_value,
@@ -959,7 +1001,7 @@ def train_and_evaluate(c: DictConfig):
             weight_decay=c.opt.weight_decay,
             mask=wd_mask,
         )
-        rest_adamw = optax.inject_hyperparams(optax.adamw)(
+        rest_adamw = optax.inject_hyperparams(adamw_ctor)(
             lr_schedule,
             c.opt.b1,
             b2_value,
@@ -978,7 +1020,7 @@ def train_and_evaluate(c: DictConfig):
                 f"rest_eps={c.opt.eps}"
             )
     else:
-        tx = optax.inject_hyperparams(optax.adamw)(
+        tx = optax.inject_hyperparams(adamw_ctor)(
             lr_schedule,
             c.opt.b1,
             b2_value,
