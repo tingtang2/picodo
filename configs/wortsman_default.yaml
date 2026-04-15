@@ -99,3 +99,13 @@ hessian:
 # Off by default. Negligible cost (one 768x768 eigh per step).
 wu_diagnostics:
   enabled: false
+
+# Tier-1 v_t evidence diagnostics: per-row sqrt(v_hat) quantiles,
+# fraction-below-eps, frequency-bucketed means, and Spearman rho between
+# log token frequency and log row-v. Computed on both token_embed_out
+# (W_U) and token_embed_in (W_E). Requires a precomputed token-frequency
+# .npy (see compute_token_frequencies.py). Off by default.
+v_t_diagnostics:
+  enabled: false
+  freq_path: null  # e.g. ~/datasets/fineweb_gpt2_freqs.npy
+  num_buckets: 10

@@ -15,6 +15,7 @@ import model as model_lib
 import param_tracking
 import hessian as hessian_lib
 import wu_diagnostics
+import v_t_diagnostics
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
 from etils import epath
@@ -1017,6 +1018,32 @@ def train_and_evaluate(c: DictConfig):
     wu_diag_enabled = bool(getattr(wu_diag_cfg, "enabled", False))
     wu_diag_tracker = wu_diagnostics.WUDiagnostics() if wu_diag_enabled else None
 
+    # Tier-1 v_t evidence: per-row sqrt(v_hat) quantiles, fraction below
+    # eps, frequency-bucketed means, Spearman rho(log f, log row_v) on
+    # both the output and input embeddings.
+    v_t_cfg = getattr(c, "v_t_diagnostics", None)
+    v_t_enabled = bool(getattr(v_t_cfg, "enabled", False))
+    if v_t_enabled:
+        v_t_freq_path = getattr(v_t_cfg, "freq_path", None)
+        if v_t_freq_path is None:
+            raise ValueError(
+                "v_t_diagnostics.enabled=true but freq_path is null. Point it at "
+                "the .npy produced by compute_token_frequencies.py."
+            )
+        v_t_tracker = v_t_diagnostics.VtDiagnostics(
+            freq_path=str(v_t_freq_path),
+            vocab_size=int(c.model.V),
+            b2=(b2_schedule if b2_anneal_enabled else c.opt.b2),
+            num_buckets=int(getattr(v_t_cfg, "num_buckets", 10)),
+        )
+        if jax.process_index() == 0:
+            print(
+                f"v_t diagnostics enabled: freq_path={v_t_freq_path}, "
+                f"num_buckets={int(getattr(v_t_cfg, 'num_buckets', 10))}"
+            )
+    else:
+        v_t_tracker = None
+
     if jax.process_index() == 0:
         if cosine_enabled:
             print("cosine tracker enabled: per-tensor cos(W_t, W_{t-1}) every step")
@@ -1416,7 +1443,7 @@ def train_and_evaluate(c: DictConfig):
         # per-step diagnostics: cosine + Hessian + W_U (logged independently
         # of the main metric path so they fire on every step regardless of
         # log_every_tokens / log_metrics_per_step settings).
-        if cosine_enabled or hessian_enabled or wu_diag_enabled or b2_anneal_enabled:
+        if cosine_enabled or hessian_enabled or wu_diag_enabled or v_t_enabled or b2_anneal_enabled:
             diag_metrics: dict = {}
             if b2_anneal_enabled:
                 diag_metrics["b2"] = float(b2_schedule(step))
@@ -1426,6 +1453,8 @@ def train_and_evaluate(c: DictConfig):
                 diag_metrics.update(hessian_tracker.step(opt_state.model, batch))
             if wu_diag_enabled:
                 diag_metrics.update(wu_diag_tracker.step(opt_state.model))
+            if v_t_enabled:
+                diag_metrics.update(v_t_tracker.step(opt_state, step, float(c.opt.eps)))
             if diag_metrics and jax.process_index() == 0:
                 wandb.log(diag_metrics, step)
 
