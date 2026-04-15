@@ -38,6 +38,27 @@ def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
         is_leaf=lambda x: isinstance(x, nnx.Param),
     )
 
+
+def build_unembed_label_mask(model: nnx.Module):
+    """Same-shape pytree of strings tagging each parameter leaf with its
+    optimizer group: 'unembed' for token_embed_out.embedding (W_U), 'rest'
+    for everything else. Consumed by optax.multi_transform to route each
+    group through its own adamw instance (used to give W_U a different eps).
+    """
+    _, params = nnx.split(model, nnx.Param)
+
+    def label_leaf(path, _):
+        key = jax.tree_util.keystr(path, simple=True, separator='/')
+        if 'token_embed_out' in key and 'embedding' in key:
+            return 'unembed'
+        return 'rest'
+
+    return jax.tree_util.tree_map_with_path(
+        label_leaf,
+        params,
+        is_leaf=lambda x: isinstance(x, nnx.Param),
+    )
+
 def save_to_numpy(save_dir: str, name: str, data):
     path = os.path.join(save_dir, name)
     np.save(path, np.array(data))

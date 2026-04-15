@@ -942,15 +942,50 @@ def train_and_evaluate(c: DictConfig):
         b2_schedule = None
         b2_value = c.opt.b2
 
-    tx = optax.inject_hyperparams(optax.adamw)(
-        lr_schedule,
-        c.opt.b1,
-        b2_value,
-        eps=c.opt.eps,
-        weight_decay=c.opt.weight_decay,
-        mask=wd_mask,
-    )
-    
+    # Per-group eps: optionally give the unembedding matrix (W_U,
+    # i.e. token_embed_out.embedding) its own Adam epsilon while leaving
+    # every other parameter on c.opt.eps. Set c.opt.unembed_eps=null to
+    # disable; the disabled path is byte-identical to the previous
+    # single-adamw construction.
+    unembed_eps = getattr(c.opt, "unembed_eps", None)
+    if unembed_eps is not None:
+        unembed_eps = float(unembed_eps)
+        unembed_adamw = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_value,
+            eps=unembed_eps,
+            weight_decay=c.opt.weight_decay,
+            mask=wd_mask,
+        )
+        rest_adamw = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_value,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+            mask=wd_mask,
+        )
+        eps_label_mask = utils.build_unembed_label_mask(model)
+        tx = optax.multi_transform(
+            {"unembed": unembed_adamw, "rest": rest_adamw},
+            eps_label_mask,
+        )
+        if jax.process_index() == 0:
+            print(
+                f"per-group eps enabled: unembed_eps={unembed_eps}, "
+                f"rest_eps={c.opt.eps}"
+            )
+    else:
+        tx = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_value,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+            mask=wd_mask,
+        )
+
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:
         tx = optax.chain(
