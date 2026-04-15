@@ -16,7 +16,7 @@ cd "$(dirname "$0")"
 source ../env-loss-spikes/bin/activate
 
 EPS_VALUES=(1e-8 1e-6 1e-4 1e-2)
-FREQ_PATH='~/datasets/fineweb_gpt2_freqs.npy'
+FREQ_PATH="${HOME}/datasets/fineweb_gpt2_freqs.npy"
 
 for eps in "${EPS_VALUES[@]}"; do
     run_name="gpt2s-v_t_evidence-eps${eps}-lr0.17"
