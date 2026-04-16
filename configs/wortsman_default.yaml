@@ -49,6 +49,11 @@ opt:
   # this eps and every other parameter keeps `eps` above. Leave null to use
   # a single global eps (existing behavior).
   unembed_eps: null
+  # Complement: when set, every parameter EXCEPT token_embed_out.embedding
+  # uses this eps while W_U keeps `eps` above. Negative-control knob for
+  # testing whether eps protection elsewhere matters. Both knobs may be
+  # set simultaneously (W_U gets unembed_eps, rest gets nonunembed_eps).
+  nonunembed_eps: null
   loss_skip:
     enabled: false
     warmup_steps: 1000

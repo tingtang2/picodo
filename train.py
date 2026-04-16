@@ -943,19 +943,31 @@ def train_and_evaluate(c: DictConfig):
         b2_schedule = None
         b2_value = c.opt.b2
 
-    # Per-group eps: optionally give the unembedding matrix (W_U,
-    # i.e. token_embed_out.embedding) its own Adam epsilon while leaving
-    # every other parameter on c.opt.eps. Set c.opt.unembed_eps=null to
-    # disable; the disabled path is byte-identical to the previous
-    # single-adamw construction.
-    unembed_eps = getattr(c.opt, "unembed_eps", None)
-    if unembed_eps is not None:
-        unembed_eps = float(unembed_eps)
+    # Per-group eps. Two independent knobs:
+    #   opt.unembed_eps     -> eps applied to token_embed_out.embedding (W_U)
+    #   opt.nonunembed_eps  -> eps applied to every other parameter
+    # When either is set, the optimizer is built via optax.multi_transform
+    # as two adamw instances (same lr/b1/b2/wd, different eps). Unset
+    # values fall back to c.opt.eps on their respective group. When both
+    # are null, the construction is byte-identical to a single adamw at
+    # c.opt.eps.
+    unembed_eps_override = getattr(c.opt, "unembed_eps", None)
+    nonunembed_eps_override = getattr(c.opt, "nonunembed_eps", None)
+    use_per_group = (unembed_eps_override is not None) or (nonunembed_eps_override is not None)
+    if use_per_group:
+        unembed_group_eps = (
+            float(unembed_eps_override) if unembed_eps_override is not None
+            else float(c.opt.eps)
+        )
+        rest_group_eps = (
+            float(nonunembed_eps_override) if nonunembed_eps_override is not None
+            else float(c.opt.eps)
+        )
         unembed_adamw = optax.inject_hyperparams(optax.adamw)(
             lr_schedule,
             c.opt.b1,
             b2_value,
-            eps=unembed_eps,
+            eps=unembed_group_eps,
             weight_decay=c.opt.weight_decay,
             mask=wd_mask,
         )
@@ -963,7 +975,7 @@ def train_and_evaluate(c: DictConfig):
             lr_schedule,
             c.opt.b1,
             b2_value,
-            eps=c.opt.eps,
+            eps=rest_group_eps,
             weight_decay=c.opt.weight_decay,
             mask=wd_mask,
         )
@@ -974,8 +986,8 @@ def train_and_evaluate(c: DictConfig):
         )
         if jax.process_index() == 0:
             print(
-                f"per-group eps enabled: unembed_eps={unembed_eps}, "
-                f"rest_eps={c.opt.eps}"
+                f"per-group eps enabled: unembed_eps={unembed_group_eps}, "
+                f"rest_eps={rest_group_eps}"
             )
     else:
         tx = optax.inject_hyperparams(optax.adamw)(
