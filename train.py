@@ -16,6 +16,7 @@ import param_tracking
 import hessian as hessian_lib
 import wu_diagnostics
 import v_t_diagnostics
+import attn_heatmap_diagnostics
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
 from etils import epath
@@ -1044,6 +1045,19 @@ def train_and_evaluate(c: DictConfig):
     else:
         v_t_tracker = None
 
+    # Attention heatmap diagnostics: per-layer [T, T] attention weight
+    # maps averaged over batch and heads, logged as W&B images.
+    attn_heatmap_cfg = getattr(c, "attention_heatmaps", None)
+    attn_heatmap_enabled = bool(getattr(attn_heatmap_cfg, "enabled", False))
+    attn_heatmap_every_n = int(getattr(attn_heatmap_cfg, "every_n_steps", 100))
+    if attn_heatmap_enabled:
+        from omegaconf import ListConfig
+        qk_config = c.model.use_qk_norm
+        if isinstance(qk_config, (list, tuple, ListConfig)):
+            attn_qk_norm_flags = [i in qk_config for i in range(c.model.L)]
+        else:
+            attn_qk_norm_flags = [bool(qk_config)] * c.model.L
+
     if jax.process_index() == 0:
         if cosine_enabled:
             print("cosine tracker enabled: per-tensor cos(W_t, W_{t-1}) every step")
@@ -1054,6 +1068,8 @@ def train_and_evaluate(c: DictConfig):
             )
         if wu_diag_enabled:
             print("W_U diagnostics enabled: mu_W tracking + spectral metrics every step")
+        if attn_heatmap_enabled:
+            print(f"attention heatmap logging enabled: every {attn_heatmap_every_n} steps")
 
     # set up checkpointing
     start_step = 0
@@ -1443,7 +1459,7 @@ def train_and_evaluate(c: DictConfig):
         # per-step diagnostics: cosine + Hessian + W_U (logged independently
         # of the main metric path so they fire on every step regardless of
         # log_every_tokens / log_metrics_per_step settings).
-        if cosine_enabled or hessian_enabled or wu_diag_enabled or v_t_enabled or b2_anneal_enabled:
+        if cosine_enabled or hessian_enabled or wu_diag_enabled or v_t_enabled or attn_heatmap_enabled or b2_anneal_enabled:
             diag_metrics: dict = {}
             if b2_anneal_enabled:
                 diag_metrics["b2"] = float(b2_schedule(step))
@@ -1457,6 +1473,11 @@ def train_and_evaluate(c: DictConfig):
                 diag_metrics.update(v_t_tracker.step(opt_state, step, float(c.opt.eps)))
             if diag_metrics and jax.process_index() == 0:
                 wandb.log(diag_metrics, step)
+            if attn_heatmap_enabled and (step % attn_heatmap_every_n == 0):
+                attn_heatmap_diagnostics.log_attention_heatmaps(
+                    opt_state.model, model_graphdef, batch, step,
+                    attn_qk_norm_flags,
+                )
 
         # logging
         if log_metrics_per_step:

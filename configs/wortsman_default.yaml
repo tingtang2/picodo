@@ -109,3 +109,11 @@ v_t_diagnostics:
   enabled: false
   freq_path: null  # e.g. ~/datasets/fineweb_gpt2_freqs.npy
   num_buckets: 10
+
+# Per-layer attention heatmap logging. Runs a separate inference pass
+# every N steps, computes explicit softmax(QK^T/sqrt(H)) bypassing
+# flash attention, averages over batch and heads, and logs [T, T]
+# heatmaps to W&B as images. Off by default.
+attention_heatmaps:
+  enabled: false
+  every_n_steps: 100
