@@ -71,7 +71,7 @@ def _layer_attn_map(q_raw, k_raw, has_qk_norm):
     logits = jnp.where(causal[None, None], logits, jnp.finfo(jnp.float32).min)
     weights = jax.nn.softmax(logits, axis=-1)  # [B, N, T, T]
 
-    return weights.mean(axis=(0, 1))  # [T, T]
+    return weights.mean(axis=0)  # [N, T, T]  (averaged over batch, per head)
 
 
 def log_attention_heatmaps(
@@ -98,18 +98,20 @@ def log_attention_heatmaps(
     num_layers = len(qk_norm_flags)
     for i in range(num_layers):
         q_raw, k_raw, _ = qkv_dict[i]
-        attn_map = _layer_attn_map(q_raw, k_raw, qk_norm_flags[i])
-        attn_np = np.asarray(jax.device_get(attn_map))
+        attn_maps = _layer_attn_map(q_raw, k_raw, qk_norm_flags[i])  # [N, T, T]
+        attn_np = np.asarray(jax.device_get(attn_maps))
+        num_heads = attn_np.shape[0]
 
-        fig, ax = plt.subplots(figsize=(10, 10), dpi=100)
-        im = ax.imshow(attn_np, aspect='auto', cmap='viridis',
-                       interpolation='nearest')
-        ax.set_xlabel('Key position')
-        ax.set_ylabel('Query position')
-        ax.set_title(f'Layer {i} attention (avg over batch & heads)')
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        images[f'attn_heatmap/layer_{i}'] = wandb.Image(fig)
-        plt.close(fig)
+        for h in range(num_heads):
+            fig, ax = plt.subplots(figsize=(10, 10), dpi=100)
+            im = ax.imshow(attn_np[h], aspect='auto', cmap='viridis',
+                           interpolation='nearest')
+            ax.set_xlabel('Key position')
+            ax.set_ylabel('Query position')
+            ax.set_title(f'Layer {i} Head {h} (avg over batch)')
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            images[f'attn_heatmap/layer_{i}_head_{h}'] = wandb.Image(fig)
+            plt.close(fig)
 
     if jax.process_index() == 0:
         wandb.log(images, step)
