@@ -49,6 +49,11 @@ opt:
   # this eps and every other parameter keeps `eps` above. Leave null to use
   # a single global eps (existing behavior).
   unembed_eps: null
+  # When true, train W_U with plain SGD (no momentum) while every other
+  # parameter stays on AdamW. Direct test of the softmax shift-invariance
+  # conservation law (SGD preserves it exactly). Mutually exclusive with
+  # unembed_eps. Shares the main learning-rate schedule.
+  unembed_sgd: false
   loss_skip:
     enabled: false
     warmup_steps: 1000

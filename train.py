@@ -943,13 +943,65 @@ def train_and_evaluate(c: DictConfig):
         b2_schedule = None
         b2_value = c.opt.b2
 
-    # Per-group eps: optionally give the unembedding matrix (W_U,
-    # i.e. token_embed_out.embedding) its own Adam epsilon while leaving
-    # every other parameter on c.opt.eps. Set c.opt.unembed_eps=null to
-    # disable; the disabled path is byte-identical to the previous
-    # single-adamw construction.
+    # Three optimizer-construction paths, in priority order:
+    #
+    #   1. c.opt.unembed_sgd=true  -> plain SGD on W_U (token_embed_out
+    #      .embedding), adamw on everything else. Tests the softmax
+    #      shift-invariance conservation law: SGD preserves the row-sum-
+    #      zero gradient identity exactly, so mu_W should stay pinned at
+    #      init. Mutually exclusive with c.opt.unembed_eps.
+    #
+    #   2. c.opt.unembed_eps not null  -> per-group eps via multi_transform
+    #      (W_U at unembed_eps, rest at c.opt.eps).
+    #
+    #   3. Default  -> single optax.adamw at c.opt.eps.
+    #
+    # The default path (both knobs off) is byte-identical to upstream.
+    unembed_sgd = bool(getattr(c.opt, "unembed_sgd", False))
     unembed_eps = getattr(c.opt, "unembed_eps", None)
-    if unembed_eps is not None:
+    if unembed_sgd and unembed_eps is not None:
+        raise ValueError(
+            "opt.unembed_sgd=true is incompatible with opt.unembed_eps being "
+            f"set (got unembed_eps={unembed_eps}). SGD has no epsilon; pick one."
+        )
+
+    if unembed_sgd:
+        # Plain SGD (no momentum, no second moment) on W_U. Weight decay
+        # still applied via add_decayed_weights with the shared wd_mask
+        # so that W_U's regularisation matches the Adam baseline. Under
+        # multi_transform+masked, the wd_mask sees only leaves belonging
+        # to this group; irrelevant entries carry MaskedNode placeholders
+        # and are ignored per optax's standard masking semantics.
+        sgd_transforms = []
+        if float(c.opt.weight_decay) > 0.0:
+            sgd_transforms.append(
+                optax.add_decayed_weights(c.opt.weight_decay, mask=wd_mask)
+            )
+        sgd_transforms.append(optax.sgd(lr_schedule))
+        unembed_tx = (
+            optax.chain(*sgd_transforms) if len(sgd_transforms) > 1
+            else sgd_transforms[0]
+        )
+        rest_tx = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_value,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+            mask=wd_mask,
+        )
+        eps_label_mask = utils.build_unembed_label_mask(model)
+        tx = optax.multi_transform(
+            {"unembed": unembed_tx, "rest": rest_tx},
+            eps_label_mask,
+        )
+        if jax.process_index() == 0:
+            print(
+                "unembed-SGD enabled: W_U trained with plain SGD "
+                f"(lr from schedule, weight_decay={float(c.opt.weight_decay)}); "
+                f"rest trained with adamw at eps={c.opt.eps}"
+            )
+    elif unembed_eps is not None:
         unembed_eps = float(unembed_eps)
         unembed_adamw = optax.inject_hyperparams(optax.adamw)(
             lr_schedule,
