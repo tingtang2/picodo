@@ -10,7 +10,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 source ../env-loss-spikes/bin/activate
 
-V_INIT_VALUES=(1e-4 1e-2 1e-6)
+V_INIT_VALUES=(1e-6)
 EPS_VALUES=(1e-8 1e-4 1e-2 1e-6)
 FREQ_PATH="${HOME}/datasets/fineweb_gpt2_freqs.npy"
 
