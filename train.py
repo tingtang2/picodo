@@ -138,6 +138,45 @@ def _to_host_numpy(x, dtype=np.float32, flatten: bool = False):
     return arr.reshape(-1) if flatten else arr
 
 
+class _AsyncMetricWriter:
+    """Queues one step of metrics so host logging stays off the step critical path."""
+
+    def __init__(self):
+        self.prev_step = None
+        self.prev_metrics = None
+
+    def _kick_host_transfer(self, x):
+        if isinstance(x, jax.Array) and x.is_fully_addressable and hasattr(x, "copy_to_host_async"):
+            x.copy_to_host_async()
+        return x
+
+    def _materialize_scalar(self, x):
+        if isinstance(x, jax.Array):
+            arr = _to_host_numpy(x, flatten=False)
+            return arr.item() if arr.ndim == 0 else arr
+        if isinstance(x, np.generic):
+            return x.item()
+        return x
+
+    def enqueue(self, step, metrics, pbar):
+        if jax.process_index() != 0:
+            return
+        jax.tree_util.tree_map(self._kick_host_transfer, metrics)
+        log_step, log_metrics = self.prev_step, self.prev_metrics
+        self.prev_step, self.prev_metrics = step, metrics
+        if log_metrics is not None:
+            materialized = {k: self._materialize_scalar(v) for k, v in log_metrics.items()}
+            _log_metrics_if_primary(materialized, log_step, pbar)
+
+    def flush(self, pbar):
+        if jax.process_index() != 0 or self.prev_metrics is None:
+            return
+        materialized = {k: self._materialize_scalar(v) for k, v in self.prev_metrics.items()}
+        _log_metrics_if_primary(materialized, self.prev_step, pbar)
+        self.prev_step = None
+        self.prev_metrics = None
+
+
 @partial(jax.jit, static_argnames=('model_graphdef', 'collect_qkv_stats'))
 def loss_fn_with_skip(
     model_state,
@@ -784,6 +823,63 @@ def eval_step(c, model_state, model_graphdef, dataset, collect_qkv_stats: bool =
     )
 
 
+def _build_lightweight_train_metrics(
+    step,
+    tokens_per_opt_step,
+    train_loss,
+    train_med_loss,
+    train_lower_90th_mean_loss,
+    lr_schedule,
+    b2_schedule,
+    loss_skip_stats=None,
+):
+    metrics = {}
+    metrics['train_loss'] = train_loss
+    metrics['train_med_loss'] = train_med_loss
+    metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss
+    metrics['train_tokens_seen'] = (step + 1) * tokens_per_opt_step
+    metrics['lr'] = lr_schedule(step)
+    if b2_schedule is not None:
+        metrics['b2'] = b2_schedule(step)
+    if loss_skip_stats is not None:
+        metrics.update(loss_skip_stats)
+    return metrics
+
+
+def _build_heavy_train_metrics(
+    output_logit_mean,
+    output_logit_norm,
+    output_logit_std,
+    output_logit_entropy,
+    opt_state,
+    grads,
+    qkv_stats,
+    logit_grad_stats,
+    logit_grad_scaling_stats,
+    loss_skip_stats=None,
+    include_model_diagnostics: bool = True,
+):
+    metrics = {}
+    if output_logit_mean is not None:
+        metrics['train_output_logit_mean'] = output_logit_mean
+        metrics['train_output_logit_norm'] = output_logit_norm
+        metrics['train_output_logit_std'] = output_logit_std
+        metrics['train_output_logit_entropy'] = output_logit_entropy
+    if include_model_diagnostics:
+        metrics.update(utils.get_layer_grad_norms_split(grads))
+        metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
+        metrics.update(utils.get_layer_moment_norms(opt_state))
+        metrics.update(utils.get_layer_second_moment_rms_metrics(grads, opt_state))
+    if logit_grad_stats is not None:
+        metrics.update(logit_grad_stats)
+    if logit_grad_scaling_stats is not None:
+        metrics.update(logit_grad_scaling_stats)
+    metrics.update(qkv_stats)
+    if loss_skip_stats is not None:
+        metrics.update(loss_skip_stats)
+    return metrics
+
+
 def _build_train_metrics(
     step,
     tokens_per_opt_step,
@@ -802,37 +898,39 @@ def _build_train_metrics(
     logit_grad_stats,
     logit_grad_scaling_stats,
     loss_skip_stats=None,
+    include_model_diagnostics: bool = True,
 ):
-    metrics = {}
-    metrics['train_loss'] = train_loss
-    metrics['train_med_loss'] = train_med_loss
-    metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss
-    metrics['train_tokens_seen'] = (step + 1) * tokens_per_opt_step
-    metrics['train_output_logit_mean'] = output_logit_mean
-    metrics['train_output_logit_norm'] = output_logit_norm
-    metrics['train_output_logit_std'] = output_logit_std
-    metrics['train_output_logit_entropy'] = output_logit_entropy
-    metrics['lr'] = lr_schedule(step)
-    if b2_schedule is not None:
-        metrics['b2'] = b2_schedule(step)
-    metrics.update(utils.get_layer_grad_norms_split(grads))
-    metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
-    metrics.update(utils.get_layer_moment_norms(opt_state))
-    metrics.update(utils.get_layer_second_moment_rms_metrics(grads, opt_state))
-    if logit_grad_stats is not None:
-        metrics.update(logit_grad_stats)
-    if logit_grad_scaling_stats is not None:
-        metrics.update(logit_grad_scaling_stats)
-    metrics.update(qkv_stats)
-    if loss_skip_stats is not None:
-        metrics.update(loss_skip_stats)
+    metrics = _build_lightweight_train_metrics(
+        step,
+        tokens_per_opt_step,
+        train_loss,
+        train_med_loss,
+        train_lower_90th_mean_loss,
+        lr_schedule,
+        b2_schedule,
+        loss_skip_stats,
+    )
+    metrics.update(_build_heavy_train_metrics(
+        output_logit_mean,
+        output_logit_norm,
+        output_logit_std,
+        output_logit_entropy,
+        opt_state,
+        grads,
+        qkv_stats,
+        logit_grad_stats,
+        logit_grad_scaling_stats,
+        loss_skip_stats=None,
+        include_model_diagnostics=include_model_diagnostics,
+    ))
     return metrics
 
 
 def _log_metrics_if_primary(metrics, step, pbar):
     if jax.process_index() == 0:
         wandb.log(metrics, step)
-        pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
+        if 'train_loss' in metrics:
+            pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
 
 
 def _resolve_diagnostics_dir(ckpt_dir):
@@ -1099,6 +1197,8 @@ def train_and_evaluate(c: DictConfig):
     # training loop
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
     log_metrics_per_step = bool(getattr(c, "log_metrics_per_step", False))
+    log_metrics_per_step_full = bool(getattr(c, "log_metrics_per_step_full", False))
+    metric_writer = _AsyncMetricWriter() if log_metrics_per_step else None
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
     collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
@@ -1165,14 +1265,14 @@ def train_and_evaluate(c: DictConfig):
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
         batch = ds_train[step]
-        will_log_train_metrics = log_metrics_per_step or (
+        will_log_heavy_metrics = log_metrics_per_step_full or (
             (train_loss_num + 1) * tokens_per_opt_step >= c.log_every_tokens
         )
         pre_output_logit_mean = None
         pre_output_logit_norm = None
         pre_output_logit_std = None
         pre_output_logit_entropy = None
-        if will_log_train_metrics:
+        if will_log_heavy_metrics:
             (
                 pre_output_logit_mean,
                 pre_output_logit_norm,
@@ -1480,34 +1580,55 @@ def train_and_evaluate(c: DictConfig):
         if c.diagnostics.save_raw_losses:
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, batch)
 
+        train_loss_sum += batch_loss_to_log
+        train_med_loss_sum += jnp.median(train_raw_loss)
+        train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
+        train_loss_num += 1
+        should_log_interval_metrics = train_loss_num * tokens_per_opt_step >= c.log_every_tokens
+
         # logging
         if log_metrics_per_step:
-            metrics = _build_train_metrics(
+            metrics = _build_lightweight_train_metrics(
                 step,
                 tokens_per_opt_step,
                 batch_loss_to_log,
                 jnp.median(train_raw_loss),
                 utils.compute_lower_90th_percentile_mean(train_raw_loss),
-                pre_output_logit_mean,
-                pre_output_logit_norm,
-                pre_output_logit_std,
-                pre_output_logit_entropy,
-                opt_state,
-                grads,
                 lr_schedule,
                 b2_schedule,
-                qkv_stats,
-                logit_grad_stats,
-                logit_grad_scaling_stats,
                 loss_skip_stats,
             )
-            _log_metrics_if_primary(metrics, step, pbar)
-        else:
-            train_loss_sum += batch_loss_to_log
-            train_med_loss_sum += jnp.median(train_raw_loss)
-            train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
-            train_loss_num += 1
-            if train_loss_num * tokens_per_opt_step >= c.log_every_tokens:
+            if log_metrics_per_step_full:
+                metrics.update(_build_heavy_train_metrics(
+                    pre_output_logit_mean,
+                    pre_output_logit_norm,
+                    pre_output_logit_std,
+                    pre_output_logit_entropy,
+                    opt_state,
+                    grads,
+                    qkv_stats,
+                    logit_grad_stats,
+                    logit_grad_scaling_stats,
+                    include_model_diagnostics=True,
+                ))
+            metric_writer.enqueue(step, metrics, pbar)
+        if should_log_interval_metrics:
+            if log_metrics_per_step:
+                if not log_metrics_per_step_full:
+                    metrics = _build_heavy_train_metrics(
+                        pre_output_logit_mean,
+                        pre_output_logit_norm,
+                        pre_output_logit_std,
+                        pre_output_logit_entropy,
+                        opt_state,
+                        grads,
+                        qkv_stats,
+                        logit_grad_stats,
+                        logit_grad_scaling_stats,
+                        include_model_diagnostics=True,
+                    )
+                    _log_metrics_if_primary(metrics, step, pbar)
+            else:
                 metrics = _build_train_metrics(
                     step,
                     tokens_per_opt_step,
@@ -1526,9 +1647,10 @@ def train_and_evaluate(c: DictConfig):
                     logit_grad_stats,
                     logit_grad_scaling_stats,
                     loss_skip_stats,
+                    include_model_diagnostics=True,
                 )
                 _log_metrics_if_primary(metrics, step, pbar)
-                train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
+            train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
@@ -1570,6 +1692,9 @@ def train_and_evaluate(c: DictConfig):
             # Wait for async checkpoint to complete in multihost setting
             if jax.process_count() > 1:
                 ckpt_mngr.wait_until_finished()
+
+    if metric_writer is not None:
+        metric_writer.flush(pbar)
     
     if num_opt_steps != len(ds_train):
         print('exiting early')
