@@ -45,6 +45,10 @@ opt:
   clip_by_global_norm: 1.0
   use_z_loss: false
   eps: 1e-8
+  # Optimizer: "adamw" (default) or "sgd". For sgd: plain SGD with no
+  # momentum and no second moment; b1/b2/eps ignored; weight_decay still
+  # applied (via optax.add_decayed_weights with the existing wd_mask).
+  optimizer: adamw
   # Per-group Adam epsilon: when set, token_embed_out.embedding (W_U) uses
   # this eps and every other parameter keeps `eps` above. Leave null to use
   # a single global eps (existing behavior).
