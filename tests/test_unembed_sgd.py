@@ -153,47 +153,47 @@ class TestConservationLaw(unittest.TestCase):
     LR = 0.1
 
     def test_sgd_preserves_row_sum(self):
-        """The true theorem: SGD is exactly linear in the gradient, so
-        delta_rowsum = -lr * grad_rowsum. On a gradient constructed to
-        have ~zero row-sum, the output row-sum change is correspondingly
-        tiny (no extra drift introduced by the optimizer itself).
+        """The theorem: SGD's update is POINTWISE equal to -lr * g. This
+        element-wise identity is stronger than — and implies — row-sum
+        linearity for any gradient.
 
-        This is the robust version of the test: it compares SGD's
-        actual output against what SGD mathematically must produce,
-        regardless of fp32 residuals in the synthetic input gradient.
+        We test it at the update level directly to avoid the catastrophic
+        cancellation of two fp32 sums in sum(W_new) - sum(W), which
+        otherwise masks the theorem with O(sqrt(V) * eps_fp32) ~ 2e-5
+        roundoff even when the optimizer is mathematically perfect.
         """
         key = jax.random.PRNGKey(0)
         k_w, k_g = jax.random.split(key)
         W = jax.random.normal(k_w, (self.V, self.D), dtype=jnp.float32)
         g = _make_zero_rowsum_grad(W.shape, k_g)
 
-        grad_rowsum = jnp.sum(g, axis=0)
-        grad_rowsum_norm = float(jnp.linalg.norm(grad_rowsum))
-
         tx = optax.sgd(self.LR)
         state = tx.init(W)
         updates, _ = tx.update(g, state, W)
-        W_new = W + updates
 
-        actual_delta = jnp.sum(W_new, axis=0) - jnp.sum(W, axis=0)
-        expected_delta = -self.LR * grad_rowsum
-        linearity_residual = float(jnp.linalg.norm(actual_delta - expected_delta))
-
-        # SGD's linearity: the residual between observed and predicted
-        # row-sum change must be at machine-precision level.
+        # Pointwise: updates[i,j] must equal -lr * g[i,j] exactly in fp32.
+        # optax.sgd = optax.scale_by_learning_rate, which multiplies by -lr;
+        # no preconditioning, no state, no nonlinearity.
+        expected_updates = (-self.LR) * g
+        max_abs_diff = float(jnp.max(jnp.abs(updates - expected_updates)))
         self.assertLess(
-            linearity_residual, 1e-5,
-            f"SGD linearity violated: observed ||Δ - (-lr·∑g)||="
-            f"{linearity_residual}. grad_rowsum_norm={grad_rowsum_norm}",
+            max_abs_diff, 1e-6,
+            f"SGD pointwise linearity violated: max |updates - (-lr·g)|="
+            f"{max_abs_diff}",
         )
 
-        # And the absolute row-sum change should be orders of magnitude
-        # smaller than Adam's on the same input (Adam produces > 1e-3).
-        actual_delta_norm = float(jnp.linalg.norm(actual_delta))
+        # Row-sum corollary, measured on the updates directly (single
+        # summation, no cancellation). This is well below Adam's
+        # violation on the same inputs (which is > 1e-3).
+        update_rowsum = jnp.sum(updates, axis=0)
+        expected_update_rowsum = (-self.LR) * jnp.sum(g, axis=0)
+        rowsum_residual = float(
+            jnp.linalg.norm(update_rowsum - expected_update_rowsum)
+        )
         self.assertLess(
-            actual_delta_norm, 1e-4,
-            f"SGD on near-zero-row-sum grad should produce tiny row-sum "
-            f"change; got ||Δ row-sum||={actual_delta_norm}",
+            rowsum_residual, 1e-5,
+            f"SGD row-sum of updates should equal -lr * row-sum of g; "
+            f"got ||residual||={rowsum_residual}",
         )
 
     def test_adam_breaks_row_sum(self):
