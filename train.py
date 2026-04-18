@@ -966,18 +966,34 @@ def train_and_evaluate(c: DictConfig):
         )
 
     if unembed_sgd:
-        # Plain SGD (no momentum, no second moment) on W_U. Weight decay
-        # still applied via add_decayed_weights with the shared wd_mask
-        # so that W_U's regularisation matches the Adam baseline. Under
+        # SGD on W_U (optionally with momentum). Weight decay still
+        # applied via add_decayed_weights with the shared wd_mask so
+        # that W_U's regularisation matches the Adam baseline. Under
         # multi_transform+masked, the wd_mask sees only leaves belonging
         # to this group; irrelevant entries carry MaskedNode placeholders
         # and are ignored per optax's standard masking semantics.
+        #
+        # opt.unembed_sgd_momentum controls the momentum coefficient.
+        # Defaults to 0.9. Set to 0 (or null) for plain SGD. Any positive
+        # value preserves the row-sum-conservation property because the
+        # velocity is a linear combination of past (zero-row-sum)
+        # gradients, so its row-sum stays zero by induction.
+        sgd_momentum_cfg = getattr(c.opt, "unembed_sgd_momentum", 0.9)
+        sgd_momentum = (
+            float(sgd_momentum_cfg) if sgd_momentum_cfg is not None else 0.0
+        )
+        if sgd_momentum < 0.0 or sgd_momentum >= 1.0:
+            raise ValueError(
+                f"opt.unembed_sgd_momentum must be in [0, 1); got {sgd_momentum}"
+            )
+        sgd_momentum_arg = sgd_momentum if sgd_momentum > 0.0 else None
+
         sgd_transforms = []
         if float(c.opt.weight_decay) > 0.0:
             sgd_transforms.append(
                 optax.add_decayed_weights(c.opt.weight_decay, mask=wd_mask)
             )
-        sgd_transforms.append(optax.sgd(lr_schedule))
+        sgd_transforms.append(optax.sgd(lr_schedule, momentum=sgd_momentum_arg))
         unembed_tx = (
             optax.chain(*sgd_transforms) if len(sgd_transforms) > 1
             else sgd_transforms[0]
@@ -996,9 +1012,13 @@ def train_and_evaluate(c: DictConfig):
             eps_label_mask,
         )
         if jax.process_index() == 0:
+            momentum_str = (
+                f"momentum={sgd_momentum}" if sgd_momentum > 0.0
+                else "no momentum (plain SGD)"
+            )
             print(
-                "unembed-SGD enabled: W_U trained with plain SGD "
-                f"(lr from schedule, weight_decay={float(c.opt.weight_decay)}); "
+                f"unembed-SGD enabled: W_U trained with SGD ({momentum_str}, "
+                f"lr from schedule, weight_decay={float(c.opt.weight_decay)}); "
                 f"rest trained with adamw at eps={c.opt.eps}"
             )
     elif unembed_eps is not None:

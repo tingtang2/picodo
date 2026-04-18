@@ -217,6 +217,64 @@ class TestConservationLaw(unittest.TestCase):
             f"got ||Δ row-sum||={delta_norm}",
         )
 
+    def test_sgd_with_momentum_preserves_row_sum(self):
+        """SGD with momentum still preserves row-sum over many steps.
+        Velocity v_t = momentum * v_{t-1} + g_t is a linear combination
+        of zero-row-sum gradients, so v_t has zero row-sum by induction,
+        and each update -lr * v_t preserves the row-sum of W.
+
+        Tested by running the optax implementation against a manually
+        tracked reference trajectory (momentum semantics are unambiguous)
+        and verifying element-wise agreement.
+        """
+        V, D = 128, 32
+        momentum = 0.9
+        n_steps = 10
+        key = jax.random.PRNGKey(7)
+        k_w = jax.random.split(key, 1)[0]
+        W0 = jax.random.normal(k_w, (V, D), dtype=jnp.float32)
+
+        tx = optax.sgd(self.LR, momentum=momentum)
+        state = tx.init(W0)
+
+        W_optax = W0
+        W_manual = W0
+        v_manual = jnp.zeros_like(W0)
+
+        for step in range(n_steps):
+            k = jax.random.PRNGKey(step + 100)
+            g = _make_zero_rowsum_grad(W0.shape, k)
+            updates, state = tx.update(g, state, W_optax)
+            W_optax = W_optax + updates
+            v_manual = momentum * v_manual + g
+            W_manual = W_manual - self.LR * v_manual
+
+        # optax's trajectory must match the textbook SGD+momentum recursion.
+        trajectory_diff = float(jnp.max(jnp.abs(W_optax - W_manual)))
+        self.assertLess(
+            trajectory_diff, 1e-4,
+            f"optax.sgd(momentum=0.9) should match v<-mu*v+g; w<-w-lr*v "
+            f"recursion. max elementwise diff={trajectory_diff}",
+        )
+
+        # Row-sum conservation: each update has row-sum = -lr * v_rowsum.
+        # Compute expected cumulative rowsum change via the manual velocity.
+        cum_update_rowsum = jnp.sum(W_optax - W0, axis=0)
+        expected_cum_rowsum = -self.LR * jnp.sum(
+            # Sum of velocity trajectory * (-lr) = sum of updates
+            # but easier: sum(W - W0) directly equals cumulative update.
+            jnp.zeros_like(v_manual), axis=0,  # unused — keep symmetric
+        )
+        # The meaningful check: the cumulative row-sum drift after
+        # 10 momentum-SGD steps should be small (bounded by accumulated
+        # fp32 roundoff in the zero-row-sum gradient construction).
+        self.assertLess(
+            float(jnp.linalg.norm(cum_update_rowsum)), 1e-2,
+            f"SGD+momentum should keep cumulative row-sum drift small; "
+            f"got ||Δ row-sum after {n_steps} steps||="
+            f"{float(jnp.linalg.norm(cum_update_rowsum))}",
+        )
+
     def test_adam_breaking_grows_with_row_dispersion(self):
         """Adam's row-sum violation should be larger when the per-row
         gradient-squared magnitudes are more dispersed across rows.
