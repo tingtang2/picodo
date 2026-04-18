@@ -138,6 +138,31 @@ def _to_host_numpy(x, dtype=np.float32, flatten: bool = False):
     return arr.reshape(-1) if flatten else arr
 
 
+def _prepare_output_embedding_metric_groups(c):
+    if not bool(getattr(c, "log_output_embedding_group_metrics", True)):
+        return ()
+
+    groups_cfg = getattr(c, "output_embedding_groups", None)
+    if not groups_cfg:
+        return ()
+
+    groups = []
+    for group_cfg in groups_cfg:
+        name = getattr(group_cfg, "name", None)
+        token_ids_cfg = getattr(group_cfg, "token_ids", None)
+        if name is None or token_ids_cfg is None:
+            continue
+        token_ids = tuple(int(token_id) for token_id in token_ids_cfg)
+        if not token_ids:
+            continue
+        groups.append({
+            "name": str(name),
+            "token_ids": np.asarray(token_ids, dtype=np.int32),
+        })
+
+    return tuple(groups)
+
+
 class _AsyncMetricWriter:
     """Queues one step of metrics so host logging stays off the step critical path."""
 
@@ -858,6 +883,8 @@ def _build_heavy_train_metrics(
     logit_grad_scaling_stats,
     loss_skip_stats=None,
     include_model_diagnostics: bool = True,
+    output_embedding_metric_groups=(),
+    adam_eps: float = 1e-8,
 ):
     metrics = {}
     if output_logit_mean is not None:
@@ -870,6 +897,7 @@ def _build_heavy_train_metrics(
         metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
         metrics.update(utils.get_layer_moment_norms(opt_state))
         metrics.update(utils.get_layer_second_moment_rms_metrics(grads, opt_state))
+        metrics.update(utils.get_output_embedding_group_metrics(opt_state, output_embedding_metric_groups, eps=adam_eps))
     if logit_grad_stats is not None:
         metrics.update(logit_grad_stats)
     if logit_grad_scaling_stats is not None:
@@ -899,6 +927,8 @@ def _build_train_metrics(
     logit_grad_scaling_stats,
     loss_skip_stats=None,
     include_model_diagnostics: bool = True,
+    output_embedding_metric_groups=(),
+    adam_eps: float = 1e-8,
 ):
     metrics = _build_lightweight_train_metrics(
         step,
@@ -922,6 +952,8 @@ def _build_train_metrics(
         logit_grad_scaling_stats,
         loss_skip_stats=None,
         include_model_diagnostics=include_model_diagnostics,
+        output_embedding_metric_groups=output_embedding_metric_groups,
+        adam_eps=adam_eps,
     ))
     return metrics
 
@@ -1200,8 +1232,14 @@ def train_and_evaluate(c: DictConfig):
     log_metrics_per_step_full = bool(getattr(c, "log_metrics_per_step_full", False))
     use_async_metric_writer = log_metrics_per_step and jax.process_count() == 1
     metric_writer = _AsyncMetricWriter() if use_async_metric_writer else None
+    output_embedding_metric_groups = _prepare_output_embedding_metric_groups(c)
     if log_metrics_per_step and (not use_async_metric_writer) and jax.process_index() == 0:
         print("disabling async per-step metric writer in multi-host mode; using direct logging instead")
+    if output_embedding_metric_groups and jax.process_index() == 0:
+        group_summary = ", ".join(
+            f"{group['name']}({len(group['token_ids'])})" for group in output_embedding_metric_groups
+        )
+        print(f"output embedding group metrics enabled: {group_summary}")
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
     collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
@@ -1613,6 +1651,8 @@ def train_and_evaluate(c: DictConfig):
                     logit_grad_stats,
                     logit_grad_scaling_stats,
                     include_model_diagnostics=True,
+                    output_embedding_metric_groups=output_embedding_metric_groups,
+                    adam_eps=c.opt.eps,
                 ))
             if metric_writer is not None:
                 metric_writer.enqueue(step, metrics, pbar)
@@ -1632,6 +1672,8 @@ def train_and_evaluate(c: DictConfig):
                         logit_grad_stats,
                         logit_grad_scaling_stats,
                         include_model_diagnostics=True,
+                        output_embedding_metric_groups=output_embedding_metric_groups,
+                        adam_eps=c.opt.eps,
                     )
                     _log_metrics_if_primary(metrics, step, pbar)
             else:
@@ -1654,6 +1696,8 @@ def train_and_evaluate(c: DictConfig):
                     logit_grad_scaling_stats,
                     loss_skip_stats,
                     include_model_diagnostics=True,
+                    output_embedding_metric_groups=output_embedding_metric_groups,
+                    adam_eps=c.opt.eps,
                 )
                 _log_metrics_if_primary(metrics, step, pbar)
             train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0

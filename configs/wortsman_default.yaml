@@ -10,6 +10,7 @@ num_tokens_train: null
 log_every_tokens: 1_000_000
 log_metrics_per_step: false
 log_metrics_per_step_full: false
+log_output_embedding_group_metrics: true
 eval_every_steps: 100
 num_tokens_valid: 20_000_000
 wandb_project: 'picodo-loss-spikes'

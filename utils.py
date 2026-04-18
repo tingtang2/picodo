@@ -152,6 +152,27 @@ def _get_state_component(state, key):
     return getattr(state, key)
 
 
+def _get_nested_state_item(tree, path):
+    node = tree
+    for key in path:
+        if isinstance(node, Mapping) or hasattr(node, "items"):
+            node = node[key]
+        else:
+            node = getattr(node, key)
+    return node
+
+
+def _state_leaf_to_array(node, dtype=jnp.float32):
+    value = node.value if hasattr(node, "value") else node
+    return jnp.asarray(value, dtype=dtype)
+
+
+def _sanitize_metric_name(name: str) -> str:
+    sanitized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(name).strip())
+    sanitized = "_".join(part for part in sanitized.split("_") if part)
+    return sanitized or "unnamed"
+
+
 def get_layer_moment_norms(opt_state):
     adam_state = _find_moment_state(opt_state)
     if adam_state is None:
@@ -244,6 +265,90 @@ def get_layer_second_moment_rms_metrics(grads, opt_state, eps: float = 1e-30):
 
     if whitened_vals:
         metrics["rms_grad_sq_over_second_moment/global_mean"] = float(np.mean(whitened_vals))
+
+    return metrics
+
+
+def get_output_embedding_group_metrics(opt_state, token_groups, eps: float):
+    """Group-averaged output embedding diagnostics over selected token rows."""
+    if not token_groups:
+        return {}
+
+    moment_state = _find_moment_state(opt_state)
+    if moment_state is None:
+        return {}
+
+    try:
+        output_embedding = _state_leaf_to_array(
+            _get_nested_state_item(opt_state.model, ("token_embed_out", "embedding"))
+        )
+        first_moment = _state_leaf_to_array(
+            _get_nested_state_item(_get_state_component(moment_state, "mu"), ("model", "token_embed_out", "embedding"))
+        )
+        second_moment = _state_leaf_to_array(
+            _get_nested_state_item(_get_state_component(moment_state, "nu"), ("model", "token_embed_out", "embedding"))
+        )
+    except (AttributeError, KeyError, TypeError):
+        return {}
+
+    if (
+        output_embedding.ndim != 2
+        or first_moment.shape != output_embedding.shape
+        or second_moment.shape != output_embedding.shape
+    ):
+        return {}
+
+    sqrt_second_moment = jnp.sqrt(jnp.maximum(second_moment, 0.0))
+    adam_ratio = first_moment / (sqrt_second_moment + jnp.asarray(eps, dtype=jnp.float32))
+    vocab_size = int(output_embedding.shape[0])
+    metrics = {}
+    group_rows_by_name = {}
+    group_token_ids_by_name = {}
+
+    for group in token_groups:
+        token_ids = np.asarray(group["token_ids"], dtype=np.int32)
+        valid_token_ids = token_ids[(token_ids >= 0) & (token_ids < vocab_size)]
+        if valid_token_ids.size == 0:
+            continue
+
+        metric_group_name = _sanitize_metric_name(group["name"])
+        group_rows = output_embedding[valid_token_ids]
+        group_rows_by_name[metric_group_name] = group_rows
+        group_token_ids_by_name[metric_group_name] = valid_token_ids
+        group_sqrt_second_moment = sqrt_second_moment[valid_token_ids]
+        group_adam_ratio = adam_ratio[valid_token_ids]
+
+        row_l2_norm = jnp.linalg.norm(group_rows, axis=-1)
+        row_sqrt_second_moment_mean = jnp.mean(group_sqrt_second_moment, axis=-1)
+        row_sqrt_second_moment_max = jnp.max(group_sqrt_second_moment, axis=-1)
+        row_adam_ratio_mean = jnp.mean(group_adam_ratio, axis=-1)
+
+        metrics[f"output_embedding_groups/{metric_group_name}/row_l2_norm_mean"] = jnp.mean(row_l2_norm)
+        metrics[f"output_embedding_groups/{metric_group_name}/sqrt_second_moment_mean"] = jnp.mean(
+            row_sqrt_second_moment_mean
+        )
+        metrics[f"output_embedding_groups/{metric_group_name}/sqrt_second_moment_max"] = jnp.mean(
+            row_sqrt_second_moment_max
+        )
+        metrics[f"output_embedding_groups/{metric_group_name}/adam_ratio_mean"] = jnp.mean(row_adam_ratio_mean)
+
+    most_frequent_rows = group_rows_by_name.get("most_frequent")
+    least_frequent_rows = group_rows_by_name.get("least_frequent")
+    least_frequent_token_ids = group_token_ids_by_name.get("least_frequent")
+    if most_frequent_rows is not None and least_frequent_rows is not None and least_frequent_token_ids is not None:
+        most_frequent_mean = jnp.mean(most_frequent_rows, axis=0)
+        most_frequent_mean_norm = jnp.linalg.norm(most_frequent_mean)
+        least_frequent_norms = jnp.linalg.norm(least_frequent_rows, axis=-1)
+        cosine_denoms = jnp.maximum(most_frequent_mean_norm * least_frequent_norms, jnp.asarray(eps, dtype=jnp.float32))
+        cosine_sims = jnp.sum(least_frequent_rows * most_frequent_mean[None, :], axis=-1) / cosine_denoms
+
+        for token_id, cosine_sim in zip(least_frequent_token_ids.tolist(), cosine_sims):
+            metrics[
+                f"output_embedding_groups/most_frequent_to_least_frequent/cosine_similarity/token_{int(token_id)}"
+            ] = cosine_sim
+        metrics["output_embedding_groups/most_frequent_to_least_frequent/cosine_similarity_mean"] = jnp.mean(
+            cosine_sims
+        )
 
     return metrics
 
