@@ -1198,7 +1198,10 @@ def train_and_evaluate(c: DictConfig):
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
     log_metrics_per_step = bool(getattr(c, "log_metrics_per_step", False))
     log_metrics_per_step_full = bool(getattr(c, "log_metrics_per_step_full", False))
-    metric_writer = _AsyncMetricWriter() if log_metrics_per_step else None
+    use_async_metric_writer = log_metrics_per_step and jax.process_count() == 1
+    metric_writer = _AsyncMetricWriter() if use_async_metric_writer else None
+    if log_metrics_per_step and (not use_async_metric_writer) and jax.process_index() == 0:
+        print("disabling async per-step metric writer in multi-host mode; using direct logging instead")
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
     collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
@@ -1611,7 +1614,10 @@ def train_and_evaluate(c: DictConfig):
                     logit_grad_scaling_stats,
                     include_model_diagnostics=True,
                 ))
-            metric_writer.enqueue(step, metrics, pbar)
+            if metric_writer is not None:
+                metric_writer.enqueue(step, metrics, pbar)
+            else:
+                _log_metrics_if_primary(metrics, step, pbar)
         if should_log_interval_metrics:
             if log_metrics_per_step:
                 if not log_metrics_per_step_full:
