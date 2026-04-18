@@ -167,6 +167,15 @@ def _state_leaf_to_array(node, dtype=jnp.float32):
     return jnp.asarray(value, dtype=dtype)
 
 
+def _get_first_nested_state_item(tree, candidate_paths):
+    for path in candidate_paths:
+        try:
+            return _get_nested_state_item(tree, path)
+        except (AttributeError, KeyError, TypeError):
+            continue
+    raise KeyError(f"Could not resolve any of the candidate paths: {candidate_paths}")
+
+
 def _sanitize_metric_name(name: str) -> str:
     sanitized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(name).strip())
     sanitized = "_".join(part for part in sanitized.split("_") if part)
@@ -283,10 +292,22 @@ def get_output_embedding_group_metrics(opt_state, token_groups, eps: float):
             _get_nested_state_item(opt_state.model, ("token_embed_out", "embedding"))
         )
         first_moment = _state_leaf_to_array(
-            _get_nested_state_item(_get_state_component(moment_state, "mu"), ("model", "token_embed_out", "embedding"))
+            _get_first_nested_state_item(
+                _get_state_component(moment_state, "mu"),
+                (
+                    ("token_embed_out", "embedding"),
+                    ("model", "token_embed_out", "embedding"),
+                ),
+            )
         )
         second_moment = _state_leaf_to_array(
-            _get_nested_state_item(_get_state_component(moment_state, "nu"), ("model", "token_embed_out", "embedding"))
+            _get_first_nested_state_item(
+                _get_state_component(moment_state, "nu"),
+                (
+                    ("token_embed_out", "embedding"),
+                    ("model", "token_embed_out", "embedding"),
+                ),
+            )
         )
     except (AttributeError, KeyError, TypeError):
         return {}
