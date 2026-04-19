@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import optax
 from flax import nnx
 from collections.abc import Mapping
 import os
@@ -23,6 +24,11 @@ def get_num_model_params(model: nnx.Module):
     return n_params
 
 
+def _is_output_embedding_path(path) -> bool:
+    key = jax.tree_util.keystr(path, simple=True, separator='/')
+    return key == 'token_embed_out/embedding'
+
+
 def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
     if not exclude_input_embedding:
         return None
@@ -37,6 +43,52 @@ def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
         params,
         is_leaf=lambda x: isinstance(x, nnx.Param),
     )
+
+
+def build_output_embedding_mask(model: nnx.Module):
+    _, params = nnx.split(model, nnx.Param)
+
+    def mask_leaf(path, leaf):
+        if not _is_output_embedding_path(path):
+            return False
+        value = getattr(leaf, 'value', leaf)
+        if value.ndim != 2:
+            raise ValueError(
+                "Expected `token_embed_out.embedding` to be a rank-2 matrix for row-wise centering, "
+                f"got shape={value.shape}."
+            )
+        return True
+
+    return jax.tree_util.tree_map_with_path(
+        mask_leaf,
+        params,
+        is_leaf=lambda x: isinstance(x, nnx.Param),
+    )
+
+
+def row_wise_mean_centering() -> optax.GradientTransformation:
+    """Subtracts the per-row mean from masked 2D updates."""
+
+    def init_fn(_):
+        return optax.EmptyState()
+
+    def center_update(update):
+        if isinstance(update, optax.MaskedNode):
+            return update
+        update_f32 = update.astype(jnp.float32)
+        centered = update_f32 - jnp.mean(update_f32, axis=1, keepdims=True)
+        return centered.astype(update.dtype)
+
+    def update_fn(updates, state, params=None):
+        del params
+        centered_updates = jax.tree_util.tree_map(
+            center_update,
+            updates,
+            is_leaf=lambda x: isinstance(x, optax.MaskedNode),
+        )
+        return centered_updates, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
 
 def save_to_numpy(save_dir: str, name: str, data):
     path = os.path.join(save_dir, name)

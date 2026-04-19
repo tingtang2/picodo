@@ -1085,7 +1085,7 @@ def train_and_evaluate(c: DictConfig):
                 f"start_b2={c.opt.b2}, final_b2={final_b2}, warmup_steps=0"
             )
     wd_mask = utils.build_weight_decay_mask(model, c.opt.exclude_input_embedding_weight_decay)
-    tx = optax.inject_hyperparams(optax.adamw)(
+    adamw_tx = optax.inject_hyperparams(optax.adamw)(
         lr_schedule,
         c.opt.b1,
         b2_hparam,
@@ -1093,6 +1093,29 @@ def train_and_evaluate(c: DictConfig):
         weight_decay=c.opt.weight_decay,
         mask=wd_mask,
     )
+    lm_head_gc_mode = str(getattr(c.opt, "lm_head_gradient_centering", "off")).lower()
+    if lm_head_gc_mode not in {"off", "pre", "post"}:
+        raise ValueError(
+            "Expected `opt.lm_head_gradient_centering` to be one of "
+            "{'off', 'pre', 'post'}, "
+            f"got {lm_head_gc_mode!r}."
+        )
+    if lm_head_gc_mode == "off":
+        tx = adamw_tx
+    else:
+        lm_head_gc_tx = optax.masked(
+            utils.row_wise_mean_centering(),
+            utils.build_output_embedding_mask(model),
+        )
+        if lm_head_gc_mode == "pre":
+            tx = optax.chain(lm_head_gc_tx, adamw_tx)
+        else:
+            tx = optax.chain(adamw_tx, lm_head_gc_tx)
+        if jax.process_index() == 0:
+            print(
+                "lm-head gradient centering enabled: "
+                f"mode={lm_head_gc_mode}, target=token_embed_out.embedding"
+            )
     
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:
