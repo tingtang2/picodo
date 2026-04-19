@@ -1093,38 +1093,71 @@ def train_and_evaluate(c: DictConfig):
         weight_decay=c.opt.weight_decay,
         mask=wd_mask,
     )
-    lm_head_gc_raw = getattr(c.opt, "lm_head_gradient_centering", "off")
-    if isinstance(lm_head_gc_raw, bool):
-        if lm_head_gc_raw:
+
+    def normalize_lm_head_centering_mode(raw_value, field_name):
+        if isinstance(raw_value, bool):
+            if raw_value:
+                raise ValueError(
+                    f"Expected `{field_name}` to be one of "
+                    "{'off', 'pre', 'post'} or legacy `false`, got `true`."
+                )
+            return "off"
+        mode = str(raw_value).lower()
+        if mode not in {"off", "pre", "post"}:
             raise ValueError(
-                "Expected `opt.lm_head_gradient_centering` to be one of "
-                "{'off', 'pre', 'post'} or legacy `false`, got `true`."
+                f"Expected `{field_name}` to be one of "
+                "{'off', 'pre', 'post'} or legacy `false`, "
+                f"got {raw_value!r}."
             )
-        lm_head_gc_mode = "off"
-    else:
-        lm_head_gc_mode = str(lm_head_gc_raw).lower()
-    if lm_head_gc_mode not in {"off", "pre", "post"}:
-        raise ValueError(
-            "Expected `opt.lm_head_gradient_centering` to be one of "
-            "{'off', 'pre', 'post'} or legacy `false`, "
-            f"got {lm_head_gc_raw!r}."
-        )
-    if lm_head_gc_mode == "off":
-        tx = adamw_tx
-    else:
+        return mode
+
+    pre_transforms = []
+    post_transforms = []
+    output_embedding_mask = None
+
+    lm_head_gc_mode = normalize_lm_head_centering_mode(
+        getattr(c.opt, "lm_head_gradient_centering", "off"),
+        "opt.lm_head_gradient_centering",
+    )
+    if lm_head_gc_mode != "off":
+        output_embedding_mask = utils.build_output_embedding_mask(model)
         lm_head_gc_tx = optax.masked(
             utils.row_wise_mean_centering(),
-            utils.build_output_embedding_mask(model),
+            output_embedding_mask,
         )
         if lm_head_gc_mode == "pre":
-            tx = optax.chain(lm_head_gc_tx, adamw_tx)
+            pre_transforms.append(lm_head_gc_tx)
         else:
-            tx = optax.chain(adamw_tx, lm_head_gc_tx)
+            post_transforms.append(lm_head_gc_tx)
         if jax.process_index() == 0:
             print(
-                "lm-head gradient centering enabled: "
+                "lm-head row-wise gradient centering enabled: "
                 f"mode={lm_head_gc_mode}, target=token_embed_out.embedding"
             )
+
+    lm_head_weighted_gc_mode = normalize_lm_head_centering_mode(
+        getattr(c.opt, "lm_head_weighted_columnwise_gradient_centering", "off"),
+        "opt.lm_head_weighted_columnwise_gradient_centering",
+    )
+    if lm_head_weighted_gc_mode != "off":
+        if output_embedding_mask is None:
+            output_embedding_mask = utils.build_output_embedding_mask(model)
+        lm_head_weighted_gc_tx = optax.masked(
+            utils.magnitude_weighted_column_wise_centering(),
+            output_embedding_mask,
+        )
+        if lm_head_weighted_gc_mode == "pre":
+            pre_transforms.append(lm_head_weighted_gc_tx)
+        else:
+            post_transforms.append(lm_head_weighted_gc_tx)
+        if jax.process_index() == 0:
+            print(
+                "lm-head weighted column-wise gradient centering enabled: "
+                f"mode={lm_head_weighted_gc_mode}, target=token_embed_out.embedding"
+            )
+
+    tx_chain = [*pre_transforms, adamw_tx, *post_transforms]
+    tx = tx_chain[0] if len(tx_chain) == 1 else optax.chain(*tx_chain)
     
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:

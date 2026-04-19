@@ -48,6 +48,7 @@ opt:
   weight_decay: 1e-4
   exclude_input_embedding_weight_decay: false
   lm_head_gradient_centering: 'off' # one of: off, pre, post
+  lm_head_weighted_columnwise_gradient_centering: 'off' # one of: off, pre, post
   clip_by_global_norm: 1.0
   use_z_loss: false
   eps: 1e-8

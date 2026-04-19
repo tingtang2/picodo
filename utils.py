@@ -90,6 +90,45 @@ def row_wise_mean_centering() -> optax.GradientTransformation:
 
     return optax.GradientTransformation(init_fn, update_fn)
 
+
+def magnitude_weighted_column_wise_centering(eps: float = 1e-8) -> optax.GradientTransformation:
+    """Zero-centers per-column drift, weighted by squared row norms of the params."""
+
+    def init_fn(_):
+        return optax.EmptyState()
+
+    def center_update(update, param):
+        if isinstance(update, optax.MaskedNode) or isinstance(param, optax.MaskedNode):
+            return update
+
+        update_f32 = update.astype(jnp.float32)
+        param_f32 = param.astype(jnp.float32)
+
+        total_drift = jnp.sum(update_f32, axis=0, keepdims=True)
+        sq_norms = jnp.sum(jnp.square(param_f32), axis=1, keepdims=True)
+        sq_norm_sum = jnp.sum(sq_norms)
+        uniform = jnp.full_like(sq_norms, 1.0 / sq_norms.shape[0])
+        proportions = jnp.where(sq_norm_sum > eps, sq_norms / sq_norm_sum, uniform)
+
+        centered = update_f32 - proportions * total_drift
+        return centered.astype(update.dtype)
+
+    def update_fn(updates, state, params=None):
+        if params is None:
+            raise ValueError(
+                "magnitude_weighted_column_wise_centering requires `params` to compute row norms."
+            )
+        centered_updates = jax.tree_util.tree_map(
+            center_update,
+            updates,
+            params,
+            is_leaf=lambda x: isinstance(x, optax.MaskedNode),
+        )
+        return centered_updates, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def save_to_numpy(save_dir: str, name: str, data):
     path = os.path.join(save_dir, name)
     np.save(path, np.array(data))
