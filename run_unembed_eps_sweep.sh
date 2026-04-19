@@ -1,40 +1,44 @@
 #!/usr/bin/env bash
-# Sweeps token_embed_out.embedding (W_U) Adam epsilon over {1e-6, 1e-4, 1e-2}
-# while keeping every other parameter on c.opt.eps (1e-8 in wortsman_default).
-# Spike-inducing config: peak_lr=0.17, use_z_loss=False (mirrors prior
-# gpt2m-v6e16 sweep at lr=0.12 that exhibited spikes; gpt2s + higher lr
-# expected to spike similarly under small global eps).
-# Runs in series, foreground; failures log and continue to the next eps.
+# Unembed-only eps sweep: global eps stays at 1e-8, only token_embed_out
+# gets a different eps via opt.unembed_eps. Tests whether the spike
+# mitigation is localized to the lm_head (rules out "eps is just smaller LR").
+#
+# Per Aditya's suggestion: 1e-8 (control, no split), 1e-5, 1e-4.
 
 set -uo pipefail
 
 cd "$(dirname "$0")"
 source ../env-loss-spikes/bin/activate
 
-UNEMBED_EPS_VALUES=(1e-6 1e-4 1e-2)
+#UNEMBED_EPS_VALUES=(1e-8 1e-5 1e-4)
+UNEMBED_EPS_VALUES=(1e-6 1e-7)
+FREQ_PATH="${HOME}/datasets/finewebedu_gpt2_freqs.npy"
 
-for eps in "${UNEMBED_EPS_VALUES[@]}"; do
-    run_name="gpt2s-unembed_eps${eps}-lr0.17"
+for ueps in "${UNEMBED_EPS_VALUES[@]}"; do
+    run_name="gpt2s-unembed_eps${ueps}-rest1e-8-lr0.17"
     echo "============================================================"
-    echo "[sweep] starting run: ${run_name}  (unembed_eps=${eps})"
+    echo "[sweep] starting run: ${run_name}  (unembed eps=${ueps}, rest eps=1e-8)"
     echo "============================================================"
 
     python3 main.py \
         --config-name=wortsman_default \
-        +model=gpt2s +dataset=fw_gpt2 \
+        +model=gpt2s +dataset=fwedu_gpt2 \
         seed=0 \
         opt.peak_lr=0.17 \
         opt.batch_size=256 \
         opt.use_z_loss=False \
-        opt.unembed_eps="${eps}" \
+        opt.eps=1e-8 \
+        opt.unembed_eps="${ueps}" \
         checkpoint.turn_on=false \
         wu_diagnostics.enabled=true \
+        v_t_diagnostics.enabled=true \
+        v_t_diagnostics.freq_path="${FREQ_PATH}" \
         log_metrics_per_step=true \
         wandb_mode=online \
         run_name="${run_name}" \
-    || echo "=== unembed_eps=${eps} FAILED, continuing ==="
+    || echo "=== unembed_eps=${ueps} FAILED, continuing ==="
 
-    echo "=== Finished unembed_eps=${eps} ==="
+    echo "=== Finished unembed_eps=${ueps} ==="
 done
 
 echo "[sweep] all runs complete."

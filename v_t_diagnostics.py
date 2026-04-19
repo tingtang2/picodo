@@ -65,6 +65,25 @@ def _find_scale_by_adam_state(tree: Any) -> Optional[Any]:
     return None
 
 
+def _find_all_adam_states(tree: Any) -> list:
+    """Like _find_scale_by_adam_state but returns ALL Adam states.
+    Needed for optax.multi_transform which creates separate Adam states
+    per parameter group (e.g. unembed vs rest)."""
+    results = []
+    if isinstance(tree, Mapping):
+        if ('mu' in tree) and ('nu' in tree):
+            results.append(tree)
+        else:
+            for v in tree.values():
+                results.extend(_find_all_adam_states(v))
+    elif hasattr(tree, 'mu') and hasattr(tree, 'nu'):
+        results.append(tree)
+    elif isinstance(tree, (list, tuple)):
+        for v in tree:
+            results.extend(_find_all_adam_states(v))
+    return results
+
+
 def _get_nu(adam_state: Any) -> Any:
     if hasattr(adam_state, 'nu'):
         return adam_state.nu
@@ -208,10 +227,9 @@ class VtDiagnostics:
         return float(self.b2)
 
     def step(self, opt_state: Any, step_t: int, eps: float) -> Dict[str, float]:
-        adam_state = _find_scale_by_adam_state(opt_state)
-        if adam_state is None:
+        adam_states = _find_all_adam_states(opt_state)
+        if not adam_states:
             return {}
-        nu_tree = _get_nu(adam_state)
 
         # Bias correction uses optax's post-increment count: after step_t
         # training steps, optax's internal count is step_t + 1.
@@ -224,7 +242,12 @@ class VtDiagnostics:
 
         out: Dict[str, float] = {}
         for layer_name, prefix in self.layers:
-            nu = _extract_embedding_nu(nu_tree, layer_name)
+            nu = None
+            for adam_state in adam_states:
+                nu_tree = _get_nu(adam_state)
+                nu = _extract_embedding_nu(nu_tree, layer_name)
+                if nu is not None:
+                    break
             if nu is None:
                 continue
             m = self._fn(nu, self.freq, self.bucket_ids, eps_arr, bc_arr)

@@ -106,6 +106,6 @@ wu_diagnostics:
 # (W_U) and token_embed_in (W_E). Requires a precomputed token-frequency
 # .npy (see compute_token_frequencies.py). Off by default.
 v_t_diagnostics:
-  enabled: false
-  freq_path: null  # e.g. ~/datasets/fineweb_gpt2_freqs.npy
+  enabled: true
+  freq_path: "~/datasets/finewebedu_gpt2_freqs.npy"
   num_buckets: 10
