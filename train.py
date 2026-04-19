@@ -1093,12 +1093,21 @@ def train_and_evaluate(c: DictConfig):
         weight_decay=c.opt.weight_decay,
         mask=wd_mask,
     )
-    lm_head_gc_mode = str(getattr(c.opt, "lm_head_gradient_centering", "off")).lower()
+    lm_head_gc_raw = getattr(c.opt, "lm_head_gradient_centering", "off")
+    if isinstance(lm_head_gc_raw, bool):
+        if lm_head_gc_raw:
+            raise ValueError(
+                "Expected `opt.lm_head_gradient_centering` to be one of "
+                "{'off', 'pre', 'post'} or legacy `false`, got `true`."
+            )
+        lm_head_gc_mode = "off"
+    else:
+        lm_head_gc_mode = str(lm_head_gc_raw).lower()
     if lm_head_gc_mode not in {"off", "pre", "post"}:
         raise ValueError(
             "Expected `opt.lm_head_gradient_centering` to be one of "
-            "{'off', 'pre', 'post'}, "
-            f"got {lm_head_gc_mode!r}."
+            "{'off', 'pre', 'post'} or legacy `false`, "
+            f"got {lm_head_gc_raw!r}."
         )
     if lm_head_gc_mode == "off":
         tx = adamw_tx
