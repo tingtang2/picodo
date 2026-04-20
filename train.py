@@ -1156,7 +1156,58 @@ def train_and_evaluate(c: DictConfig):
                 f"mode={lm_head_weighted_gc_mode}, target=token_embed_out.embedding"
             )
 
-    tx_chain = [*pre_transforms, adamw_tx, *post_transforms]
+    lm_head_optimizer_cfg = getattr(c.opt, "lm_head_optimizer", None)
+    lm_head_optimizer_type = str(getattr(lm_head_optimizer_cfg, "type", "adamw")).lower()
+    if lm_head_optimizer_type == "adamw":
+        base_optimizer_tx = adamw_tx
+    elif lm_head_optimizer_type == "sgd_momentum":
+        if output_embedding_mask is None:
+            output_embedding_mask = utils.build_output_embedding_mask(model)
+        non_output_embedding_mask = jax.tree_util.tree_map(
+            lambda is_output_embedding: not is_output_embedding,
+            output_embedding_mask,
+        )
+        if wd_mask is None:
+            rest_wd_mask = non_output_embedding_mask
+        else:
+            rest_wd_mask = jax.tree_util.tree_map(
+                lambda use_wd, is_non_output_embedding: bool(use_wd and is_non_output_embedding),
+                wd_mask,
+                non_output_embedding_mask,
+            )
+
+        lm_head_sgd_tx = optax.inject_hyperparams(optax.sgd)(
+            learning_rate=lr_schedule,
+            momentum=float(getattr(lm_head_optimizer_cfg, "momentum", 0.9)),
+            nesterov=bool(getattr(lm_head_optimizer_cfg, "nesterov", False)),
+        )
+        rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+            mask=rest_wd_mask,
+        )
+        base_optimizer_tx = optax.chain(
+            optax.masked(rest_adamw_tx, non_output_embedding_mask),
+            optax.masked(lm_head_sgd_tx, output_embedding_mask),
+        )
+        if jax.process_index() == 0:
+            print(
+                "split lm-head optimizer enabled: "
+                "default=adamw, lm_head=sgd_momentum, "
+                f"momentum={float(getattr(lm_head_optimizer_cfg, 'momentum', 0.9))}, "
+                f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}"
+            )
+    else:
+        raise ValueError(
+            "Expected `opt.lm_head_optimizer.type` to be one of "
+            "{'adamw', 'sgd_momentum'}, "
+            f"got {lm_head_optimizer_type!r}."
+        )
+
+    tx_chain = [*pre_transforms, base_optimizer_tx, *post_transforms]
     tx = tx_chain[0] if len(tx_chain) == 1 else optax.chain(*tx_chain)
     
     clip_by_global_norm = c.opt.clip_by_global_norm
