@@ -93,6 +93,5 @@ diagnostics:
   end_step: null # to specific end step
   save_raw_losses: false
   collect_qkv_stats: false
-  spike_analysis_steps: [101, 102] # list of steps at which to run per-token loss vs W_U row-norm analysis
-  spike_analysis_top_k: 20
+  spike_analysis_top_k: 15
   spike_analysis_min_count: 5

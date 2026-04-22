@@ -1853,19 +1853,6 @@ def train_and_evaluate(c: DictConfig):
                     eval_logits,
                 )
 
-        spike_analysis_steps = list(getattr(c.diagnostics, 'spike_analysis_steps', []) or [])
-        if step in spike_analysis_steps:
-            spike_metrics = utils.compute_spike_token_diagnostics(
-                opt_state.model,
-                model_graphdef,
-                ds_valid,
-                step=step,
-                top_k=int(getattr(c.diagnostics, 'spike_analysis_top_k', 20)),
-                min_count=int(getattr(c.diagnostics, 'spike_analysis_min_count', 5)),
-            )
-            if jax.process_index() == 0 and spike_metrics:
-                wandb.log(spike_metrics, step)
-
         if _should_checkpoint(c, step):
             _save_checkpoint(ckpt_mngr, step, opt_state)
             # Wait for async checkpoint to complete in multihost setting
