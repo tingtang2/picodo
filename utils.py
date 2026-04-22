@@ -511,10 +511,8 @@ def compute_spike_token_diagnostics(
 ):
     """Rank target tokens by mean eval loss, compare their W_U row norms
     to the vocab distribution. Returns wandb-loggable metrics + prints summary."""
-    W_U = np.asarray(
-        _state_leaf_to_array(
-            _get_nested_state_item(model_state, ("token_embed_out", "embedding"))
-        )
+    W_U = _state_leaf_to_array(
+        _get_nested_state_item(model_state, ("token_embed_out", "embedding"))
     )
     vocab_size = int(W_U.shape[0])
 
@@ -529,28 +527,30 @@ def compute_spike_token_diagnostics(
         loss_sum_total = loss_sum_total + ls
         count_total = count_total + cnt
 
-    loss_sum_np = np.asarray(loss_sum_total)
-    count_np = np.asarray(count_total)
     # only rank tokens seen >= min_count times (else one-shot rare tokens dominate)
-    mean_loss = np.where(
-        count_np >= min_count,
-        loss_sum_np / np.maximum(count_np, 1),
-        -np.inf,
+    mean_loss = jnp.where(
+        count_total >= min_count,
+        loss_sum_total / jnp.maximum(count_total, 1),
+        -jnp.inf,
     )
 
-    row_norms = np.linalg.norm(W_U, axis=-1)
-    median_rn = float(np.median(row_norms))
-    p90 = float(np.percentile(row_norms, 90))
-    p99 = float(np.percentile(row_norms, 99))
-    max_rn = float(np.max(row_norms))
+    row_norms = jnp.linalg.norm(W_U, axis=-1)
+    median_rn = float(jnp.median(row_norms))
+    p90 = float(jnp.quantile(row_norms, 0.9))
+    p99 = float(jnp.quantile(row_norms, 0.99))
+    max_rn = float(jnp.max(row_norms))
 
-    eligible = int((count_np >= min_count).sum())
+    eligible = int(jnp.sum(count_total >= min_count))
     k = min(top_k, eligible) if eligible > 0 else 0
     if k == 0:
         print(f"\n=== Spike analysis @ step {step}: no tokens with count >= {min_count} in eval ===")
         return {}
 
-    top_ids = np.argsort(-mean_loss)[:k]
+    top_ids = jnp.argsort(-mean_loss)[:k]
+    top_ids_list = [int(x) for x in top_ids.tolist()]
+    counts_top = [int(x) for x in count_total[top_ids].tolist()]
+    mean_loss_top = [float(x) for x in mean_loss[top_ids].tolist()]
+    row_norms_top = [float(x) for x in row_norms[top_ids].tolist()]
 
     print(f"\n=== Spike analysis @ step {step} ===")
     print(
@@ -559,12 +559,11 @@ def compute_spike_token_diagnostics(
     )
     print(f"Top-{k} target tokens by mean eval loss:")
     print(f"  {'rank':>4} {'token_id':>9} {'count':>6} {'mean_loss':>10} {'row_norm':>10} {'rn/median':>10}")
-    for rank, tid in enumerate(top_ids):
-        tid_i = int(tid)
+    for rank in range(k):
         print(
-            f"  {rank+1:>4d} {tid_i:>9d} {int(count_np[tid_i]):>6d}"
-            f" {float(mean_loss[tid_i]):>10.4f} {float(row_norms[tid_i]):>10.4f}"
-            f" {float(row_norms[tid_i]) / max(median_rn, 1e-9):>10.3f}"
+            f"  {rank+1:>4d} {top_ids_list[rank]:>9d} {counts_top[rank]:>6d}"
+            f" {mean_loss_top[rank]:>10.4f} {row_norms_top[rank]:>10.4f}"
+            f" {row_norms_top[rank] / max(median_rn, 1e-9):>10.3f}"
         )
 
     metrics = {
@@ -574,14 +573,13 @@ def compute_spike_token_diagnostics(
         "spike_analysis/row_norm/max": max_rn,
         "spike_analysis/eligible_token_count": eligible,
     }
-    for rank, tid in enumerate(top_ids):
-        tid_i = int(tid)
+    for rank in range(k):
         prefix = f"spike_analysis/top_{rank+1:02d}"
-        metrics[f"{prefix}/token_id"] = tid_i
-        metrics[f"{prefix}/mean_loss"] = float(mean_loss[tid_i])
-        metrics[f"{prefix}/count"] = int(count_np[tid_i])
-        metrics[f"{prefix}/row_norm"] = float(row_norms[tid_i])
-        metrics[f"{prefix}/row_norm_over_median"] = float(row_norms[tid_i]) / max(median_rn, 1e-9)
+        metrics[f"{prefix}/token_id"] = top_ids_list[rank]
+        metrics[f"{prefix}/mean_loss"] = mean_loss_top[rank]
+        metrics[f"{prefix}/count"] = counts_top[rank]
+        metrics[f"{prefix}/row_norm"] = row_norms_top[rank]
+        metrics[f"{prefix}/row_norm_over_median"] = row_norms_top[rank] / max(median_rn, 1e-9)
     return metrics
 
 
