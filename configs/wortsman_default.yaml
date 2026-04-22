@@ -8,7 +8,7 @@ ds_path: null
 tokens_params_ratio: 20 # chinchilla scaling
 num_tokens_train: null
 log_every_tokens: 1_000_000
-log_metrics_per_step: false
+log_metrics_per_step: True
 log_metrics_per_step_full: false
 log_output_embedding_group_metrics: true
 eval_every_steps: 100
@@ -38,7 +38,7 @@ model:
   
 opt:
   batch_size: 256
-  peak_lr: 0.01
+  peak_lr: 0.15
   warmup_frac: 0.05
   b1: 0.9
   b2: 0.95
@@ -93,3 +93,6 @@ diagnostics:
   end_step: null # to specific end step
   save_raw_losses: false
   collect_qkv_stats: false
+  spike_analysis_steps: [101, 102] # list of steps at which to run per-token loss vs W_U row-norm analysis
+  spike_analysis_top_k: 20
+  spike_analysis_min_count: 5

@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 from collections.abc import Mapping
+from functools import partial
 import os
 import numpy as np
 
@@ -481,3 +482,107 @@ def compute_qkv_stats(qkv_dict):
         stats[f'k/layer_{i}/fro_norm'] = get_l2_norm(k)
         stats[f'v/layer_{i}/fro_norm'] = get_l2_norm(v)
     return stats
+
+@partial(jax.jit, static_argnames=('model_graphdef', 'vocab_size'))
+def _per_token_loss_sum_and_count(model_state, model_graphdef, x, vocab_size):
+    """Per-target-token loss sum [V] and count [V] for a single batch."""
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis=1)
+    logits = model(x, return_qkv=False).astype(jnp.float32)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
+
+    # remove wraparound last position
+    losses = losses[:, :-1]
+    targets = y[:, :-1]
+    # both [B·(T-1)]
+    losses_flat = losses.reshape(-1)
+    targets_flat = targets.reshape(-1)
+
+    # scatter-add each (target_id, loss) pair into per-token bins
+    loss_sum = jnp.zeros(vocab_size, dtype=jnp.float32).at[targets_flat].add(losses_flat)
+    count = jnp.zeros(vocab_size, dtype=jnp.int32).at[targets_flat].add(1)
+    return loss_sum, count
+
+
+def compute_spike_token_diagnostics(
+    model_state, model_graphdef, ds_valid, step: int,
+    top_k: int = 20, min_count: int = 5,
+):
+    """Rank target tokens by mean eval loss, compare their W_U row norms
+    to the vocab distribution. Returns wandb-loggable metrics + prints summary."""
+    W_U = np.asarray(
+        _state_leaf_to_array(
+            _get_nested_state_item(model_state, ("token_embed_out", "embedding"))
+        )
+    )
+    vocab_size = int(W_U.shape[0])
+
+    # accumulate per-token loss sum + count over all eval batches
+    loss_sum_total = jnp.zeros(vocab_size, dtype=jnp.float32)
+    count_total = jnp.zeros(vocab_size, dtype=jnp.int32)
+    for i in range(len(ds_valid)):
+        batch = ds_valid[i]
+        ls, cnt = _per_token_loss_sum_and_count(
+            model_state, model_graphdef, batch, vocab_size
+        )
+        loss_sum_total = loss_sum_total + ls
+        count_total = count_total + cnt
+
+    loss_sum_np = np.asarray(loss_sum_total)
+    count_np = np.asarray(count_total)
+    # only rank tokens seen >= min_count times (else one-shot rare tokens dominate)
+    mean_loss = np.where(
+        count_np >= min_count,
+        loss_sum_np / np.maximum(count_np, 1),
+        -np.inf,
+    )
+
+    row_norms = np.linalg.norm(W_U, axis=-1)
+    median_rn = float(np.median(row_norms))
+    p90 = float(np.percentile(row_norms, 90))
+    p99 = float(np.percentile(row_norms, 99))
+    max_rn = float(np.max(row_norms))
+
+    eligible = int((count_np >= min_count).sum())
+    k = min(top_k, eligible) if eligible > 0 else 0
+    if k == 0:
+        print(f"\n=== Spike analysis @ step {step}: no tokens with count >= {min_count} in eval ===")
+        return {}
+
+    top_ids = np.argsort(-mean_loss)[:k]
+
+    print(f"\n=== Spike analysis @ step {step} ===")
+    print(
+        f"W_U row_norm dist: median={median_rn:.3f}  p90={p90:.3f}  p99={p99:.3f}  max={max_rn:.3f}"
+        f"   (eligible tokens: {eligible}/{vocab_size}, min_count={min_count})"
+    )
+    print(f"Top-{k} target tokens by mean eval loss:")
+    print(f"  {'rank':>4} {'token_id':>9} {'count':>6} {'mean_loss':>10} {'row_norm':>10} {'rn/median':>10}")
+    for rank, tid in enumerate(top_ids):
+        tid_i = int(tid)
+        print(
+            f"  {rank+1:>4d} {tid_i:>9d} {int(count_np[tid_i]):>6d}"
+            f" {float(mean_loss[tid_i]):>10.4f} {float(row_norms[tid_i]):>10.4f}"
+            f" {float(row_norms[tid_i]) / max(median_rn, 1e-9):>10.3f}"
+        )
+
+    metrics = {
+        "spike_analysis/row_norm/median": median_rn,
+        "spike_analysis/row_norm/p90": p90,
+        "spike_analysis/row_norm/p99": p99,
+        "spike_analysis/row_norm/max": max_rn,
+        "spike_analysis/eligible_token_count": eligible,
+    }
+    for rank, tid in enumerate(top_ids):
+        tid_i = int(tid)
+        prefix = f"spike_analysis/top_{rank+1:02d}"
+        metrics[f"{prefix}/token_id"] = tid_i
+        metrics[f"{prefix}/mean_loss"] = float(mean_loss[tid_i])
+        metrics[f"{prefix}/count"] = int(count_np[tid_i])
+        metrics[f"{prefix}/row_norm"] = float(row_norms[tid_i])
+        metrics[f"{prefix}/row_norm_over_median"] = float(row_norms[tid_i]) / max(median_rn, 1e-9)
+    return metrics
+
+
+
