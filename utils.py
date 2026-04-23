@@ -505,83 +505,6 @@ def _per_token_loss_sum_and_count(model_state, model_graphdef, x, vocab_size):
     return loss_sum, count
 
 
-def compute_spike_token_diagnostics(
-    model_state, model_graphdef, ds_valid, step: int,
-    top_k: int = 20, min_count: int = 5,
-):
-    """Rank target tokens by mean eval loss, compare their W_U row norms
-    to the vocab distribution. Returns wandb-loggable metrics + prints summary."""
-    W_U = _state_leaf_to_array(
-        _get_nested_state_item(model_state, ("token_embed_out", "embedding"))
-    )
-    vocab_size = int(W_U.shape[0])
-
-    # accumulate per-token loss sum + count over all eval batches
-    loss_sum_total = jnp.zeros(vocab_size, dtype=jnp.float32)
-    count_total = jnp.zeros(vocab_size, dtype=jnp.int32)
-    for i in range(len(ds_valid)):
-        batch = ds_valid[i]
-        ls, cnt = _per_token_loss_sum_and_count(
-            model_state, model_graphdef, batch, vocab_size
-        )
-        loss_sum_total = loss_sum_total + ls
-        count_total = count_total + cnt
-
-    # only rank tokens seen >= min_count times (else one-shot rare tokens dominate)
-    mean_loss = jnp.where(
-        count_total >= min_count,
-        loss_sum_total / jnp.maximum(count_total, 1),
-        -jnp.inf,
-    )
-
-    row_norms = jnp.linalg.norm(W_U, axis=-1)
-    median_rn = float(jnp.median(row_norms))
-    p90 = float(jnp.quantile(row_norms, 0.9))
-    p99 = float(jnp.quantile(row_norms, 0.99))
-    max_rn = float(jnp.max(row_norms))
-
-    eligible = int(jnp.sum(count_total >= min_count))
-    k = min(top_k, eligible) if eligible > 0 else 0
-    if k == 0:
-        print(f"\n=== Spike analysis @ step {step}: no tokens with count >= {min_count} in eval ===")
-        return {}
-
-    top_ids = jnp.argsort(-mean_loss)[:k]
-    top_ids_list = [int(x) for x in top_ids.tolist()]
-    counts_top = [int(x) for x in count_total[top_ids].tolist()]
-    mean_loss_top = [float(x) for x in mean_loss[top_ids].tolist()]
-    row_norms_top = [float(x) for x in row_norms[top_ids].tolist()]
-
-    print(f"\n=== Spike analysis @ step {step} ===")
-    print(
-        f"W_U row_norm dist: median={median_rn:.3f}  p90={p90:.3f}  p99={p99:.3f}  max={max_rn:.3f}"
-        f"   (eligible tokens: {eligible}/{vocab_size}, min_count={min_count})"
-    )
-    print(f"Top-{k} target tokens by mean eval loss:")
-    print(f"  {'rank':>4} {'token_id':>9} {'count':>6} {'mean_loss':>10} {'row_norm':>10} {'rn/median':>10}")
-    for rank in range(k):
-        print(
-            f"  {rank+1:>4d} {top_ids_list[rank]:>9d} {counts_top[rank]:>6d}"
-            f" {mean_loss_top[rank]:>10.4f} {row_norms_top[rank]:>10.4f}"
-            f" {row_norms_top[rank] / max(median_rn, 1e-9):>10.3f}"
-        )
-
-    metrics = {
-        "spike_analysis/row_norm/median": median_rn,
-        "spike_analysis/row_norm/p90": p90,
-        "spike_analysis/row_norm/p99": p99,
-        "spike_analysis/row_norm/max": max_rn,
-        "spike_analysis/eligible_token_count": eligible,
-    }
-    for rank in range(k):
-        prefix = f"spike_analysis/top_{rank+1:02d}"
-        metrics[f"{prefix}/token_id"] = top_ids_list[rank]
-        metrics[f"{prefix}/mean_loss"] = mean_loss_top[rank]
-        metrics[f"{prefix}/count"] = counts_top[rank]
-        metrics[f"{prefix}/row_norm"] = row_norms_top[rank]
-        metrics[f"{prefix}/row_norm_over_median"] = row_norms_top[rank] / max(median_rn, 1e-9)
-    return metrics
-
 @partial(jax.jit, static_argnames=('model_graphdef',))
 def _per_batch_grad_W_U(model_state, model_graphdef, x):
     """[V, D] gradient of summed CE loss w.r.t. W_U for a single batch."""
@@ -597,40 +520,115 @@ def _per_batch_grad_W_U(model_state, model_graphdef, x):
     g_W_U = _get_nested_state_item(grads, ("token_embed_out", "embedding"))
     return _state_leaf_to_array(g_W_U)  # [V, D]
 
-def aggregate_grads_over_eval(model_state, model_graphdef, ds_valid, step: int):
-    # accumulate per-token loss sum + count over all eval batches
 
-    W_U = _state_leaf_to_array(_get_nested_state_item(model_state, ("token_embed_out", "embedding")) )
-    V, D = W_U.shape
-
-
-    grad_sum_total = jnp.zeros((V, D), dtype=jnp.float32)
-    for i in range(len(ds_valid)): 
-        batch = ds_valid[i]
-        grad_sum_total = grad_sum_total + _per_batch_grad_W_U(model_state, model_graphdef, batch)
-
-    grad_sum_avg = grad_sum_total / len(ds_valid)
-
-    row_norms = jnp.linalg.norm(grad_sum_avg, axis = -1) #[V]
-
-    mean_rn   = float(jnp.mean(row_norms))
-    median_rn = float(jnp.median(row_norms))
-    p90       = float(jnp.quantile(row_norms, 0.9))
-    p99       = float(jnp.quantile(row_norms, 0.99))
-    max_rn    = float(jnp.max(row_norms))
-
-    print(f"\n=== Grad W_U aggregation @ step {step} ===")
-    print(
-        f"||∂L/∂W_U[i,:]|| over vocab: "
-        f"mean={mean_rn:.4e}  median={median_rn:.4e}  "
-        f"p90={p90:.4e}  p99={p99:.4e}  max={max_rn:.4e}"
+def _dist_stats(x):
+    """Return (median, p90, p99, max, mean) as Python floats for a [V] array."""
+    return (
+        float(jnp.median(x)),
+        float(jnp.quantile(x, 0.9)),
+        float(jnp.quantile(x, 0.99)),
+        float(jnp.max(x)),
+        float(jnp.mean(x)),
     )
 
-    return {
-        "grad_analysis/row_norm/mean":   mean_rn,
-        "grad_analysis/row_norm/median": median_rn,
-        "grad_analysis/row_norm/p90":    p90,
-        "grad_analysis/row_norm/p99":    p99,
-        "grad_analysis/row_norm/max":    max_rn,
+
+def compute_spike_token_diagnostics(
+    model_state, model_graphdef, ds_valid, step: int,
+    top_k: int = 20, min_count: int = 5,
+):
+    """Rank target tokens by mean eval loss; for the top-k tokens, show
+    W_U row norms and ||∂L/∂W_U[i,:]|| alongside the vocab-wide distributions.
+    Returns wandb-loggable metrics + prints summary."""
+    W_U = _state_leaf_to_array(
+        _get_nested_state_item(model_state, ("token_embed_out", "embedding"))
+    )
+    vocab_size, D = int(W_U.shape[0]), int(W_U.shape[1])
+
+    # Single eval pass: accumulate (per-token loss sum, count) AND the gradient
+    # of summed CE loss w.r.t. W_U across all batches. Grads sum by linearity.
+    loss_sum_total = jnp.zeros(vocab_size, dtype=jnp.float32)
+    count_total = jnp.zeros(vocab_size, dtype=jnp.int32)
+    grad_sum_total = jnp.zeros((vocab_size, D), dtype=jnp.float32)
+    for i in range(len(ds_valid)):
+        batch = ds_valid[i]
+        ls, cnt = _per_token_loss_sum_and_count(
+            model_state, model_graphdef, batch, vocab_size
+        )
+        loss_sum_total = loss_sum_total + ls
+        count_total = count_total + cnt
+        grad_sum_total = grad_sum_total + _per_batch_grad_W_U(
+            model_state, model_graphdef, batch
+        )
+
+    # only rank tokens seen >= min_count times (else one-shot rare tokens dominate)
+    mean_loss = jnp.where(
+        count_total >= min_count,
+        loss_sum_total / jnp.maximum(count_total, 1),
+        -jnp.inf,
+    )
+
+    # vocab-wide distributions: W_U row norms and per-batch-avg grad row norms
+    row_norms = jnp.linalg.norm(W_U, axis=-1)                                # [V]
+    grad_row_norms = jnp.linalg.norm(grad_sum_total / len(ds_valid), axis=-1)  # [V]
+
+    median_rn, p90, p99, max_rn, _ = _dist_stats(row_norms)
+    grad_median, grad_p90, grad_p99, grad_max, grad_mean = _dist_stats(grad_row_norms)
+
+    eligible = int(jnp.sum(count_total >= min_count))
+    k = min(top_k, eligible) if eligible > 0 else 0
+    if k == 0:
+        print(f"\n=== Spike analysis @ step {step}: no tokens with count >= {min_count} in eval ===")
+        return {}
+
+    top_ids = jnp.argsort(-mean_loss)[:k]
+    top_ids_list = [int(x) for x in top_ids.tolist()]
+    counts_top = [int(x) for x in count_total[top_ids].tolist()]
+    mean_loss_top = [float(x) for x in mean_loss[top_ids].tolist()]
+    row_norms_top = [float(x) for x in row_norms[top_ids].tolist()]
+    grad_rn_top = [float(x) for x in grad_row_norms[top_ids].tolist()]
+
+    print(f"\n=== Spike analysis @ step {step} ===")
+    print(
+        f"W_U row_norm dist: median={median_rn:.3f}  p90={p90:.3f}  p99={p99:.3f}  max={max_rn:.3f}"
+        f"   (eligible tokens: {eligible}/{vocab_size}, min_count={min_count})"
+    )
+    print(
+        f"grad row_norm dist: median={grad_median:.3e}  p90={grad_p90:.3e}  p99={grad_p99:.3e}  max={grad_max:.3e}"
+    )
+    print(f"Top-{k} target tokens by mean eval loss:")
+    print(
+        f"  {'rank':>4} {'token_id':>9} {'count':>6} {'mean_loss':>10}"
+        f" {'row_norm':>10} {'rn/median':>10}"
+        f" {'grad_rn':>12} {'g_rn/median':>12}"
+    )
+    for rank in range(k):
+        print(
+            f"  {rank+1:>4d} {top_ids_list[rank]:>9d} {counts_top[rank]:>6d}"
+            f" {mean_loss_top[rank]:>10.4f} {row_norms_top[rank]:>10.4f}"
+            f" {row_norms_top[rank] / max(median_rn, 1e-9):>10.3f}"
+            f" {grad_rn_top[rank]:>12.3e}"
+            f" {grad_rn_top[rank] / max(grad_median, 1e-12):>12.3f}"
+        )
+
+    metrics = {
+        "spike_analysis/row_norm/median": median_rn,
+        "spike_analysis/row_norm/p90": p90,
+        "spike_analysis/row_norm/p99": p99,
+        "spike_analysis/row_norm/max": max_rn,
+        "spike_analysis/grad_row_norm/mean": grad_mean,
+        "spike_analysis/grad_row_norm/median": grad_median,
+        "spike_analysis/grad_row_norm/p90": grad_p90,
+        "spike_analysis/grad_row_norm/p99": grad_p99,
+        "spike_analysis/grad_row_norm/max": grad_max,
+        "spike_analysis/eligible_token_count": eligible,
     }
-            
+    for rank in range(k):
+        prefix = f"spike_analysis/top_{rank+1:02d}"
+        metrics[f"{prefix}/token_id"] = top_ids_list[rank]
+        metrics[f"{prefix}/mean_loss"] = mean_loss_top[rank]
+        metrics[f"{prefix}/count"] = counts_top[rank]
+        metrics[f"{prefix}/row_norm"] = row_norms_top[rank]
+        metrics[f"{prefix}/row_norm_over_median"] = row_norms_top[rank] / max(median_rn, 1e-9)
+        metrics[f"{prefix}/grad_row_norm"] = grad_rn_top[rank]
+        metrics[f"{prefix}/grad_row_norm_over_median"] = grad_rn_top[rank] / max(grad_median, 1e-12)
+    return metrics

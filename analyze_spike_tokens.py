@@ -175,20 +175,19 @@ def main(c: DictConfig):
         f"(top_k={top_k}, min_count={min_count})..."
     )
     t0 = time.time()
-    metrics_W_U = utils.compute_spike_token_diagnostics(
+
+    #which batch
+    use_val = False
+    num_samps = 100
+
+    metrics = utils.compute_spike_token_diagnostics(
         model_state,
         model_graphdef,
-        ds_valid,
+        #ds_valid,
+        ds_train[:num_samps] if use_val == False else ds_valid[:num_samps],
         step=step_to_load,
         top_k=top_k,
         min_count=min_count,
-    )
-
-    metrics_grads = utils.aggregate_grads_over_eval(
-        model_state, 
-        model_graphdef, 
-        ds_valid, 
-        step=step_to_load,
     )
 
     print(f"Diagnostic complete in {time.time() - t0:.1f}s")
@@ -202,9 +201,8 @@ def main(c: DictConfig):
                 'checkpoint_dir': ckpt_dir,
                 'top_k': top_k,
                 'min_count': min_count,
-                'num_eval_batches': int(len(ds_valid)),
-                'metrics_W_U': metrics_W_U,
-                'metrics_grads': metrics_grads,
+                'num_eval_batches': int(num_samps),
+                'metrics': metrics,
             },
             f,
             indent=2,
