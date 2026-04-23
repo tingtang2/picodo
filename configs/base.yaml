@@ -45,9 +45,11 @@ opt:
   weight_decay: 0.02
   exclude_input_embedding_weight_decay: false
   lm_head_optimizer:
-    type: adamw # one of: adamw, sgd_momentum
+    type: adamw # one of: adamw, sgd_momentum, coupled_adam
     momentum: 0.9
     nesterov: false
+    couple_vocab_axis: true    # paper: average v_t over vocab axis (axis 0 of [V, D])
+    couple_feature_axis: false # extension: average v_t over feature axis (axis 1)
   lm_head_gradient_centering: 'off' # one of: off, pre, post
   lm_head_weighted_columnwise_gradient_centering: 'off' # one of: off, pre, post
   loss_skip:
