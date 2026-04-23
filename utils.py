@@ -582,5 +582,55 @@ def compute_spike_token_diagnostics(
         metrics[f"{prefix}/row_norm_over_median"] = row_norms_top[rank] / max(median_rn, 1e-9)
     return metrics
 
+@partial(jax.jit, static_argnames=('model_graphdef',))
+def _per_batch_grad_W_U(model_state, model_graphdef, x):
+    """[V, D] gradient of summed CE loss w.r.t. W_U for a single batch."""
+    def loss_fn(state):
+        model = nnx.merge(model_graphdef, state)
+        y = jnp.roll(x, -1, axis=1)
+        logits = model(x, return_qkv=False).astype(jnp.float32)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
+        return losses[:, :-1].sum()
+
+    grads = jax.grad(loss_fn)(model_state)
+    g_W_U = _get_nested_state_item(grads, ("token_embed_out", "embedding"))
+    return _state_leaf_to_array(g_W_U)  # [V, D]
+
+def aggregate_grads_over_eval(model_state, model_graphdef, ds_valid, step: int):
+    # accumulate per-token loss sum + count over all eval batches
+
+    W_U = _state_leaf_to_array(_get_nested_state_item(model_state, ("token_embed_out", "embedding")) )
+    V, D = W_U.shape
 
 
+    grad_sum_total = jnp.zeros((V, D), dtype=jnp.float32)
+    for i in range(len(ds_valid)): 
+        batch = ds_valid[i]
+        grad_sum_total = grad_sum_total + _per_batch_grad_W_U(model_state, model_graphdef, batch)
+
+    grad_sum_avg = grad_sum_total / len(ds_valid)
+
+    row_norms = jnp.linalg.norm(grad_sum_avg, axis = -1) #[V]
+
+    mean_rn   = float(jnp.mean(row_norms))
+    median_rn = float(jnp.median(row_norms))
+    p90       = float(jnp.quantile(row_norms, 0.9))
+    p99       = float(jnp.quantile(row_norms, 0.99))
+    max_rn    = float(jnp.max(row_norms))
+
+    print(f"\n=== Grad W_U aggregation @ step {step} ===")
+    print(
+        f"||∂L/∂W_U[i,:]|| over vocab: "
+        f"mean={mean_rn:.4e}  median={median_rn:.4e}  "
+        f"p90={p90:.4e}  p99={p99:.4e}  max={max_rn:.4e}"
+    )
+
+    return {
+        "grad_analysis/row_norm/mean":   mean_rn,
+        "grad_analysis/row_norm/median": median_rn,
+        "grad_analysis/row_norm/p90":    p90,
+        "grad_analysis/row_norm/p99":    p99,
+        "grad_analysis/row_norm/max":    max_rn,
+    }
+            

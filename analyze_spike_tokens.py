@@ -175,7 +175,7 @@ def main(c: DictConfig):
         f"(top_k={top_k}, min_count={min_count})..."
     )
     t0 = time.time()
-    metrics = utils.compute_spike_token_diagnostics(
+    metrics_W_U = utils.compute_spike_token_diagnostics(
         model_state,
         model_graphdef,
         ds_valid,
@@ -183,6 +183,14 @@ def main(c: DictConfig):
         top_k=top_k,
         min_count=min_count,
     )
+
+    metrics_grads = utils.aggregate_grads_over_eval(
+        model_state, 
+        model_graphdef, 
+        ds_valid, 
+        step=step_to_load,
+    )
+
     print(f"Diagnostic complete in {time.time() - t0:.1f}s")
 
     report_path = save_dir_path / f'spike_token_diagnostic_step_{step_to_load}.json'
@@ -195,7 +203,8 @@ def main(c: DictConfig):
                 'top_k': top_k,
                 'min_count': min_count,
                 'num_eval_batches': int(len(ds_valid)),
-                'metrics': metrics,
+                'metrics_W_U': metrics_W_U,
+                'metrics_grads': metrics_grads,
             },
             f,
             indent=2,
