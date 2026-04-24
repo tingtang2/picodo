@@ -1,3 +1,4 @@
+import gc
 import math
 from collections import deque
 import jax
@@ -1217,6 +1218,8 @@ def train_and_evaluate(c: DictConfig):
     
     optimizer = nnx.ModelAndOptimizer(model, tx)
     opt_graphdef, opt_state = nnx.split(optimizer)
+    del optimizer
+    del model
 
 
     # set up checkpointing
@@ -1327,9 +1330,13 @@ def train_and_evaluate(c: DictConfig):
                     'falling back to resume from checkpoint id + 1.'
                 )
                 start_step = latest_step + 1
+            del restored_data
+            gc.collect()
             print(f'Successfully restored checkpoint. Resuming from step {start_step}.')
         else:
             print('No checkpoint found. Starting from scratch.')
+    del abstract_opt_state
+    gc.collect()
 
     if c.diagnostics.save_raw_losses:
         diagnostics_dir = _resolve_diagnostics_dir(ckpt_dir)
