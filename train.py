@@ -1846,7 +1846,7 @@ def train_and_evaluate(c: DictConfig):
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
-            
+
             # diagnostics
             if c.diagnostics.save_raw_losses:
                 diagnostics_dir = _resolve_diagnostics_dir(ckpt_dir)
