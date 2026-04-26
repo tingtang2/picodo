@@ -610,6 +610,90 @@ def compute_spike_token_diagnostics(
             f" {grad_rn_top[rank] / max(grad_median, 1e-12):>12.3f}"
         )
 
+    grad_row_mean = jnp.mean(grad_sum_total / len(ds_valid), axis=-1)
+    top_k_grad = min(top_k, vocab_size)
+    top_grad_ids = jnp.argsort(-jnp.abs(grad_row_mean))[:top_k_grad]
+    top_grad_ids_list = [int(x) for x in top_grad_ids.tolist()]
+    counts_grad_top = [int(x) for x in count_total[top_grad_ids].tolist()]
+    grad_mean_grad_top = [float(x) for x in grad_row_mean[top_grad_ids].tolist()]
+    grad_rn_grad_top = [float(x) for x in grad_row_norms[top_grad_ids].tolist()]
+    row_norms_grad_top = [float(x) for x in row_norms[top_grad_ids].tolist()]
+    raw_mean_loss = loss_sum_total / jnp.maximum(count_total, 1)
+    raw_mean_loss_grad_top = [float(x) for x in raw_mean_loss[top_grad_ids].tolist()]
+
+    print(f"\nTop-{top_k_grad} tokens by |grad row mean|:")
+    print(
+        f"  {'rank':>4} {'token_id':>9} {'count':>6} {'grad_mean':>12} {'grad_rn':>12}"
+        f" {'g_rn/median':>12} {'row_norm':>10} {'rn/median':>10}"
+        f" {'mean_loss':>10}"
+    )
+    for rank in range(top_k_grad):
+        ml_str = (
+            f"{raw_mean_loss_grad_top[rank]:>10.4f}"
+            if counts_grad_top[rank] > 0 else f"{'—':>10}"
+        )
+        print(
+            f"  {rank+1:>4d} {top_grad_ids_list[rank]:>9d} {counts_grad_top[rank]:>6d}"
+            f" {grad_mean_grad_top[rank]:>12.3e}"
+            f" {grad_rn_grad_top[rank]:>12.3e}"
+            f" {grad_rn_grad_top[rank] / max(grad_median, 1e-12):>12.3f}"
+            f" {row_norms_grad_top[rank]:>10.4f}"
+            f" {row_norms_grad_top[rank] / max(median_rn, 1e-9):>10.3f}"
+            f" {ml_str}"
+        )
+
+    bot_grad_ids = jnp.argsort(jnp.abs(grad_row_mean))[:top_k_grad]
+    bot_grad_ids_list = [int(x) for x in bot_grad_ids.tolist()]
+    counts_grad_bot = [int(x) for x in count_total[bot_grad_ids].tolist()]
+    grad_mean_grad_bot = [float(x) for x in grad_row_mean[bot_grad_ids].tolist()]
+    grad_rn_grad_bot = [float(x) for x in grad_row_norms[bot_grad_ids].tolist()]
+    row_norms_grad_bot = [float(x) for x in row_norms[bot_grad_ids].tolist()]
+    raw_mean_loss_grad_bot = [float(x) for x in raw_mean_loss[bot_grad_ids].tolist()]
+
+    print(f"\nBottom-{top_k_grad} tokens by |grad row mean|:")
+    print(
+        f"  {'rank':>4} {'token_id':>9} {'count':>6} {'grad_mean':>12} {'grad_rn':>12}"
+        f" {'g_rn/median':>12} {'row_norm':>10} {'rn/median':>10}"
+        f" {'mean_loss':>10}"
+    )
+    for rank in range(top_k_grad):
+        ml_str = (
+            f"{raw_mean_loss_grad_bot[rank]:>10.4f}"
+            if counts_grad_bot[rank] > 0 else f"{'—':>10}"
+        )
+        print(
+            f"  {rank+1:>4d} {bot_grad_ids_list[rank]:>9d} {counts_grad_bot[rank]:>6d}"
+            f" {grad_mean_grad_bot[rank]:>12.3e}"
+            f" {grad_rn_grad_bot[rank]:>12.3e}"
+            f" {grad_rn_grad_bot[rank] / max(grad_median, 1e-12):>12.3f}"
+            f" {row_norms_grad_bot[rank]:>10.4f}"
+            f" {row_norms_grad_bot[rank] / max(median_rn, 1e-9):>10.3f}"
+            f" {ml_str}"
+        )
+
+    counts_f32 = count_total.astype(jnp.float32)
+    c_min = int(jnp.min(counts_f32))
+    c_q1 = int(jnp.quantile(counts_f32, 0.25))
+    c_med = int(jnp.quantile(counts_f32, 0.50))
+    c_q3 = int(jnp.quantile(counts_f32, 0.75))
+    c_max = int(jnp.max(counts_f32))
+    nonzero_mask = count_total > 0
+    n_nonzero = int(jnp.sum(nonzero_mask))
+    counts_nz = counts_f32[nonzero_mask] if n_nonzero > 0 else counts_f32
+    nz_min = int(jnp.min(counts_nz))
+    nz_q1 = int(jnp.quantile(counts_nz, 0.25))
+    nz_med = int(jnp.quantile(counts_nz, 0.50))
+    nz_q3 = int(jnp.quantile(counts_nz, 0.75))
+    nz_max = int(jnp.max(counts_nz))
+    print(
+        f"\nTarget-count 5-number summary (all {vocab_size} tokens):"
+        f" min={c_min:_}  Q1={c_q1:_}  median={c_med:_}  Q3={c_q3:_}  max={c_max:_}"
+    )
+    print(
+        f"Target-count 5-number summary ({n_nonzero} tokens with count>0):"
+        f" min={nz_min:_}  Q1={nz_q1:_}  median={nz_med:_}  Q3={nz_q3:_}  max={nz_max:_}"
+    )
+
     metrics = {
         "spike_analysis/row_norm/median": median_rn,
         "spike_analysis/row_norm/p90": p90,

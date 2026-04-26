@@ -177,8 +177,8 @@ def main(c: DictConfig):
     t0 = time.time()
 
     #which batch
-    use_val = False
-    num_samps = 100
+    use_val = True
+    num_samps = len(ds_valid)
 
     metrics = utils.compute_spike_token_diagnostics(
         model_state,
