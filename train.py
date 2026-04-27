@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 from omegaconf.dictconfig import DictConfig
 import data, utils
 import model as model_lib
+import unembed_dispersion_diagnostic
 import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy 
 from etils import epath
@@ -1363,6 +1364,24 @@ def train_and_evaluate(c: DictConfig):
             f"{group['name']}({len(group['token_ids'])})" for group in output_embedding_metric_groups
         )
         print(f"output embedding group metrics enabled: {group_summary}")
+
+    # Per-step W_U dispersion diagnostic — tests the second-moment-asymmetry
+    # hypothesis (within-row vs across-row CoV of nu, outlier attribution
+    # of column-mean updates, parameter-level row/column variance).
+    unembed_dispersion_cfg = getattr(c, "unembed_dispersion", None)
+    unembed_dispersion_enabled = bool(getattr(unembed_dispersion_cfg, "enabled", False))
+    unembed_dispersion_every_n = int(getattr(unembed_dispersion_cfg, "every_n_steps", 500))
+    if unembed_dispersion_enabled:
+        unembed_dispersion_tracker = unembed_dispersion_diagnostic.UnembedDispersionDiagnostic(
+            b2=b2_hparam,
+            eps=c.opt.eps,
+        )
+        if jax.process_index() == 0:
+            print(
+                f"unembed dispersion diagnostic enabled: every {unembed_dispersion_every_n} steps"
+            )
+    else:
+        unembed_dispersion_tracker = None
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
     collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
@@ -1825,6 +1844,13 @@ def train_and_evaluate(c: DictConfig):
                 _log_metrics_if_primary(metrics, step, pbar)
             train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
+        # W_U dispersion diagnostic (cheap per-step reductions on the
+        # unembedding matrix and Adam's mu/nu for it).
+        if unembed_dispersion_tracker is not None and step % unembed_dispersion_every_n == 0:
+            disp_metrics = unembed_dispersion_tracker.step(opt_state, step)
+            if disp_metrics and jax.process_index() == 0:
+                wandb.log(disp_metrics, step)
+
         # eval and checkpointing
         if step % c.eval_every_steps == 0:
             (

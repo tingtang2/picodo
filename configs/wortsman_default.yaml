@@ -95,3 +95,11 @@ diagnostics:
   collect_qkv_stats: false
   spike_analysis_top_k: 15
   spike_analysis_min_count: 5
+
+# Per-step dispersion diagnostic on the unembedding matrix W_U.
+# Tests the second-moment-asymmetry hypothesis: nu is uniform within rows
+# (across feature dim D) but heavy-tailed across rows (across vocab dim V),
+# making column-mean operations outlier-dominated. Off by default.
+unembed_dispersion:
+  enabled: false
+  every_n_steps: 500
