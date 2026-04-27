@@ -521,14 +521,15 @@ def _per_batch_grad_W_U(model_state, model_graphdef, x):
     return _state_leaf_to_array(g_W_U)  # [V, D]
 
 def _compute_adam_update_W_U(model_state, opt_state, lr_at_step, eps, weight_decay):
-    """[V, D] AdamW update applied to W_U at this checkpoint."""
+    """Returns (update_W_U, m_W_U, v_W_U) — AdamW update plus the stored
+    first/second moments that produced it."""
     W_U = _state_leaf_to_array(_get_nested_state_item(model_state, ("token_embed_out", "embedding")))
     adam = _find_moment_state(opt_state)
     m_W_U = _state_leaf_to_array(_get_nested_state_item(adam["mu"], ("token_embed_out", "embedding")))
     v_W_U = _state_leaf_to_array(_get_nested_state_item(adam["nu"], ("token_embed_out", "embedding")))
     update_W_U = -lr_at_step * m_W_U / (jnp.sqrt(v_W_U) + eps)
     update_W_U -= lr_at_step * weight_decay * W_U
-    return update_W_U
+    return update_W_U, m_W_U, v_W_U
 
 def _dist_stats(x):
     """Return (median, p90, p99, max, mean) as Python floats for a [V] array."""
@@ -541,10 +542,47 @@ def _dist_stats(x):
     )
 
 
+def _fmt_width(spec):
+    return len(f"{0:{spec}}")
+
+
+def _print_ranked_tables(
+    metric_name, sort_key_arr, k, count_total, raw_mean_loss, column_specs,
+):
+    """Print Top-k and Bottom-k tables sorted by sort_key_arr (Top descending,
+    Bottom ascending). Each row shows rank | token_id | count | <column_specs...> |
+    mean_loss (— when count==0). column_specs is an ordered list of
+    (header, fmt_spec, [V]_array)."""
+    widths = [_fmt_width(spec) for _, spec, _ in column_specs]
+    for label, ascending in [("Top", False), ("Bottom", True)]:
+        idx = jnp.argsort(sort_key_arr if ascending else -sort_key_arr)[:k]
+        idx_list = [int(x) for x in idx.tolist()]
+        counts = [int(x) for x in count_total[idx].tolist()]
+        ml_vals = [float(x) for x in raw_mean_loss[idx].tolist()]
+        col_vals = [
+            [float(x) for x in arr[idx].tolist()] for _, _, arr in column_specs
+        ]
+
+        print(f"\n{label}-{k} tokens by {metric_name}:")
+        header = f"  {'rank':>4} {'token_id':>9} {'count':>6}"
+        for (name, _, _), w in zip(column_specs, widths):
+            header += f" {name:>{w}}"
+        header += f" {'mean_loss':>10}"
+        print(header)
+
+        for rank in range(k):
+            row = f"  {rank+1:>4d} {idx_list[rank]:>9d} {counts[rank]:>6d}"
+            for col_idx, (_, spec, _) in enumerate(column_specs):
+                row += f" {col_vals[col_idx][rank]:{spec}}"
+            ml_str = f"{ml_vals[rank]:>10.4f}" if counts[rank] > 0 else f"{'—':>10}"
+            row += f" {ml_str}"
+            print(row)
+
+
 def compute_spike_token_diagnostics(
     model_state, model_graphdef, ds_valid, step: int,
     top_k: int = 20, min_count: int = 5,
-    update_W_U=None,
+    update_W_U=None, m_W_U=None, v_W_U=None, save_dir=None,
 ):
     """Rank target tokens by mean eval loss; for the top-k tokens, show
     W_U row norms and ||∂L/∂W_U[i,:]|| alongside the vocab-wide distributions.
@@ -554,11 +592,14 @@ def compute_spike_token_diagnostics(
     )
     vocab_size, D = int(W_U.shape[0]), int(W_U.shape[1])
 
-    # Single eval pass: accumulate per-token loss sum, count, AND |∂L/∂W_U| per
-    # batch (abs taken before summing so per-feature signs don't cancel across batches).
+    # Single eval pass: accumulate per-token loss sum, count, the abs-grad
+    # (used only as the |grad row mean| ranking key — keeps Ting's no-cancellation
+    # property), and the SIGNED grad sum (used for grad_signed_row_norms — the
+    # apples-to-apples comparison column for upd_rn / m_rn).
     loss_sum_total = jnp.zeros(vocab_size, dtype=jnp.float32)
     count_total = jnp.zeros(vocab_size, dtype=jnp.int32)
     grad_sum_total = jnp.zeros((vocab_size, D), dtype=jnp.float32)
+    grad_signed_sum_total = jnp.zeros((vocab_size, D), dtype=jnp.float32)
     for i in range(len(ds_valid)):
         batch = ds_valid[i]
         ls, cnt = _per_token_loss_sum_and_count(
@@ -566,9 +607,9 @@ def compute_spike_token_diagnostics(
         )
         loss_sum_total = loss_sum_total + ls
         count_total = count_total + cnt
-        grad_sum_total = grad_sum_total + jnp.abs(_per_batch_grad_W_U(
-            model_state, model_graphdef, batch
-        ))
+        g_batch = _per_batch_grad_W_U(model_state, model_graphdef, batch)
+        grad_sum_total = grad_sum_total + jnp.abs(g_batch)
+        grad_signed_sum_total = grad_signed_sum_total + g_batch
 
     # only rank tokens seen >= min_count times (else one-shot rare tokens dominate)
     mean_loss = jnp.where(
@@ -577,12 +618,12 @@ def compute_spike_token_diagnostics(
         -jnp.inf,
     )
 
-    # vocab-wide distributions: W_U row norms and per-batch-avg grad row norms
-    row_norms = jnp.linalg.norm(W_U, axis=-1)                                # [V]
-    grad_row_norms = jnp.linalg.norm(grad_sum_total / len(ds_valid), axis=-1)  # [V]
+    # vocab-wide distributions: W_U row norms and per-batch-avg signed-grad row norms
+    row_norms = jnp.linalg.norm(W_U, axis=-1)                                            # [V]
+    grad_signed_row_norms = jnp.linalg.norm(grad_signed_sum_total / len(ds_valid), axis=-1)  # [V]
 
     median_rn, p90, p99, max_rn, _ = _dist_stats(row_norms)
-    grad_median, grad_p90, grad_p99, grad_max, grad_mean = _dist_stats(grad_row_norms)
+    grad_median, grad_p90, grad_p99, grad_max, grad_mean = _dist_stats(grad_signed_row_norms)
 
     eligible = int(jnp.sum(count_total >= min_count))
     k = min(top_k, eligible) if eligible > 0 else 0
@@ -595,7 +636,7 @@ def compute_spike_token_diagnostics(
     counts_top = [int(x) for x in count_total[top_ids].tolist()]
     mean_loss_top = [float(x) for x in mean_loss[top_ids].tolist()]
     row_norms_top = [float(x) for x in row_norms[top_ids].tolist()]
-    grad_rn_top = [float(x) for x in grad_row_norms[top_ids].tolist()]
+    grad_rn_top = [float(x) for x in grad_signed_row_norms[top_ids].tolist()]
 
     print(f"\n=== Spike analysis @ step {step} ===")
     print(
@@ -603,83 +644,41 @@ def compute_spike_token_diagnostics(
         f"   (eligible tokens: {eligible}/{vocab_size}, min_count={min_count})"
     )
     print(
-        f"grad row_norm dist: median={grad_median:.3e}  p90={grad_p90:.3e}  p99={grad_p99:.3e}  max={grad_max:.3e}"
+        f"signed grad row_norm dist: median={grad_median:.3e}  p90={grad_p90:.3e}  p99={grad_p99:.3e}  max={grad_max:.3e}"
     )
     print(f"Top-{k} target tokens by mean eval loss:")
     print(
         f"  {'rank':>4} {'token_id':>9} {'count':>6} {'mean_loss':>10}"
         f" {'row_norm':>10} {'rn/median':>10}"
-        f" {'grad_rn':>12} {'g_rn/median':>12}"
+        f" {'grad_signed_rn':>15} {'g_rn/median':>12}"
     )
     for rank in range(k):
         print(
             f"  {rank+1:>4d} {top_ids_list[rank]:>9d} {counts_top[rank]:>6d}"
             f" {mean_loss_top[rank]:>10.4f} {row_norms_top[rank]:>10.4f}"
             f" {row_norms_top[rank] / max(median_rn, 1e-9):>10.3f}"
-            f" {grad_rn_top[rank]:>12.3e}"
+            f" {grad_rn_top[rank]:>15.3e}"
             f" {grad_rn_top[rank] / max(grad_median, 1e-12):>12.3f}"
         )
 
     grad_row_mean = jnp.mean(grad_sum_total / len(ds_valid), axis=-1)
     top_k_grad = min(top_k, vocab_size)
-    top_grad_ids = jnp.argsort(-jnp.abs(grad_row_mean))[:top_k_grad]
-    top_grad_ids_list = [int(x) for x in top_grad_ids.tolist()]
-    counts_grad_top = [int(x) for x in count_total[top_grad_ids].tolist()]
-    grad_mean_grad_top = [float(x) for x in grad_row_mean[top_grad_ids].tolist()]
-    grad_rn_grad_top = [float(x) for x in grad_row_norms[top_grad_ids].tolist()]
-    row_norms_grad_top = [float(x) for x in row_norms[top_grad_ids].tolist()]
     raw_mean_loss = loss_sum_total / jnp.maximum(count_total, 1)
-    raw_mean_loss_grad_top = [float(x) for x in raw_mean_loss[top_grad_ids].tolist()]
 
-    print(f"\nTop-{top_k_grad} tokens by |grad row mean|:")
-    print(
-        f"  {'rank':>4} {'token_id':>9} {'count':>6} {'grad_mean':>12} {'grad_rn':>12}"
-        f" {'g_rn/median':>12} {'row_norm':>10} {'rn/median':>10}"
-        f" {'mean_loss':>10}"
+    _print_ranked_tables(
+        metric_name="|grad row mean|",
+        sort_key_arr=grad_row_mean,
+        k=top_k_grad,
+        count_total=count_total,
+        raw_mean_loss=raw_mean_loss,
+        column_specs=[
+            ("grad_mean", ">12.3e", grad_row_mean),
+            ("grad_signed_rn", ">15.3e", grad_signed_row_norms),
+            ("g_rn/median", ">12.3f", grad_signed_row_norms / max(grad_median, 1e-12)),
+            ("row_norm", ">10.4f", row_norms),
+            ("rn/median", ">10.3f", row_norms / max(median_rn, 1e-9)),
+        ],
     )
-    for rank in range(top_k_grad):
-        ml_str = (
-            f"{raw_mean_loss_grad_top[rank]:>10.4f}"
-            if counts_grad_top[rank] > 0 else f"{'—':>10}"
-        )
-        print(
-            f"  {rank+1:>4d} {top_grad_ids_list[rank]:>9d} {counts_grad_top[rank]:>6d}"
-            f" {grad_mean_grad_top[rank]:>12.3e}"
-            f" {grad_rn_grad_top[rank]:>12.3e}"
-            f" {grad_rn_grad_top[rank] / max(grad_median, 1e-12):>12.3f}"
-            f" {row_norms_grad_top[rank]:>10.4f}"
-            f" {row_norms_grad_top[rank] / max(median_rn, 1e-9):>10.3f}"
-            f" {ml_str}"
-        )
-
-    bot_grad_ids = jnp.argsort(jnp.abs(grad_row_mean))[:top_k_grad]
-    bot_grad_ids_list = [int(x) for x in bot_grad_ids.tolist()]
-    counts_grad_bot = [int(x) for x in count_total[bot_grad_ids].tolist()]
-    grad_mean_grad_bot = [float(x) for x in grad_row_mean[bot_grad_ids].tolist()]
-    grad_rn_grad_bot = [float(x) for x in grad_row_norms[bot_grad_ids].tolist()]
-    row_norms_grad_bot = [float(x) for x in row_norms[bot_grad_ids].tolist()]
-    raw_mean_loss_grad_bot = [float(x) for x in raw_mean_loss[bot_grad_ids].tolist()]
-
-    print(f"\nBottom-{top_k_grad} tokens by |grad row mean|:")
-    print(
-        f"  {'rank':>4} {'token_id':>9} {'count':>6} {'grad_mean':>12} {'grad_rn':>12}"
-        f" {'g_rn/median':>12} {'row_norm':>10} {'rn/median':>10}"
-        f" {'mean_loss':>10}"
-    )
-    for rank in range(top_k_grad):
-        ml_str = (
-            f"{raw_mean_loss_grad_bot[rank]:>10.4f}"
-            if counts_grad_bot[rank] > 0 else f"{'—':>10}"
-        )
-        print(
-            f"  {rank+1:>4d} {bot_grad_ids_list[rank]:>9d} {counts_grad_bot[rank]:>6d}"
-            f" {grad_mean_grad_bot[rank]:>12.3e}"
-            f" {grad_rn_grad_bot[rank]:>12.3e}"
-            f" {grad_rn_grad_bot[rank] / max(grad_median, 1e-12):>12.3f}"
-            f" {row_norms_grad_bot[rank]:>10.4f}"
-            f" {row_norms_grad_bot[rank] / max(median_rn, 1e-9):>10.3f}"
-            f" {ml_str}"
-        )
 
     counts_f32 = count_total.astype(jnp.float32)
     c_min = int(jnp.min(counts_f32))
@@ -716,59 +715,71 @@ def compute_spike_token_diagnostics(
             f"update mean(|row|) dist: median={u_am_med:.3e}  p90={u_am_p90:.3e}  p99={u_am_p99:.3e}  max={u_am_max:.3e}"
         )
 
-        top_upd_ids = jnp.argsort(-update_row_abs_mean)[:top_k_grad]
-        top_upd_ids_list = [int(x) for x in top_upd_ids.tolist()]
-        counts_upd_top = [int(x) for x in count_total[top_upd_ids].tolist()]
-        upd_abs_mean_top = [float(x) for x in update_row_abs_mean[top_upd_ids].tolist()]
-        upd_rn_top = [float(x) for x in update_row_norm[top_upd_ids].tolist()]
-        grad_rn_upd_top = [float(x) for x in grad_row_norms[top_upd_ids].tolist()]
-        raw_mean_loss_upd_top = [float(x) for x in raw_mean_loss[top_upd_ids].tolist()]
+        column_specs = [
+            ("upd_abs_mean", ">13.3e", update_row_abs_mean),
+            ("upd_rn", ">12.3e", update_row_norm),
+        ]
+        if m_W_U is not None and v_W_U is not None:
+            m_row_norm = jnp.linalg.norm(m_W_U, axis=-1)
+            sqrtv_row_norm = jnp.linalg.norm(jnp.sqrt(v_W_U), axis=-1)
+            column_specs += [
+                ("m_rn", ">12.3e", m_row_norm),
+                ("sqrtv_rn", ">12.3e", sqrtv_row_norm),
+            ]
+        column_specs += [
+            ("grad_signed_rn", ">15.3e", grad_signed_row_norms),
+        ]
 
-        print(f"\nTop-{top_k_grad} tokens by mean(|update_row|):")
-        print(
-            f"  {'rank':>4} {'token_id':>9} {'count':>6} {'upd_abs_mean':>13} {'upd_rn':>12}"
-            f" {'grad_rn':>12} {'g_rn/median':>12} {'mean_loss':>10}"
+        _print_ranked_tables(
+            metric_name="mean(|update_row|)",
+            sort_key_arr=update_row_abs_mean,
+            k=top_k_grad,
+            count_total=count_total,
+            raw_mean_loss=raw_mean_loss,
+            column_specs=column_specs,
         )
-        for rank in range(top_k_grad):
-            ml_str = (
-                f"{raw_mean_loss_upd_top[rank]:>10.4f}"
-                if counts_upd_top[rank] > 0 else f"{'—':>10}"
-            )
-            print(
-                f"  {rank+1:>4d} {top_upd_ids_list[rank]:>9d} {counts_upd_top[rank]:>6d}"
-                f" {upd_abs_mean_top[rank]:>13.3e}"
-                f" {upd_rn_top[rank]:>12.3e}"
-                f" {grad_rn_upd_top[rank]:>12.3e}"
-                f" {grad_rn_upd_top[rank] / max(grad_median, 1e-12):>12.3f}"
-                f" {ml_str}"
-            )
 
-        bot_upd_ids = jnp.argsort(update_row_abs_mean)[:top_k_grad]
-        bot_upd_ids_list = [int(x) for x in bot_upd_ids.tolist()]
-        counts_upd_bot = [int(x) for x in count_total[bot_upd_ids].tolist()]
-        upd_abs_mean_bot = [float(x) for x in update_row_abs_mean[bot_upd_ids].tolist()]
-        upd_rn_bot = [float(x) for x in update_row_norm[bot_upd_ids].tolist()]
-        grad_rn_upd_bot = [float(x) for x in grad_row_norms[bot_upd_ids].tolist()]
-        raw_mean_loss_upd_bot = [float(x) for x in raw_mean_loss[bot_upd_ids].tolist()]
+        if save_dir is not None and v_W_U is not None:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            sqrtv_mean = jnp.mean(jnp.sqrt(v_W_U), axis=-1)
+            mask = count_total > 0
+            counts_np = np.array(count_total[mask])
+            sqrtv_np = np.array(sqrtv_mean[mask])
+            plt.figure(figsize=(8, 6))
+            plt.scatter(counts_np, sqrtv_np, s=3, alpha=0.35)
+            plt.xscale('log')
+            plt.yscale('log')
+            plt.xlabel('target count')
+            plt.ylabel('mean(√v[v, :]) over D features')
+            plt.title(f'mean(√v) vs target count @ step {step}  (count>0 only)')
+            plt.tight_layout()
+            plot_path = os.path.join(str(save_dir), 'sqrtv_vs_count.png')
+            plt.savefig(plot_path, dpi=120)
+            plt.close()
+            print(f"Saved mean(√v) vs count scatter to: {plot_path}")
 
-        print(f"\nBottom-{top_k_grad} tokens by mean(|update_row|):")
-        print(
-            f"  {'rank':>4} {'token_id':>9} {'count':>6} {'upd_abs_mean':>13} {'upd_rn':>12}"
-            f" {'grad_rn':>12} {'g_rn/median':>12} {'mean_loss':>10}"
-        )
-        for rank in range(top_k_grad):
-            ml_str = (
-                f"{raw_mean_loss_upd_bot[rank]:>10.4f}"
-                if counts_upd_bot[rank] > 0 else f"{'—':>10}"
-            )
-            print(
-                f"  {rank+1:>4d} {bot_upd_ids_list[rank]:>9d} {counts_upd_bot[rank]:>6d}"
-                f" {upd_abs_mean_bot[rank]:>13.3e}"
-                f" {upd_rn_bot[rank]:>12.3e}"
-                f" {grad_rn_upd_bot[rank]:>12.3e}"
-                f" {grad_rn_upd_bot[rank] / max(grad_median, 1e-12):>12.3f}"
-                f" {ml_str}"
-            )
+        if save_dir is not None and m_W_U is not None:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            m_abs_mean = jnp.mean(jnp.abs(m_W_U), axis=-1)
+            mask = count_total > 0
+            counts_np = np.array(count_total[mask])
+            m_np = np.array(m_abs_mean[mask])
+            plt.figure(figsize=(8, 6))
+            plt.scatter(counts_np, m_np, s=3, alpha=0.35)
+            plt.xscale('log')
+            plt.yscale('log')
+            plt.xlabel('target count')
+            plt.ylabel('mean(|m[v, :]|) over D features')
+            plt.title(f'mean(|m|) vs target count @ step {step}  (count>0 only)')
+            plt.tight_layout()
+            plot_path_m = os.path.join(str(save_dir), 'm_vs_count.png')
+            plt.savefig(plot_path_m, dpi=120)
+            plt.close()
+            print(f"Saved mean(|m|) vs count scatter to: {plot_path_m}")
 
     metrics = {
         "spike_analysis/row_norm/median": median_rn,

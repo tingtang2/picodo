@@ -180,6 +180,18 @@ def main(c: DictConfig):
     use_val = True
     num_samps = len(ds_valid)
 
+    lr_at_step = float(lr_schedule(step_to_load))
+    eps = float(_cfg_get(c, 'opt.eps', 1e-8))
+    weight_decay = float(c.opt.weight_decay)
+    update_W_U, m_W_U, v_W_U = utils._compute_adam_update_W_U(
+        model_state, opt_state, lr_at_step, eps, weight_decay,
+    )
+    print(
+        f"Adam update at step {step_to_load}: "
+        f"lr={lr_at_step:.3e}  weight_decay={weight_decay:.3e}  "
+        f"||update||={float(jnp.linalg.norm(update_W_U)):.3e}"
+    )
+
     metrics = utils.compute_spike_token_diagnostics(
         model_state,
         model_graphdef,
@@ -188,6 +200,10 @@ def main(c: DictConfig):
         step=step_to_load,
         top_k=top_k,
         min_count=min_count,
+        update_W_U=update_W_U,
+        m_W_U=m_W_U,
+        v_W_U=v_W_U,
+        save_dir=save_dir,
     )
 
     print(f"Diagnostic complete in {time.time() - t0:.1f}s")
