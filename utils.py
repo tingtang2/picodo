@@ -520,6 +520,15 @@ def _per_batch_grad_W_U(model_state, model_graphdef, x):
     g_W_U = _get_nested_state_item(grads, ("token_embed_out", "embedding"))
     return _state_leaf_to_array(g_W_U)  # [V, D]
 
+def _compute_adam_update_W_U(model_state, opt_state, lr_at_step, eps, weight_decay):
+    """[V, D] AdamW update applied to W_U at this checkpoint."""
+    W_U = _state_leaf_to_array(_get_nested_state_item(model_state, ("token_embed_out", "embedding")))
+    adam = _find_moment_state(opt_state)
+    m_W_U = _state_leaf_to_array(_get_nested_state_item(adam["mu"], ("token_embed_out", "embedding")))
+    v_W_U = _state_leaf_to_array(_get_nested_state_item(adam["nu"], ("token_embed_out", "embedding")))
+    update_W_U = -lr_at_step * m_W_U / (jnp.sqrt(v_W_U) + eps)
+    update_W_U -= lr_at_step * weight_decay * W_U
+    return update_W_U
 
 def _dist_stats(x):
     """Return (median, p90, p99, max, mean) as Python floats for a [V] array."""
@@ -535,6 +544,7 @@ def _dist_stats(x):
 def compute_spike_token_diagnostics(
     model_state, model_graphdef, ds_valid, step: int,
     top_k: int = 20, min_count: int = 5,
+    update_W_U=None,
 ):
     """Rank target tokens by mean eval loss; for the top-k tokens, show
     W_U row norms and ||∂L/∂W_U[i,:]|| alongside the vocab-wide distributions.
@@ -544,8 +554,8 @@ def compute_spike_token_diagnostics(
     )
     vocab_size, D = int(W_U.shape[0]), int(W_U.shape[1])
 
-    # Single eval pass: accumulate (per-token loss sum, count) AND the gradient
-    # of summed CE loss w.r.t. W_U across all batches. Grads sum by linearity.
+    # Single eval pass: accumulate per-token loss sum, count, AND |∂L/∂W_U| per
+    # batch (abs taken before summing so per-feature signs don't cancel across batches).
     loss_sum_total = jnp.zeros(vocab_size, dtype=jnp.float32)
     count_total = jnp.zeros(vocab_size, dtype=jnp.int32)
     grad_sum_total = jnp.zeros((vocab_size, D), dtype=jnp.float32)
@@ -556,9 +566,9 @@ def compute_spike_token_diagnostics(
         )
         loss_sum_total = loss_sum_total + ls
         count_total = count_total + cnt
-        grad_sum_total = grad_sum_total + _per_batch_grad_W_U(
+        grad_sum_total = grad_sum_total + jnp.abs(_per_batch_grad_W_U(
             model_state, model_graphdef, batch
-        )
+        ))
 
     # only rank tokens seen >= min_count times (else one-shot rare tokens dominate)
     mean_loss = jnp.where(
@@ -693,6 +703,72 @@ def compute_spike_token_diagnostics(
         f"Target-count 5-number summary ({n_nonzero} tokens with count>0):"
         f" min={nz_min:_}  Q1={nz_q1:_}  median={nz_med:_}  Q3={nz_q3:_}  max={nz_max:_}"
     )
+
+    if update_W_U is not None:
+        update_row_norm = jnp.linalg.norm(update_W_U, axis=-1)
+        update_row_abs_mean = jnp.mean(jnp.abs(update_W_U), axis=-1)
+        u_rn_med, u_rn_p90, u_rn_p99, u_rn_max, _ = _dist_stats(update_row_norm)
+        u_am_med, u_am_p90, u_am_p99, u_am_max, _ = _dist_stats(update_row_abs_mean)
+        print(
+            f"\nupdate row_norm dist:    median={u_rn_med:.3e}  p90={u_rn_p90:.3e}  p99={u_rn_p99:.3e}  max={u_rn_max:.3e}"
+        )
+        print(
+            f"update mean(|row|) dist: median={u_am_med:.3e}  p90={u_am_p90:.3e}  p99={u_am_p99:.3e}  max={u_am_max:.3e}"
+        )
+
+        top_upd_ids = jnp.argsort(-update_row_abs_mean)[:top_k_grad]
+        top_upd_ids_list = [int(x) for x in top_upd_ids.tolist()]
+        counts_upd_top = [int(x) for x in count_total[top_upd_ids].tolist()]
+        upd_abs_mean_top = [float(x) for x in update_row_abs_mean[top_upd_ids].tolist()]
+        upd_rn_top = [float(x) for x in update_row_norm[top_upd_ids].tolist()]
+        grad_rn_upd_top = [float(x) for x in grad_row_norms[top_upd_ids].tolist()]
+        raw_mean_loss_upd_top = [float(x) for x in raw_mean_loss[top_upd_ids].tolist()]
+
+        print(f"\nTop-{top_k_grad} tokens by mean(|update_row|):")
+        print(
+            f"  {'rank':>4} {'token_id':>9} {'count':>6} {'upd_abs_mean':>13} {'upd_rn':>12}"
+            f" {'grad_rn':>12} {'g_rn/median':>12} {'mean_loss':>10}"
+        )
+        for rank in range(top_k_grad):
+            ml_str = (
+                f"{raw_mean_loss_upd_top[rank]:>10.4f}"
+                if counts_upd_top[rank] > 0 else f"{'—':>10}"
+            )
+            print(
+                f"  {rank+1:>4d} {top_upd_ids_list[rank]:>9d} {counts_upd_top[rank]:>6d}"
+                f" {upd_abs_mean_top[rank]:>13.3e}"
+                f" {upd_rn_top[rank]:>12.3e}"
+                f" {grad_rn_upd_top[rank]:>12.3e}"
+                f" {grad_rn_upd_top[rank] / max(grad_median, 1e-12):>12.3f}"
+                f" {ml_str}"
+            )
+
+        bot_upd_ids = jnp.argsort(update_row_abs_mean)[:top_k_grad]
+        bot_upd_ids_list = [int(x) for x in bot_upd_ids.tolist()]
+        counts_upd_bot = [int(x) for x in count_total[bot_upd_ids].tolist()]
+        upd_abs_mean_bot = [float(x) for x in update_row_abs_mean[bot_upd_ids].tolist()]
+        upd_rn_bot = [float(x) for x in update_row_norm[bot_upd_ids].tolist()]
+        grad_rn_upd_bot = [float(x) for x in grad_row_norms[bot_upd_ids].tolist()]
+        raw_mean_loss_upd_bot = [float(x) for x in raw_mean_loss[bot_upd_ids].tolist()]
+
+        print(f"\nBottom-{top_k_grad} tokens by mean(|update_row|):")
+        print(
+            f"  {'rank':>4} {'token_id':>9} {'count':>6} {'upd_abs_mean':>13} {'upd_rn':>12}"
+            f" {'grad_rn':>12} {'g_rn/median':>12} {'mean_loss':>10}"
+        )
+        for rank in range(top_k_grad):
+            ml_str = (
+                f"{raw_mean_loss_upd_bot[rank]:>10.4f}"
+                if counts_upd_bot[rank] > 0 else f"{'—':>10}"
+            )
+            print(
+                f"  {rank+1:>4d} {bot_upd_ids_list[rank]:>9d} {counts_upd_bot[rank]:>6d}"
+                f" {upd_abs_mean_bot[rank]:>13.3e}"
+                f" {upd_rn_bot[rank]:>12.3e}"
+                f" {grad_rn_upd_bot[rank]:>12.3e}"
+                f" {grad_rn_upd_bot[rank] / max(grad_median, 1e-12):>12.3f}"
+                f" {ml_str}"
+            )
 
     metrics = {
         "spike_analysis/row_norm/median": median_rn,
