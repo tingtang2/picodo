@@ -37,14 +37,13 @@ relative to the model forward+backward at gpt2m scale.
 from __future__ import annotations
 from typing import Any, Callable, NamedTuple, Union
 
-import chex
 import jax
 import jax.numpy as jnp
 import optax
 
 
 class RightPrecondAdamState(NamedTuple):
-    count: chex.Array
+    count: jax.Array
     m: Any  # tree-of-[V,D]-arrays (or MaskedNode at masked-out leaves)
     R: Any  # tree-of-[D,D]-arrays (or MaskedNode at masked-out leaves)
 
@@ -58,7 +57,7 @@ def _arr(p: Any):
 
 
 def right_precond_adam(
-    learning_rate: Union[float, Callable[[chex.Numeric], chex.Numeric]],
+    learning_rate: Union[float, Callable[[Any], Any]],
     b1: float = 0.9,
     b2: float = 0.95,
     eps: float = 1e-8,
