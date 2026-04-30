@@ -44,12 +44,30 @@ opt:
     final_b2: 0.999
   weight_decay: 0.02
   exclude_input_embedding_weight_decay: false
+  default_optimizer:
+    type: adamw # one of: adamw, muon
+    muon:
+      beta: 0.95
+      ns_steps: 5
+      eps: ${opt.eps}
+      weight_decay: ${opt.weight_decay}
+      mu_dtype: null
+      nesterov: true
+      adaptive: false
+      consistent_rms: null
+  input_embedding_optimizer:
+    type: adamw # one of: adamw, sgd_momentum
+    momentum: 0.9
+    nesterov: false
   lm_head_optimizer:
     type: adamw # one of: adamw, sgd_momentum
     momentum: 0.9
     nesterov: false
   lm_head_gradient_centering: 'off' # one of: off, pre, post
   lm_head_weighted_columnwise_gradient_centering: 'off' # one of: off, pre, post
+  clip_by_global_norm: 1.0
+  use_z_loss: false
+  eps: 1e-8
   loss_skip:
     enabled: false
     warmup_steps: 1000

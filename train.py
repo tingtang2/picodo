@@ -1086,14 +1086,30 @@ def train_and_evaluate(c: DictConfig):
                 f"start_b2={c.opt.b2}, final_b2={final_b2}, warmup_steps=0"
             )
     wd_mask = utils.build_weight_decay_mask(model, c.opt.exclude_input_embedding_weight_decay)
-    adamw_tx = optax.inject_hyperparams(optax.adamw)(
-        lr_schedule,
-        c.opt.b1,
-        b2_hparam,
-        eps=c.opt.eps,
-        weight_decay=c.opt.weight_decay,
-        mask=wd_mask,
-    )
+
+    def masked_weight_decay_mask(target_mask):
+        if wd_mask is None:
+            return target_mask
+        return utils.and_masks(wd_mask, target_mask)
+
+    def build_adamw_tx(target_mask=None):
+        return optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+            mask=wd_mask if target_mask is None else masked_weight_decay_mask(target_mask),
+        )
+
+    def build_sgd_momentum_tx(optimizer_cfg):
+        return optax.inject_hyperparams(optax.sgd)(
+            learning_rate=lr_schedule,
+            momentum=float(getattr(optimizer_cfg, "momentum", 0.9)),
+            nesterov=bool(getattr(optimizer_cfg, "nesterov", False)),
+        )
+
+    adamw_tx = build_adamw_tx()
 
     def normalize_lm_head_centering_mode(raw_value, field_name):
         if isinstance(raw_value, bool):
@@ -1157,55 +1173,123 @@ def train_and_evaluate(c: DictConfig):
                 f"mode={lm_head_weighted_gc_mode}, target=token_embed_out.embedding"
             )
 
+    def normalize_embedding_optimizer_type(optimizer_cfg, field_name):
+        optimizer_type = str(getattr(optimizer_cfg, "type", "adamw")).lower()
+        if optimizer_type not in {"adamw", "sgd_momentum"}:
+            raise ValueError(
+                f"Expected `{field_name}.type` to be one of "
+                "{'adamw', 'sgd_momentum'}, "
+                f"got {optimizer_type!r}."
+            )
+        return optimizer_type
+
+    def build_embedding_optimizer_tx(optimizer_cfg, target_mask, field_name):
+        optimizer_type = normalize_embedding_optimizer_type(optimizer_cfg, field_name)
+        if optimizer_type == "adamw":
+            return build_adamw_tx(target_mask), optimizer_type
+        return build_sgd_momentum_tx(optimizer_cfg), optimizer_type
+
+    default_optimizer_cfg = getattr(c.opt, "default_optimizer", None)
+    default_optimizer_type = str(getattr(default_optimizer_cfg, "type", "adamw")).lower()
+    input_embedding_optimizer_cfg = getattr(c.opt, "input_embedding_optimizer", None)
     lm_head_optimizer_cfg = getattr(c.opt, "lm_head_optimizer", None)
-    lm_head_optimizer_type = str(getattr(lm_head_optimizer_cfg, "type", "adamw")).lower()
-    if lm_head_optimizer_type == "adamw":
-        base_optimizer_tx = adamw_tx
-    elif lm_head_optimizer_type == "sgd_momentum":
-        if output_embedding_mask is None:
-            output_embedding_mask = utils.build_output_embedding_mask(model)
-        non_output_embedding_mask = jax.tree_util.tree_map(
-            lambda is_output_embedding: not is_output_embedding,
-            output_embedding_mask,
-        )
-        if wd_mask is None:
-            rest_wd_mask = non_output_embedding_mask
+    input_embedding_optimizer_type = normalize_embedding_optimizer_type(
+        input_embedding_optimizer_cfg,
+        "opt.input_embedding_optimizer",
+    )
+    lm_head_optimizer_type = normalize_embedding_optimizer_type(
+        lm_head_optimizer_cfg,
+        "opt.lm_head_optimizer",
+    )
+
+    if default_optimizer_type == "adamw":
+        if input_embedding_optimizer_type == "adamw" and lm_head_optimizer_type == "adamw":
+            base_optimizer_tx = adamw_tx
         else:
-            rest_wd_mask = jax.tree_util.tree_map(
-                lambda use_wd, is_non_output_embedding: bool(use_wd and is_non_output_embedding),
-                wd_mask,
-                non_output_embedding_mask,
+            input_embedding_mask = utils.build_input_embedding_mask(model)
+            if output_embedding_mask is None:
+                output_embedding_mask = utils.build_output_embedding_mask(model)
+            embedding_mask = utils.or_masks(input_embedding_mask, output_embedding_mask)
+            non_embedding_mask = utils.invert_mask(embedding_mask)
+            rest_adamw_tx = build_adamw_tx(non_embedding_mask)
+            input_embedding_tx, _ = build_embedding_optimizer_tx(
+                input_embedding_optimizer_cfg,
+                input_embedding_mask,
+                "opt.input_embedding_optimizer",
+            )
+            lm_head_tx, _ = build_embedding_optimizer_tx(
+                lm_head_optimizer_cfg,
+                output_embedding_mask,
+                "opt.lm_head_optimizer",
+            )
+            base_optimizer_tx = optax.chain(
+                optax.masked(rest_adamw_tx, non_embedding_mask),
+                optax.masked(input_embedding_tx, input_embedding_mask),
+                optax.masked(lm_head_tx, output_embedding_mask),
+            )
+            if jax.process_index() == 0:
+                print(
+                    "split embedding optimizer enabled: "
+                    f"default=adamw, input_embedding={input_embedding_optimizer_type}, "
+                    f"lm_head={lm_head_optimizer_type}"
+                )
+    elif default_optimizer_type == "muon":
+        if not hasattr(optax, "contrib") or not hasattr(optax.contrib, "muon"):
+            raise ValueError(
+                "`opt.default_optimizer.type=muon` requires an Optax version with "
+                "`optax.contrib.muon`."
             )
 
-        lm_head_sgd_tx = optax.inject_hyperparams(optax.sgd)(
+        input_embedding_mask = utils.build_input_embedding_mask(model)
+        if output_embedding_mask is None:
+            output_embedding_mask = utils.build_output_embedding_mask(model)
+        non_embedding_mask = utils.build_non_embedding_mask(model)
+
+        muon_cfg = getattr(default_optimizer_cfg, "muon", None)
+        muon_wd_mask = masked_weight_decay_mask(non_embedding_mask)
+        muon_tx = optax.contrib.muon(
             learning_rate=lr_schedule,
-            momentum=float(getattr(lm_head_optimizer_cfg, "momentum", 0.9)),
-            nesterov=bool(getattr(lm_head_optimizer_cfg, "nesterov", False)),
+            beta=float(getattr(muon_cfg, "beta", 0.95)),
+            ns_steps=int(getattr(muon_cfg, "ns_steps", 5)),
+            eps=float(getattr(muon_cfg, "eps", c.opt.eps)),
+            weight_decay=float(getattr(muon_cfg, "weight_decay", c.opt.weight_decay)),
+            weight_decay_mask=muon_wd_mask,
+            mu_dtype=getattr(muon_cfg, "mu_dtype", None),
+            nesterov=bool(getattr(muon_cfg, "nesterov", True)),
+            adaptive=bool(getattr(muon_cfg, "adaptive", False)),
+            adam_b1=float(getattr(muon_cfg, "adam_b1", c.opt.b1)),
+            adam_b2=float(getattr(muon_cfg, "adam_b2", c.opt.b2)),
+            adam_weight_decay=float(getattr(muon_cfg, "adam_weight_decay", c.opt.weight_decay)),
+            muon_weight_dimension_numbers=utils.build_muon_dimension_numbers(model),
         )
-        rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
-            lr_schedule,
-            c.opt.b1,
-            b2_hparam,
-            eps=c.opt.eps,
-            weight_decay=c.opt.weight_decay,
-            mask=rest_wd_mask,
+        input_embedding_tx, _ = build_embedding_optimizer_tx(
+            input_embedding_optimizer_cfg,
+            input_embedding_mask,
+            "opt.input_embedding_optimizer",
+        )
+        lm_head_tx, _ = build_embedding_optimizer_tx(
+            lm_head_optimizer_cfg,
+            output_embedding_mask,
+            "opt.lm_head_optimizer",
         )
         base_optimizer_tx = optax.chain(
-            optax.masked(rest_adamw_tx, non_output_embedding_mask),
-            optax.masked(lm_head_sgd_tx, output_embedding_mask),
+            optax.masked(muon_tx, non_embedding_mask),
+            optax.masked(input_embedding_tx, input_embedding_mask),
+            optax.masked(lm_head_tx, output_embedding_mask),
         )
         if jax.process_index() == 0:
             print(
-                "split lm-head optimizer enabled: "
-                "default=adamw, lm_head=sgd_momentum, "
-                f"momentum={float(getattr(lm_head_optimizer_cfg, 'momentum', 0.9))}, "
-                f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}"
+                "split Muon optimizer enabled: "
+                f"default=muon_non_embeddings, input_embedding={input_embedding_optimizer_type}, "
+                f"lm_head={lm_head_optimizer_type}, "
+                f"muon_beta={float(getattr(muon_cfg, 'beta', 0.95))}, "
+                f"muon_nesterov={bool(getattr(muon_cfg, 'nesterov', True))}"
             )
     else:
         raise ValueError(
-            "Expected `opt.lm_head_optimizer.type` to be one of "
-            "{'adamw', 'sgd_momentum'}, "
-            f"got {lm_head_optimizer_type!r}."
+            "Expected `opt.default_optimizer.type` to be one of "
+            "{'adamw', 'muon'}, "
+            f"got {default_optimizer_type!r}."
         )
 
     tx_chain = [*pre_transforms, base_optimizer_tx, *post_transforms]
