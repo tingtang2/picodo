@@ -37,6 +37,15 @@ def _is_lm_head_oblique_target_rms_log_path(path) -> bool:
     return key == 'lm_head_oblique_target_rms_log'
 
 
+def _is_input_embedding_path(path) -> bool:
+    key = jax.tree_util.keystr(path, simple=True, separator='/')
+    return key == 'token_embed_in/embedding'
+
+
+def _is_embedding_path(path) -> bool:
+    return _is_input_embedding_path(path) or _is_output_embedding_path(path)
+
+
 def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
     _, params = nnx.split(model, nnx.Param)
     learned_target_rms_present = False
@@ -65,6 +74,16 @@ def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
 
     return jax.tree_util.tree_map_with_path(
         mask_leaf,
+        params,
+        is_leaf=lambda x: isinstance(x, nnx.Param),
+    )
+
+
+def _build_path_mask(model: nnx.Module, predicate):
+    _, params = nnx.split(model, nnx.Param)
+
+    return jax.tree_util.tree_map_with_path(
+        lambda path, _: bool(predicate(path)),
         params,
         is_leaf=lambda x: isinstance(x, nnx.Param),
     )
@@ -141,6 +160,26 @@ def adamc(
     )
 
 
+def invert_mask(mask):
+    return jax.tree_util.tree_map(lambda include: not include, mask)
+
+
+def and_masks(*masks):
+    if not masks:
+        raise ValueError("and_masks requires at least one mask.")
+    return jax.tree_util.tree_map(lambda *values: all(values), *masks)
+
+
+def or_masks(*masks):
+    if not masks:
+        raise ValueError("or_masks requires at least one mask.")
+    return jax.tree_util.tree_map(lambda *values: any(values), *masks)
+
+
+def build_input_embedding_mask(model: nnx.Module):
+    return _build_path_mask(model, _is_input_embedding_path)
+
+
 def build_output_embedding_mask(model: nnx.Module):
     _, params = nnx.split(model, nnx.Param)
 
@@ -167,6 +206,48 @@ def build_lm_head_oblique_target_rms_mask(model: nnx.Module):
 
     return jax.tree_util.tree_map_with_path(
         lambda path, _: _is_lm_head_oblique_target_rms_log_path(path),
+        params,
+        is_leaf=lambda x: isinstance(x, nnx.Param),
+    )
+
+
+def build_non_embedding_mask(model: nnx.Module):
+    return _build_path_mask(model, lambda path: not _is_embedding_path(path))
+
+
+def build_muon_dimension_numbers(model: nnx.Module):
+    """Selects every non-embedding parameter for Muon, including projection tensors."""
+    _, params = nnx.split(model, nnx.Param)
+
+    def spec_leaf(path, leaf):
+        if _is_embedding_path(path):
+            return None
+
+        key = jax.tree_util.keystr(path, simple=True, separator='/')
+        value = getattr(leaf, 'value', leaf)
+        ndim = value.ndim
+
+        if 'qkv_proj' in key:
+            return optax.contrib.MuonDimensionNumbers(
+                reduction_axis=(2,),
+                output_axis=(0, 1, 3),
+            )
+        if 'out_proj' in key:
+            return optax.contrib.MuonDimensionNumbers(
+                reduction_axis=(0, 1),
+                output_axis=(2,),
+            )
+        if 'gate_proj' in key:
+            return optax.contrib.MuonDimensionNumbers(
+                reduction_axis=(1,),
+                output_axis=(0, 2),
+            )
+        if ndim == 2:
+            return optax.contrib.MuonDimensionNumbers()
+        return None
+
+    return jax.tree_util.tree_map_with_path(
+        spec_leaf,
         params,
         is_leaf=lambda x: isinstance(x, nnx.Param),
     )

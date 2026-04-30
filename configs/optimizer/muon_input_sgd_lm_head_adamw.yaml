@@ -1,0 +1,12 @@
+# @package opt
+
+default_optimizer:
+  type: muon
+
+input_embedding_optimizer:
+  type: sgd_momentum
+  momentum: 0.9
+  nesterov: false
+
+lm_head_optimizer:
+  type: adamw

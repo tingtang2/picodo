@@ -1931,6 +1931,18 @@ def train_and_evaluate(c: DictConfig):
         mask=wd_mask,
     )
 
+    def masked_weight_decay_mask(target_mask):
+        if wd_mask is None:
+            return target_mask
+        return utils.and_masks(wd_mask, target_mask)
+
+    def build_sgd_momentum_tx(optimizer_cfg, learning_rate):
+        return optax.inject_hyperparams(optax.sgd)(
+            learning_rate=learning_rate,
+            momentum=float(getattr(optimizer_cfg, "momentum", 0.9)),
+            nesterov=bool(getattr(optimizer_cfg, "nesterov", False)),
+        )
+
     pre_transforms, post_transforms, output_embedding_mask, lm_head_transform_logs = (
         utils.build_lm_head_update_transforms(model, c.opt)
     )
@@ -1938,6 +1950,33 @@ def train_and_evaluate(c: DictConfig):
         for log_message in lm_head_transform_logs:
             print(log_message)
 
+    def normalize_embedding_optimizer_type(optimizer_cfg, field_name):
+        optimizer_type = str(getattr(optimizer_cfg, "type", "adamw")).lower()
+        if optimizer_type not in {"adamw", "sgd_momentum"}:
+            raise ValueError(
+                f"Expected `{field_name}.type` to be one of "
+                "{'adamw', 'sgd_momentum'}, "
+                f"got {optimizer_type!r}."
+            )
+        return optimizer_type
+
+    def build_embedding_optimizer_tx(
+        optimizer_cfg, target_mask, field_name, learning_rate, peak_learning_rate
+    ):
+        optimizer_type = normalize_embedding_optimizer_type(optimizer_cfg, field_name)
+        if optimizer_type == "adamw":
+            return build_adam_tx(
+                learning_rate,
+                peak_learning_rate,
+                c.opt.b1,
+                c.opt.weight_decay,
+                mask=masked_weight_decay_mask(target_mask),
+            ), optimizer_type
+        return build_sgd_momentum_tx(optimizer_cfg, learning_rate), optimizer_type
+
+    default_optimizer_cfg = getattr(c.opt, "default_optimizer", None)
+    default_optimizer_type = str(getattr(default_optimizer_cfg, "type", "adamw")).lower()
+    input_embedding_optimizer_cfg = getattr(c.opt, "input_embedding_optimizer", None)
     lm_head_optimizer_cfg = getattr(c.opt, "lm_head_optimizer", None)
     lm_head_optimizer_type = utils.get_lm_head_optimizer_type(c.opt)
     if lm_head_optimizer_type == "adamw":
@@ -2146,6 +2185,80 @@ def train_and_evaluate(c: DictConfig):
             "{'adamw', 'sgd_momentum', 'adamw_b1', 'row_oblique', 'column_oblique'}, "
             f"got {lm_head_optimizer_type!r}."
         )
+
+    if default_optimizer_type not in {"adamw", "muon"}:
+        raise ValueError(
+            "Expected `opt.default_optimizer.type` to be one of "
+            "{'adamw', 'muon'}, "
+            f"got {default_optimizer_type!r}."
+        )
+
+    if default_optimizer_type == "muon":
+        if not hasattr(optax, "contrib") or not hasattr(optax.contrib, "muon"):
+            raise ValueError(
+                "`opt.default_optimizer.type=muon` requires an Optax version with "
+                "`optax.contrib.muon`."
+            )
+
+        input_embedding_optimizer_type = normalize_embedding_optimizer_type(
+            input_embedding_optimizer_cfg,
+            "opt.input_embedding_optimizer",
+        )
+        muon_lm_head_optimizer_type = normalize_embedding_optimizer_type(
+            lm_head_optimizer_cfg,
+            "opt.lm_head_optimizer",
+        )
+        input_embedding_mask = utils.build_input_embedding_mask(model)
+        if output_embedding_mask is None:
+            output_embedding_mask = utils.build_output_embedding_mask(model)
+        non_embedding_mask = utils.build_non_embedding_mask(model)
+
+        muon_cfg = getattr(default_optimizer_cfg, "muon", None)
+        muon_tx = optax.contrib.muon(
+            learning_rate=lr_schedule,
+            beta=float(getattr(muon_cfg, "beta", 0.95)),
+            ns_steps=int(getattr(muon_cfg, "ns_steps", 5)),
+            eps=float(getattr(muon_cfg, "eps", c.opt.eps)),
+            weight_decay=float(getattr(muon_cfg, "weight_decay", c.opt.weight_decay)),
+            weight_decay_mask=masked_weight_decay_mask(non_embedding_mask),
+            mu_dtype=getattr(muon_cfg, "mu_dtype", None),
+            nesterov=bool(getattr(muon_cfg, "nesterov", True)),
+            adaptive=bool(getattr(muon_cfg, "adaptive", False)),
+            adam_b1=float(getattr(muon_cfg, "adam_b1", c.opt.b1)),
+            adam_b2=float(getattr(muon_cfg, "adam_b2", c.opt.b2)),
+            adam_weight_decay=float(
+                getattr(muon_cfg, "adam_weight_decay", c.opt.weight_decay)
+            ),
+            muon_weight_dimension_numbers=utils.build_muon_dimension_numbers(model),
+            consistent_rms=getattr(muon_cfg, "consistent_rms", None),
+        )
+        input_embedding_tx, _ = build_embedding_optimizer_tx(
+            input_embedding_optimizer_cfg,
+            input_embedding_mask,
+            "opt.input_embedding_optimizer",
+            lr_schedule,
+            c.opt.peak_lr,
+        )
+        lm_head_tx, _ = build_embedding_optimizer_tx(
+            lm_head_optimizer_cfg,
+            output_embedding_mask,
+            "opt.lm_head_optimizer",
+            lm_head_tx_lr_schedule,
+            lm_head_peak_lr,
+        )
+        base_optimizer_tx = optax.chain(
+            optax.masked(muon_tx, non_embedding_mask),
+            optax.masked(input_embedding_tx, input_embedding_mask),
+            optax.masked(lm_head_tx, output_embedding_mask),
+        )
+        if jax.process_index() == 0:
+            print(
+                "split Muon optimizer enabled: "
+                f"default=muon_non_embeddings, input_embedding={input_embedding_optimizer_type}, "
+                f"lm_head={muon_lm_head_optimizer_type}, "
+                f"muon_beta={float(getattr(muon_cfg, 'beta', 0.95))}, "
+                f"muon_nesterov={bool(getattr(muon_cfg, 'nesterov', True))}"
+            )
 
     base_optimizer_tx, rmsnorm_scale_optimizer_log = utils.maybe_partition_rmsnorm_scale_sgd(
         model, c.opt, base_optimizer_tx, lr_schedule
