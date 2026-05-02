@@ -1201,10 +1201,54 @@ def train_and_evaluate(c: DictConfig):
                 f"momentum={float(getattr(lm_head_optimizer_cfg, 'momentum', 0.9))}, "
                 f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}"
             )
+    elif lm_head_optimizer_type == "adamw_b1":
+        if output_embedding_mask is None:
+            output_embedding_mask = utils.build_output_embedding_mask(model)
+        non_output_embedding_mask = jax.tree_util.tree_map(
+            lambda is_output_embedding: not is_output_embedding,
+            output_embedding_mask,
+        )
+        if wd_mask is None:
+            rest_wd_mask = non_output_embedding_mask
+        else:
+            rest_wd_mask = jax.tree_util.tree_map(
+                lambda use_wd, is_non_output_embedding: bool(use_wd and is_non_output_embedding),
+                wd_mask,
+                non_output_embedding_mask,
+            )
+
+        lm_head_b1 = float(getattr(lm_head_optimizer_cfg, "b1", c.opt.b1))
+
+        lm_head_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            lm_head_b1,
+            b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+        )
+        rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+            mask=rest_wd_mask,
+        )
+        base_optimizer_tx = optax.chain(
+            optax.masked(rest_adamw_tx, non_output_embedding_mask),
+            optax.masked(lm_head_adamw_tx, output_embedding_mask),
+        )
+        if jax.process_index() == 0:
+            print(
+                "split lm-head optimizer enabled: "
+                f"default=adamw(b1={c.opt.b1}), "
+                f"lm_head=adamw(b1={lm_head_b1}); "
+                "all other hparams (b2, eps, weight_decay) shared"
+            )
     else:
         raise ValueError(
             "Expected `opt.lm_head_optimizer.type` to be one of "
-            "{'adamw', 'sgd_momentum'}, "
+            "{'adamw', 'sgd_momentum', 'adamw_b1'}, "
             f"got {lm_head_optimizer_type!r}."
         )
 
