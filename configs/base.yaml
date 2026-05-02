@@ -50,6 +50,10 @@ opt:
     nesterov: false
   lm_head_gradient_centering: 'off' # one of: off, pre, post
   lm_head_weighted_columnwise_gradient_centering: 'off' # one of: off, pre, post
+  lm_head_adaptive_tuc:
+    enabled: false
+    lambda_scale: 0.05
+    eps: ${opt.eps}
   loss_skip:
     enabled: false
     warmup_steps: 1000

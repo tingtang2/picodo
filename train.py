@@ -1095,67 +1095,12 @@ def train_and_evaluate(c: DictConfig):
         mask=wd_mask,
     )
 
-    def normalize_lm_head_centering_mode(raw_value, field_name):
-        if isinstance(raw_value, bool):
-            if raw_value:
-                raise ValueError(
-                    f"Expected `{field_name}` to be one of "
-                    "{'off', 'pre', 'post'} or legacy `false`, got `true`."
-                )
-            return "off"
-        mode = str(raw_value).lower()
-        if mode not in {"off", "pre", "post"}:
-            raise ValueError(
-                f"Expected `{field_name}` to be one of "
-                "{'off', 'pre', 'post'} or legacy `false`, "
-                f"got {raw_value!r}."
-            )
-        return mode
-
-    pre_transforms = []
-    post_transforms = []
-    output_embedding_mask = None
-
-    lm_head_gc_mode = normalize_lm_head_centering_mode(
-        getattr(c.opt, "lm_head_gradient_centering", "off"),
-        "opt.lm_head_gradient_centering",
+    pre_transforms, post_transforms, output_embedding_mask, lm_head_transform_logs = (
+        utils.build_lm_head_update_transforms(model, c.opt)
     )
-    if lm_head_gc_mode != "off":
-        output_embedding_mask = utils.build_output_embedding_mask(model)
-        lm_head_gc_tx = optax.masked(
-            utils.row_wise_mean_centering(),
-            output_embedding_mask,
-        )
-        if lm_head_gc_mode == "pre":
-            pre_transforms.append(lm_head_gc_tx)
-        else:
-            post_transforms.append(lm_head_gc_tx)
-        if jax.process_index() == 0:
-            print(
-                "lm-head row-wise gradient centering enabled: "
-                f"mode={lm_head_gc_mode}, target=token_embed_out.embedding"
-            )
-
-    lm_head_weighted_gc_mode = normalize_lm_head_centering_mode(
-        getattr(c.opt, "lm_head_weighted_columnwise_gradient_centering", "off"),
-        "opt.lm_head_weighted_columnwise_gradient_centering",
-    )
-    if lm_head_weighted_gc_mode != "off":
-        if output_embedding_mask is None:
-            output_embedding_mask = utils.build_output_embedding_mask(model)
-        lm_head_weighted_gc_tx = optax.masked(
-            utils.magnitude_weighted_column_wise_centering(),
-            output_embedding_mask,
-        )
-        if lm_head_weighted_gc_mode == "pre":
-            pre_transforms.append(lm_head_weighted_gc_tx)
-        else:
-            post_transforms.append(lm_head_weighted_gc_tx)
-        if jax.process_index() == 0:
-            print(
-                "lm-head weighted column-wise gradient centering enabled: "
-                f"mode={lm_head_weighted_gc_mode}, target=token_embed_out.embedding"
-            )
+    if jax.process_index() == 0:
+        for log_message in lm_head_transform_logs:
+            print(log_message)
 
     lm_head_optimizer_cfg = getattr(c.opt, "lm_head_optimizer", None)
     lm_head_optimizer_type = str(getattr(lm_head_optimizer_cfg, "type", "adamw")).lower()

@@ -67,6 +67,79 @@ def build_output_embedding_mask(model: nnx.Module):
     )
 
 
+def normalize_lm_head_centering_mode(raw_value, field_name: str) -> str:
+    if isinstance(raw_value, bool):
+        if raw_value:
+            raise ValueError(
+                f"Expected `{field_name}` to be one of "
+                "{'off', 'pre', 'post'} or legacy `false`, got `true`."
+            )
+        return "off"
+    mode = str(raw_value).lower()
+    if mode not in {"off", "pre", "post"}:
+        raise ValueError(
+            f"Expected `{field_name}` to be one of "
+            "{'off', 'pre', 'post'} or legacy `false`, "
+            f"got {raw_value!r}."
+        )
+    return mode
+
+
+def _row_wise_mean_center(update):
+    update_f32 = jnp.asarray(update, dtype=jnp.float32)
+    if update_f32.ndim != 2:
+        raise ValueError(
+            "Expected a rank-2 update matrix for row-wise centering, "
+            f"got shape={update_f32.shape}."
+        )
+    return update_f32 - jnp.mean(update_f32, axis=1, keepdims=True)
+
+
+def apply_row_wise_adaptive_tuc(update, param, lambda_scale: float, eps: float = 1e-8):
+    """Applies row-wise mean centering followed by an adaptive trust-region clip."""
+    update_f32 = _row_wise_mean_center(update)
+    param_f32 = jnp.asarray(param, dtype=jnp.float32)
+    if param_f32.ndim != 2:
+        raise ValueError(
+            "Expected a rank-2 parameter matrix for adaptive TUC, "
+            f"got shape={param_f32.shape}."
+        )
+    if update_f32.shape != param_f32.shape:
+        raise ValueError(
+            "Adaptive TUC requires update and parameter matrices with matching shapes, "
+            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+        )
+
+    weight_norm = jnp.linalg.norm(param_f32, axis=1, keepdims=True)
+    update_norm = jnp.linalg.norm(update_f32, axis=1, keepdims=True)
+    safe_update_norm = jnp.maximum(update_norm, jnp.asarray(eps, dtype=jnp.float32))
+    scale = jnp.minimum(1.0, jnp.asarray(lambda_scale, dtype=jnp.float32) * weight_norm / safe_update_norm)
+    return update_f32 * scale
+
+
+def apply_magnitude_weighted_column_wise_centering(update, param, eps: float = 1e-8):
+    """Zero-centers per-column drift, weighted by squared row norms of the params."""
+    update_f32 = jnp.asarray(update, dtype=jnp.float32)
+    param_f32 = jnp.asarray(param, dtype=jnp.float32)
+    if update_f32.ndim != 2 or param_f32.ndim != 2:
+        raise ValueError(
+            "Expected rank-2 matrices for weighted column-wise centering, "
+            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+        )
+    if update_f32.shape != param_f32.shape:
+        raise ValueError(
+            "Weighted column-wise centering requires matching update/parameter shapes, "
+            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+        )
+
+    total_drift = jnp.sum(update_f32, axis=0, keepdims=True)
+    sq_norms = jnp.sum(jnp.square(param_f32), axis=1, keepdims=True)
+    sq_norm_sum = jnp.sum(sq_norms)
+    uniform = jnp.full_like(sq_norms, 1.0 / sq_norms.shape[0])
+    proportions = jnp.where(sq_norm_sum > eps, sq_norms / sq_norm_sum, uniform)
+    return update_f32 - proportions * total_drift
+
+
 def row_wise_mean_centering() -> optax.GradientTransformation:
     """Subtracts the per-row mean from masked 2D updates."""
 
@@ -76,9 +149,7 @@ def row_wise_mean_centering() -> optax.GradientTransformation:
     def center_update(update):
         if isinstance(update, optax.MaskedNode):
             return update
-        update_f32 = update.astype(jnp.float32)
-        centered = update_f32 - jnp.mean(update_f32, axis=1, keepdims=True)
-        return centered.astype(update.dtype)
+        return _row_wise_mean_center(update).astype(update.dtype)
 
     def update_fn(updates, state, params=None):
         del params
@@ -92,6 +163,34 @@ def row_wise_mean_centering() -> optax.GradientTransformation:
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+def adaptive_tuc_row_wise(lambda_scale: float, eps: float = 1e-8) -> optax.GradientTransformation:
+    """Row-wise mean-centers masked 2D updates, then clips them to a weight-relative trust region."""
+    if lambda_scale < 0.0:
+        raise ValueError(f"Expected `lambda_scale` to be non-negative, got {lambda_scale}.")
+
+    def init_fn(_):
+        return optax.EmptyState()
+
+    def transform_update(update, param):
+        if isinstance(update, optax.MaskedNode) or isinstance(param, optax.MaskedNode):
+            return update
+        transformed = apply_row_wise_adaptive_tuc(update, param, lambda_scale=lambda_scale, eps=eps)
+        return transformed.astype(update.dtype)
+
+    def update_fn(updates, state, params=None):
+        if params is None:
+            raise ValueError("adaptive_tuc_row_wise requires `params` to compute row norms.")
+        transformed_updates = jax.tree_util.tree_map(
+            transform_update,
+            updates,
+            params,
+            is_leaf=lambda x: isinstance(x, optax.MaskedNode),
+        )
+        return transformed_updates, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def magnitude_weighted_column_wise_centering(eps: float = 1e-8) -> optax.GradientTransformation:
     """Zero-centers per-column drift, weighted by squared row norms of the params."""
 
@@ -101,17 +200,7 @@ def magnitude_weighted_column_wise_centering(eps: float = 1e-8) -> optax.Gradien
     def center_update(update, param):
         if isinstance(update, optax.MaskedNode) or isinstance(param, optax.MaskedNode):
             return update
-
-        update_f32 = update.astype(jnp.float32)
-        param_f32 = param.astype(jnp.float32)
-
-        total_drift = jnp.sum(update_f32, axis=0, keepdims=True)
-        sq_norms = jnp.sum(jnp.square(param_f32), axis=1, keepdims=True)
-        sq_norm_sum = jnp.sum(sq_norms)
-        uniform = jnp.full_like(sq_norms, 1.0 / sq_norms.shape[0])
-        proportions = jnp.where(sq_norm_sum > eps, sq_norms / sq_norm_sum, uniform)
-
-        centered = update_f32 - proportions * total_drift
+        centered = apply_magnitude_weighted_column_wise_centering(update, param, eps=eps)
         return centered.astype(update.dtype)
 
     def update_fn(updates, state, params=None):
@@ -128,6 +217,100 @@ def magnitude_weighted_column_wise_centering(eps: float = 1e-8) -> optax.Gradien
         return centered_updates, state
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+def apply_lm_head_output_update_post_transforms(update, param, opt_cfg):
+    """Applies the configured post-optimizer LM-head transforms to a single update matrix."""
+    transformed = jnp.asarray(update, dtype=jnp.float32)
+    lm_head_gc_mode = normalize_lm_head_centering_mode(
+        getattr(opt_cfg, "lm_head_gradient_centering", "off"),
+        "opt.lm_head_gradient_centering",
+    )
+    if lm_head_gc_mode == "post":
+        transformed = _row_wise_mean_center(transformed)
+
+    lm_head_weighted_gc_mode = normalize_lm_head_centering_mode(
+        getattr(opt_cfg, "lm_head_weighted_columnwise_gradient_centering", "off"),
+        "opt.lm_head_weighted_columnwise_gradient_centering",
+    )
+    if lm_head_weighted_gc_mode == "post":
+        transformed = apply_magnitude_weighted_column_wise_centering(transformed, param)
+
+    lm_head_adaptive_tuc_cfg = getattr(opt_cfg, "lm_head_adaptive_tuc", None)
+    if bool(getattr(lm_head_adaptive_tuc_cfg, "enabled", False)):
+        transformed = apply_row_wise_adaptive_tuc(
+            transformed,
+            param,
+            lambda_scale=float(getattr(lm_head_adaptive_tuc_cfg, "lambda_scale", 0.05)),
+            eps=float(getattr(lm_head_adaptive_tuc_cfg, "eps", getattr(opt_cfg, "eps", 1e-8))),
+        )
+
+    return transformed.astype(jnp.asarray(update).dtype)
+
+
+def build_lm_head_update_transforms(model: nnx.Module, opt_cfg):
+    pre_transforms = []
+    post_transforms = []
+    output_embedding_mask = None
+    log_messages = []
+
+    lm_head_gc_mode = normalize_lm_head_centering_mode(
+        getattr(opt_cfg, "lm_head_gradient_centering", "off"),
+        "opt.lm_head_gradient_centering",
+    )
+    if lm_head_gc_mode != "off":
+        output_embedding_mask = build_output_embedding_mask(model)
+        lm_head_gc_tx = optax.masked(
+            row_wise_mean_centering(),
+            output_embedding_mask,
+        )
+        if lm_head_gc_mode == "pre":
+            pre_transforms.append(lm_head_gc_tx)
+        else:
+            post_transforms.append(lm_head_gc_tx)
+        log_messages.append(
+            "lm-head row-wise gradient centering enabled: "
+            f"mode={lm_head_gc_mode}, target=token_embed_out.embedding"
+        )
+
+    lm_head_weighted_gc_mode = normalize_lm_head_centering_mode(
+        getattr(opt_cfg, "lm_head_weighted_columnwise_gradient_centering", "off"),
+        "opt.lm_head_weighted_columnwise_gradient_centering",
+    )
+    if lm_head_weighted_gc_mode != "off":
+        if output_embedding_mask is None:
+            output_embedding_mask = build_output_embedding_mask(model)
+        lm_head_weighted_gc_tx = optax.masked(
+            magnitude_weighted_column_wise_centering(),
+            output_embedding_mask,
+        )
+        if lm_head_weighted_gc_mode == "pre":
+            pre_transforms.append(lm_head_weighted_gc_tx)
+        else:
+            post_transforms.append(lm_head_weighted_gc_tx)
+        log_messages.append(
+            "lm-head weighted column-wise gradient centering enabled: "
+            f"mode={lm_head_weighted_gc_mode}, target=token_embed_out.embedding"
+        )
+
+    lm_head_adaptive_tuc_cfg = getattr(opt_cfg, "lm_head_adaptive_tuc", None)
+    lm_head_adaptive_tuc_enabled = bool(getattr(lm_head_adaptive_tuc_cfg, "enabled", False))
+    if lm_head_adaptive_tuc_enabled:
+        if output_embedding_mask is None:
+            output_embedding_mask = build_output_embedding_mask(model)
+        lambda_scale = float(getattr(lm_head_adaptive_tuc_cfg, "lambda_scale", 0.05))
+        adaptive_tuc_eps = float(getattr(lm_head_adaptive_tuc_cfg, "eps", getattr(opt_cfg, "eps", 1e-8)))
+        lm_head_adaptive_tuc_tx = optax.masked(
+            adaptive_tuc_row_wise(lambda_scale=lambda_scale, eps=adaptive_tuc_eps),
+            output_embedding_mask,
+        )
+        post_transforms.append(lm_head_adaptive_tuc_tx)
+        log_messages.append(
+            "lm-head adaptive TUC enabled: "
+            f"lambda_scale={lambda_scale}, eps={adaptive_tuc_eps}, target=token_embed_out.embedding"
+        )
+
+    return tuple(pre_transforms), tuple(post_transforms), output_embedding_mask, tuple(log_messages)
 
 
 def save_to_numpy(save_dir: str, name: str, data):
