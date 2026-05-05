@@ -89,6 +89,9 @@ opt:
 checkpoint:
   turn_on: true
   workdir: ""
+  gcp_bucket: null
+  load_path: null
+  step_prefix: null
   checkpoint_every_steps: 2000
   max_to_keep: 100
   start_step: null # pick a specific checkpoint to start off from

@@ -1,244 +1,545 @@
-import sys
+import gc
+import math
 import os
+import sys
+from collections import deque
+from functools import partial
+
+import hydra
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import orbax.checkpoint as ocp
+import wandb
+from flax import nnx
+from omegaconf import DictConfig, OmegaConf
+from orbax.checkpoint.checkpoint_managers import preservation_policy
+from tqdm.auto import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train import eval_step, get_mean_and_norm_output_logit, loss_fn
-import utils
 import data
 import model as model_lib
+import utils
 from configs import resolver_setup
-
-import jax
-import math
-from flax import nnx
-import optax
-from omegaconf import OmegaConf, DictConfig
-import hydra
-import orbax.checkpoint as ocp
-from orbax.checkpoint.checkpoint_managers import preservation_policy 
-import jax.numpy as jnp
-import numpy as np
-from tqdm.auto import tqdm
-import wandb
-import sys
-from functools import partial
-from collections import deque
+from train import (
+    _StandardNameFormatHNS,
+    _save_checkpoint,
+    _should_checkpoint,
+    eval_step,
+    train_step,
+    train_step_centered,
+    train_step_z_loss,
+    train_step_z_loss_centered,
+)
 
 
-@partial(jax.jit, static_argnames=('model_graphdef'))
+@partial(jax.jit, static_argnames=("model_graphdef",))
 def loss_fn_light(model_state, model_graphdef, x):
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
-    logits = model(x)
-    losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y)
-    losses = losses.at[:, -1].set(0)
+    logits = model(x, return_qkv=False).astype(jnp.float32)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
+    losses = losses[:, :-1]
     return losses.mean(), losses
 
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef'), donate_argnames=('opt_state',))
-def custom_train_step(opt_state, opt_graphdef, model_graphdef, batch):
-    (loss, raw_loss), grads = jax.value_and_grad(loss_fn_light, has_aux=True)(opt_state.model, model_graphdef, batch)
-    
-    optimizer = nnx.merge(opt_graphdef, opt_state)
-    optimizer.update(grads)
-    opt_state = nnx.state(optimizer)
-    
-    return opt_state, loss, raw_loss, grads
+@partial(jax.jit, static_argnames=("model_graphdef",))
+def get_loss_and_output_logit_mean(model_state, model_graphdef, x):
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis=1)
+    logits = model(x, return_qkv=False).astype(jnp.float32)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
+    losses = losses[:, :-1]
+    mean_output_logit = logits[:, :-1].mean()
+    return losses.mean(), mean_output_logit
 
 
-@hydra.main(version_base=None, config_path='../configs', config_name='base')
-def main(c: DictConfig):
-    OmegaConf.resolve(c)
-    print(OmegaConf.to_yaml(c))
+def _normalize_checkpoint_path(path: str) -> tuple[str, bool]:
+    normalized = str(path).rstrip("/")
+    if normalized.startswith("gs://"):
+        return normalized, True
+    if normalized.startswith("/") or normalized.startswith("./") or normalized.startswith("../"):
+        return normalized, False
+    return f"gs://{normalized}", True
 
-    # init distributed env if using multiple vms
-    jax.distributed.initialize()
-    
-    # get model and dataset rng seed
-    key = jax.random.key(c.seed)
-    key, key_model, key_dataset = jax.random.split(key, 3)
 
-    # sharding
-    num_fsdp_devices = jax.device_count() // c.num_tp_devices
-    mesh = jax.make_mesh((num_fsdp_devices, c.num_tp_devices), ('data', 'model'))
-    jax.set_mesh(mesh)
-    print('sharding mesh:', ', '.join(f'{k}={v}' for k, v in mesh.shape.items()))
+def _parse_checkpoint_load_path(load_path: str) -> tuple[str, int | None, str, bool]:
+    normalized_path, is_gcs = _normalize_checkpoint_path(load_path)
+    path_without_scheme = normalized_path[5:] if normalized_path.startswith("gs://") else normalized_path
+    parts = [part for part in path_without_scheme.split("/") if part]
+    if not parts:
+        raise ValueError(f"Invalid checkpoint.load_path: {load_path!r}")
 
-    # --- 1. Initialize Base Model ---
-    print('initializing base model...')
-    c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count()) # round V up to enable sharding
-    base_model = model_lib.create_sharded_model(c.model, key_model)
-    model_graphdef = nnx.graphdef(base_model)
-    
-    # get num. model parameters
-    n_params = {
-        'n_param_nonembed': 12 * c.model.L * c.model.D**2,
-        'n_param_embed': c.model.D * c.model.V,
-        'n_param_actual': utils.get_num_model_params(base_model),
-    }
-    for k, v in n_params.items():
-        print(f'{k}={v:_}')
-    
-    # dataset
-    if (c.num_tokens_train is None) and (c.tokens_params_ratio is not None):
-        c.num_tokens_train = c.tokens_params_ratio * (n_params['n_param_nonembed'] + n_params['n_param_embed'])
-    ds_train, ds_valid = data.load_ds(key_dataset, mesh, c.ds_path, c.model.T, c.opt.batch_size, c.num_tokens_valid, c.num_tokens_train)
-    if (c.num_tokens_train is None): c.num_tokens_train = ds_train.size
+    step_to_load = None
+    if parts[-1].isdigit():
+        step_to_load = int(parts[-1])
+        parts = parts[:-1]
 
-    print("Setting up structure to load base model checkpoint...")
-    
-    num_opt_steps = len(ds_train)
+    if not parts:
+        raise ValueError(
+            "checkpoint.load_path must include at least the checkpoint directory, "
+            f"got {load_path!r}."
+        )
+
+    ckpt_dir = "/".join(parts)
+    if is_gcs:
+        ckpt_dir = f"gs://{ckpt_dir}"
+    run_name = parts[-1]
+    return ckpt_dir, step_to_load, run_name, is_gcs
+
+
+def _resolve_checkpoint_source(c: DictConfig) -> tuple[str, str, int | None, bool]:
+    load_path = getattr(c.checkpoint, "load_path", None)
+    if load_path:
+        ckpt_dir, inferred_step, inferred_run_name, is_gcs = _parse_checkpoint_load_path(load_path)
+        run_name = c.run_name if c.run_name else inferred_run_name
+        step_to_load = (
+            c.checkpoint.start_step
+            if c.checkpoint.start_step is not None
+            else inferred_step
+        )
+        return run_name, ckpt_dir, step_to_load, is_gcs
+
+    run_name = c.run_name if c.run_name else "picodo_run"
+    gcp_bucket = getattr(c.checkpoint, "gcp_bucket", None)
+    if gcp_bucket:
+        normalized_bucket, _ = _normalize_checkpoint_path(gcp_bucket)
+        return run_name, f"{normalized_bucket.rstrip('/')}/{run_name}", c.checkpoint.start_step, True
+
+    return run_name, os.path.join(c.checkpoint.workdir, run_name), c.checkpoint.start_step, False
+
+
+def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
-    tokens_per_opt_step = c.opt.batch_size * c.model.T
-    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
-    wd_mask = utils.build_weight_decay_mask(base_model, c.opt.exclude_input_embedding_weight_decay)
-    tx = optax.inject_hyperparams(optax.adamw)(
+    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(
+        0,
+        c.opt.peak_lr,
+        warmup_steps,
+        num_opt_steps,
+    )
+
+    b2_schedule = None
+    b2_hparam = c.opt.b2
+    b2_cosine_cfg = getattr(c.opt, "b2_cosine_anneal", None)
+    if bool(getattr(b2_cosine_cfg, "enabled", False)):
+        final_b2 = float(getattr(b2_cosine_cfg, "final_b2", c.opt.b2))
+        b2_schedule = optax.schedules.warmup_cosine_decay_schedule(
+            init_value=c.opt.b2,
+            peak_value=c.opt.b2,
+            warmup_steps=0,
+            decay_steps=num_opt_steps,
+            end_value=final_b2,
+        )
+        b2_hparam = b2_schedule
+        if jax.process_index() == 0:
+            print(
+                "b2 cosine annealing enabled: "
+                f"start_b2={c.opt.b2}, final_b2={final_b2}, warmup_steps=0"
+            )
+
+    wd_mask = utils.build_weight_decay_mask(model, c.opt.exclude_input_embedding_weight_decay)
+    adamw_tx = optax.inject_hyperparams(optax.adamw)(
         lr_schedule,
         c.opt.b1,
-        c.opt.b2,
+        b2_hparam,
         eps=c.opt.eps,
         weight_decay=c.opt.weight_decay,
         mask=wd_mask,
     )
-    
+
+    pre_transforms, post_transforms, output_embedding_mask, lm_head_transform_logs = (
+        utils.build_lm_head_update_transforms(model, c.opt)
+    )
+    if jax.process_index() == 0:
+        for log_message in lm_head_transform_logs:
+            print(log_message)
+
+    lm_head_optimizer_cfg = getattr(c.opt, "lm_head_optimizer", None)
+    lm_head_optimizer_type = str(getattr(lm_head_optimizer_cfg, "type", "adamw")).lower()
+    if lm_head_optimizer_type == "adamw":
+        base_optimizer_tx = adamw_tx
+    elif lm_head_optimizer_type == "sgd_momentum":
+        if output_embedding_mask is None:
+            output_embedding_mask = utils.build_output_embedding_mask(model)
+        non_output_embedding_mask = jax.tree_util.tree_map(
+            lambda is_output_embedding: not is_output_embedding,
+            output_embedding_mask,
+        )
+        if wd_mask is None:
+            rest_wd_mask = non_output_embedding_mask
+        else:
+            rest_wd_mask = jax.tree_util.tree_map(
+                lambda use_wd, is_non_output_embedding: bool(use_wd and is_non_output_embedding),
+                wd_mask,
+                non_output_embedding_mask,
+            )
+
+        lm_head_sgd_tx = optax.inject_hyperparams(optax.sgd)(
+            learning_rate=lr_schedule,
+            momentum=float(getattr(lm_head_optimizer_cfg, "momentum", 0.9)),
+            nesterov=bool(getattr(lm_head_optimizer_cfg, "nesterov", False)),
+        )
+        rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+            mask=rest_wd_mask,
+        )
+        base_optimizer_tx = optax.chain(
+            optax.masked(rest_adamw_tx, non_output_embedding_mask),
+            optax.masked(lm_head_sgd_tx, output_embedding_mask),
+        )
+        if jax.process_index() == 0:
+            print(
+                "split lm-head optimizer enabled: "
+                "default=adamw, lm_head=sgd_momentum, "
+                f"momentum={float(getattr(lm_head_optimizer_cfg, 'momentum', 0.9))}, "
+                f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}"
+            )
+    elif lm_head_optimizer_type == "adamw_b1":
+        if output_embedding_mask is None:
+            output_embedding_mask = utils.build_output_embedding_mask(model)
+        non_output_embedding_mask = jax.tree_util.tree_map(
+            lambda is_output_embedding: not is_output_embedding,
+            output_embedding_mask,
+        )
+        if wd_mask is None:
+            rest_wd_mask = non_output_embedding_mask
+        else:
+            rest_wd_mask = jax.tree_util.tree_map(
+                lambda use_wd, is_non_output_embedding: bool(use_wd and is_non_output_embedding),
+                wd_mask,
+                non_output_embedding_mask,
+            )
+
+        lm_head_b1 = float(getattr(lm_head_optimizer_cfg, "b1", c.opt.b1))
+        lm_head_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            lm_head_b1,
+            b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+        )
+        rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+            mask=rest_wd_mask,
+        )
+        base_optimizer_tx = optax.chain(
+            optax.masked(rest_adamw_tx, non_output_embedding_mask),
+            optax.masked(lm_head_adamw_tx, output_embedding_mask),
+        )
+        if jax.process_index() == 0:
+            print(
+                "split lm-head optimizer enabled: "
+                f"default=adamw(b1={c.opt.b1}), "
+                f"lm_head=adamw(b1={lm_head_b1}); "
+                "all other hparams (b2, eps, weight_decay) shared"
+            )
+    else:
+        raise ValueError(
+            "Expected `opt.lm_head_optimizer.type` to be one of "
+            "{'adamw', 'sgd_momentum', 'adamw_b1'}, "
+            f"got {lm_head_optimizer_type!r}."
+        )
+
+    tx_chain = [*pre_transforms, base_optimizer_tx, *post_transforms]
+    tx = tx_chain[0] if len(tx_chain) == 1 else optax.chain(*tx_chain)
+
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:
-        tx = optax.chain(
-            optax.clip_by_global_norm(clip_by_global_norm), tx)
-    
-    optimizer = nnx.ModelAndOptimizer(base_model, tx)
-    opt_graphdef , opt_state = nnx.split(optimizer)
+        tx = optax.chain(optax.clip_by_global_norm(clip_by_global_norm), tx)
 
-    # set up checkpointing
-    start_step = 0
-    ckpt_mngr = None
-    base_abstract_opt_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, opt_state)
+    return tx, lr_schedule, b2_schedule
 
-    run_name = c.run_name if c.run_name else 'picodo_run'
-    ckpt_dir = os.path.join(c.checkpoint.workdir, run_name)
-    mngr_options = ocp.CheckpointManagerOptions(create=False)
-    ckpt_mngr = ocp.CheckpointManager(ckpt_dir, options=mngr_options)
-    
-    step_to_load = c.checkpoint.start_step if c.checkpoint.start_step is not None else ckpt_mngr.latest_step()
-    
-    if step_to_load is None:
-        raise ValueError(f"No checkpoint found in {ckpt_dir} to load base model from.")
-    start_step = step_to_load
-        
-    print(f"Restoring base model from step {step_to_load} in {ckpt_dir}...")
-    restored_data = ckpt_mngr.restore(step_to_load, args=ocp.args.Composite(state=ocp.args.StandardRestore(base_abstract_opt_state),
-            training_metadata=ocp.args.JsonRestore(),))
-    opt_state = restored_data['state']
-    start_step = restored_data['training_metadata']['step']
-    print(f'Successfully restored checkpoint. Resuming from step {start_step}.')
-    
-    model = nnx.merge(model_graphdef, opt_state.model)
-    print("Setting up optimizer for continued training...")
-    num_opt_steps = len(ds_train)
-    warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
-    tokens_per_opt_step = c.opt.batch_size * c.model.T
-    
-    new_ckpt_mngr = None
-    if c.checkpoint.turn_on:
-        # Use a suffix or different run name for the bias tuning run
-        bias_run_name = f"{run_name}_reverse_bad_checkpoints_only_{c.opt.peak_lr}"
-        new_ckpt_dir = os.path.join(c.checkpoint.workdir, bias_run_name)
-        
-        mngr_options = ocp.CheckpointManagerOptions(
-            create=True,
-            preservation_policy=preservation_policy.LatestN(c.checkpoint.max_to_keep)
+
+def _restore_start_step(step_to_load: int, training_metadata: dict) -> int:
+    meta_step = training_metadata.get("step")
+    meta_next_step = training_metadata.get("next_step")
+    if meta_next_step is not None:
+        return meta_next_step
+    if meta_step is not None:
+        if meta_step == step_to_load + 1:
+            return meta_step
+        if meta_step == step_to_load:
+            return meta_step + 1
+        print(
+            "Warning: checkpoint metadata step does not match checkpoint id "
+            f"(metadata step={meta_step}, checkpoint id={step_to_load}). "
+            "Falling back to resume from checkpoint id + 1."
         )
-        
-        new_ckpt_mngr = ocp.CheckpointManager(new_ckpt_dir, options=mngr_options)
-        print(f"New checkpoints will be saved to: {new_ckpt_dir}")
+        return step_to_load + 1
+    print(
+        "Warning: checkpoint metadata missing step/next_step; "
+        "falling back to resume from checkpoint id + 1."
+    )
+    return step_to_load + 1
 
-    # Initialize model with optimizer state
-    model = nnx.merge(model_graphdef, opt_state.model)
-    
-    # start wandb
+
+def _run_current_train_step(c, opt_state, opt_graphdef, model_graphdef, batch):
+    collect_qkv_stats = False
+    mucentering = bool(getattr(c.opt, "mucentering", False))
+    if c.opt.use_z_loss:
+        if mucentering:
+            return train_step_z_loss_centered(
+                opt_state,
+                opt_graphdef,
+                model_graphdef,
+                batch,
+                collect_qkv_stats,
+            )
+        return train_step_z_loss(
+            opt_state,
+            opt_graphdef,
+            model_graphdef,
+            batch,
+            collect_qkv_stats,
+        )
+    if mucentering:
+        return train_step_centered(
+            opt_state,
+            opt_graphdef,
+            model_graphdef,
+            batch,
+            collect_qkv_stats,
+        )
+    return train_step(
+        opt_state,
+        opt_graphdef,
+        model_graphdef,
+        batch,
+        collect_qkv_stats,
+    )
+
+
+@hydra.main(version_base=None, config_path="../configs", config_name="base")
+def main(c: DictConfig):
+    OmegaConf.resolve(c)
+    print(OmegaConf.to_yaml(c))
+
+    jax.distributed.initialize()
+
+    key = jax.random.key(c.seed)
+    key, key_model, key_dataset = jax.random.split(key, 3)
+
+    num_fsdp_devices = jax.device_count() // c.num_tp_devices
+    mesh = jax.make_mesh((num_fsdp_devices, c.num_tp_devices), ("data", "model"))
+    jax.set_mesh(mesh)
+    print("sharding mesh:", ", ".join(f"{k}={v}" for k, v in mesh.shape.items()))
+
+    print("initializing base model...")
+    c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count())
+    model = model_lib.create_sharded_model(c.model, key_model)
+    model_graphdef = nnx.graphdef(model)
+
+    n_params = {
+        "n_param_nonembed": 12 * c.model.L * c.model.D**2,
+        "n_param_embed": c.model.D * c.model.V,
+        "n_param_actual": utils.get_num_model_params(model),
+    }
+    for k, v in n_params.items():
+        print(f"{k}={v:_}")
+
+    if (c.num_tokens_train is None) and (c.tokens_params_ratio is not None):
+        c.num_tokens_train = c.tokens_params_ratio * (
+            n_params["n_param_nonembed"] + n_params["n_param_embed"]
+        )
+    ds_train, ds_valid = data.load_ds(
+        key_dataset,
+        mesh,
+        c.ds_path,
+        c.model.T,
+        c.opt.batch_size,
+        c.num_tokens_valid,
+        c.num_tokens_train,
+    )
+    if c.num_tokens_train is None:
+        c.num_tokens_train = ds_train.size
+
+    num_opt_steps = len(ds_train)
+    tokens_per_opt_step = c.opt.batch_size * c.model.T
+    tx, lr_schedule, b2_schedule = _build_optimizer(c, model, num_opt_steps)
+    optimizer = nnx.ModelAndOptimizer(model, tx)
+    opt_graphdef, opt_state = nnx.split(optimizer)
+    del optimizer
+    del model
+
+    abstract_opt_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, opt_state)
+    run_name, load_ckpt_dir, requested_step_to_load, load_from_gcs = _resolve_checkpoint_source(c)
+    step_prefix = getattr(c.checkpoint, "step_prefix", None)
+    if load_from_gcs:
+        restore_options = ocp.CheckpointManagerOptions(
+            create=False,
+            step_name_format=_StandardNameFormatHNS(step_prefix=step_prefix),
+        )
+    else:
+        restore_options = ocp.CheckpointManagerOptions(create=False)
+    restore_mngr = ocp.CheckpointManager(load_ckpt_dir, options=restore_options)
+
+    step_to_load = (
+        requested_step_to_load
+        if requested_step_to_load is not None
+        else restore_mngr.latest_step()
+    )
+    if step_to_load is None:
+        raise ValueError(f"No checkpoint found in {load_ckpt_dir} to load base model from.")
+
+    print(f"Restoring base model from step {step_to_load} in {load_ckpt_dir}...")
+    restored_data = restore_mngr.restore(
+        step_to_load,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(abstract_opt_state),
+            training_metadata=ocp.args.JsonRestore(),
+        ),
+    )
+    opt_state = restored_data["state"]
+    start_step = _restore_start_step(step_to_load, restored_data.get("training_metadata", {}))
+    del restored_data
+    del abstract_opt_state
+    gc.collect()
+    restore_mngr.close()
+    print(f"Successfully restored checkpoint. Resuming from step {start_step}.")
+
+    save_ckpt_mngr = None
+    if c.checkpoint.turn_on:
+        if not c.checkpoint.workdir:
+            raise ValueError("checkpoint.workdir must be set when checkpoint.turn_on is True.")
+        reverse_run_name = f"{run_name}_reverse_bad_checkpoints_only_{c.opt.peak_lr}"
+        save_ckpt_dir = os.path.join(c.checkpoint.workdir, reverse_run_name)
+        save_options = ocp.CheckpointManagerOptions(
+            create=True,
+            preservation_policy=preservation_policy.LatestN(c.checkpoint.max_to_keep),
+        )
+        save_ckpt_mngr = ocp.CheckpointManager(save_ckpt_dir, options=save_options)
+        print(f"New checkpoints will be saved to: {save_ckpt_dir}")
+
     if jax.process_index() == 0:
-        wandb.init(project=c.wandb_project, config=utils.flatten_dict(c), mode=c.wandb_mode, name=f"{run_name}_reverse_checkpoint_{c.opt.peak_lr}")
-        wandb.summary.update(n_params) # Logs original params, maybe should log bias count too
-    
+        wandb.init(
+            project=c.wandb_project,
+            config=utils.flatten_dict(c),
+            mode=c.wandb_mode,
+            name=f"{run_name}_reverse_checkpoint_{c.opt.peak_lr}",
+        )
+        wandb.summary.update(n_params)
+
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
 
-    pbar = range(start_step, num_opt_steps)
-    if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
-    last_opt_states = deque(maxlen=3)
-    last_train_losses = deque(maxlen=3)
-    for step in pbar:
-        # training step
-        snapshot_state = jax.tree_util.tree_map(np.asarray, jax.device_get(opt_state))  # keep snapshot on host (CPU) to save HBM
-        # avoid duplicate snapshots
-        if (len(last_opt_states) == 0) or (not jax.tree_util.tree_reduce(
-                lambda a, b: a and b,
-                jax.tree_util.tree_map(lambda x, y: np.array_equal(x, y), snapshot_state, last_opt_states[-1]),
-                True)):
-            last_opt_states.append(snapshot_state)
-        opt_state, batch_loss, train_raw_loss, grads = custom_train_step(opt_state, opt_graphdef, model_graphdef, ds_train[step])
+    eval_every_steps = int(getattr(c, "eval_every_steps", 100))
+    skip_bad_batch = bool(getattr(c, "skip_bad_batch", False))
+    revert_idx = int(getattr(c, "revert_idx", -1))
+    rollback_buffer_len = max(revert_idx + 1, 1) if revert_idx >= 0 else max(abs(revert_idx), 1)
 
-        # logging
-        metrics = {}
-        metrics['train_loss'] = batch_loss
-        metrics['train_loss_after_update'] = loss_fn_light(opt_state.model, model_graphdef, ds_train[step])[0]
-        metrics['train_med_loss'] = jnp.median(train_raw_loss)
-        metrics['train_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(train_raw_loss)
-        metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
-        metrics['train_output_logit_mean'] = get_mean_and_norm_output_logit(opt_state.model, model_graphdef, ds_train[step])[0]
-        metrics['lr'] = lr_schedule(step)
-        if len(last_opt_states) > len(last_train_losses):
-            last_train_losses.append(float(metrics['train_loss_after_update']))
-        # metrics.update(utils.get_layer_grad_norms(grads))
-        # metrics.update(utils.get_layer_weight_norms(opt_state.model))
-        # metrics.update(utils.get_layer_moment_norms(opt_state))
+    pbar = range(start_step, num_opt_steps)
+    if jax.process_index() == 0:
+        pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
+
+    last_opt_states = deque(maxlen=rollback_buffer_len)
+    for step in pbar:
+        batch = ds_train[step]
+        if skip_bad_batch:
+            snapshot_state = jax.tree_util.tree_map(np.asarray, jax.device_get(opt_state))
+            last_opt_states.append(snapshot_state)
+
+        opt_state, objective_loss, (train_raw_loss, _), _grads = _run_current_train_step(
+            c,
+            opt_state,
+            opt_graphdef,
+            model_graphdef,
+            batch,
+        )
+
+        train_loss_before_update = train_raw_loss.mean()
+        train_loss_after_update, output_logit_mean = get_loss_and_output_logit_mean(
+            opt_state.model,
+            model_graphdef,
+            batch,
+        )
+
+        metrics = {
+            "train_loss": train_loss_before_update,
+            "train_objective_loss": objective_loss,
+            "train_loss_after_update": train_loss_after_update,
+            "train_med_loss": jnp.median(train_raw_loss),
+            "train_lower_90th_mean_loss": utils.compute_lower_90th_percentile_mean(train_raw_loss),
+            "train_tokens_seen": (step + 1) * tokens_per_opt_step,
+            "train_output_logit_mean": output_logit_mean,
+            "lr": lr_schedule(step),
+        }
+        if b2_schedule is not None:
+            metrics["b2"] = b2_schedule(step)
 
         if jax.process_index() == 0:
             wandb.log(metrics, step)
-            pbar.set_postfix_str(f'loss={metrics["train_loss"]:.2f}')
-    
-        if (
-            (metrics['train_loss_after_update'] - metrics['train_loss']) / (metrics['train_loss'] + 1e-6) > 0.5
-            and len(last_opt_states) > 0
-            and c.skip_bad_batch
-        ):
-            # pick the lowest-loss snapshot among the buffered ones
-            # best_idx = int(np.argmin(np.array(last_train_losses)))
-            best_idx = c.revert_idx
-            rollback_state = list(last_opt_states)[best_idx]
+            pbar.set_postfix_str(f"loss={float(train_loss_before_update):.2f}")
+
+        relative_loss_jump = (
+            (train_loss_after_update - train_loss_before_update)
+            / (train_loss_before_update + 1e-6)
+        )
+        if relative_loss_jump > 0.5 and len(last_opt_states) > 0 and skip_bad_batch:
+            rollback_state = list(last_opt_states)[revert_idx]
             opt_state = jax.tree_util.tree_map(
-                lambda arr, ref: jax.device_put(arr, ref.sharding) if hasattr(ref, "sharding") else jax.device_put(arr),
+                lambda arr, ref: (
+                    jax.device_put(arr, ref.sharding)
+                    if hasattr(ref, "sharding")
+                    else jax.device_put(arr)
+                ),
                 rollback_state,
                 opt_state,
             )
             if jax.process_index() == 0:
-                pct_jump = 100.0 * (float(metrics['train_loss_after_update'] - metrics['train_loss']) / (float(metrics['train_loss']) + 1e-6))
-                print(f"Reversed optimizer update at step {step} due to train loss jump of {pct_jump:.1f}%")
-            
-        # eval and checkpointing
-        if step % c.eval_every_steps == 0:
-            eval_loss, eval_raw_loss, eval_logits, mean_eval_output_logit = eval_step(c, opt_state.model, model_graphdef, ds_valid)
+                pct_jump = 100.0 * float(relative_loss_jump)
+                print(
+                    f"Reversed optimizer update at step {step} due to train loss jump of "
+                    f"{pct_jump:.1f}%"
+                )
+
+        if step % eval_every_steps == 0:
+            (
+                eval_loss,
+                eval_raw_loss,
+                _eval_logits,
+                mean_eval_output_logit,
+                _mean_eval_output_logit_std,
+                _mean_eval_output_logit_entropy,
+            ) = eval_step(
+                c,
+                opt_state.model,
+                model_graphdef,
+                ds_valid,
+                collect_qkv_stats=False,
+            )
             flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
-            metrics = {}
-            metrics['eval_loss'] = eval_loss
-            metrics['eval_output_logit_mean'] = mean_eval_output_logit
-            metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
-            metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
-            metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
+            eval_metrics = {
+                "eval_loss": eval_loss,
+                "eval_output_logit_mean": mean_eval_output_logit,
+                "eval_med_loss": jnp.median(flattened_eval_raw_loss),
+                "eval_lower_90th_mean_loss": utils.compute_lower_90th_percentile_mean(
+                    flattened_eval_raw_loss
+                ),
+                "train_tokens_seen": (step + 1) * tokens_per_opt_step,
+            }
             if jax.process_index() == 0:
-                wandb.log(metrics, step)
+                wandb.log(eval_metrics, step)
 
-        if c.checkpoint.turn_on and step % c.checkpoint.checkpoint_every_steps == 0:
-            new_ckpt_mngr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(opt_state), training_metadata=ocp.args.JsonSave({
-                'step': step + 1})), force=True)
-    
-    if num_opt_steps != len(ds_train):
-        print('exiting early')
+        if save_ckpt_mngr is not None and _should_checkpoint(c, step):
+            _save_checkpoint(save_ckpt_mngr, step, opt_state)
+
+    if jax.process_index() == 0:
         wandb.finish()
-        if new_ckpt_mngr: new_ckpt_mngr.close()
-        sys.exit(1)
+    if save_ckpt_mngr is not None:
+        save_ckpt_mngr.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
