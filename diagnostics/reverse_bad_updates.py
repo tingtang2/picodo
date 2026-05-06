@@ -58,6 +58,35 @@ def get_loss_and_output_logit_mean(model_state, model_graphdef, x):
     return losses.mean(), mean_output_logit
 
 
+def _compute_rolling_zscore_skip(history, value: float, threshold: float):
+    if history.maxlen is None:
+        raise ValueError("Rolling z-score history must have a finite maxlen.")
+
+    if len(history) < history.maxlen:
+        return False, {
+            "skip_detector_ready": 0.0,
+            "skip_detector_value": float(value),
+            "skip_detector_mean": 0.0,
+            "skip_detector_std": 0.0,
+            "skip_detector_zscore": 0.0,
+            "skip_detector_threshold": float(threshold),
+        }
+
+    window = np.asarray(history, dtype=np.float64)
+    mean = float(np.mean(window))
+    std = float(np.std(window))
+    zscore = 0.0 if std <= 0.0 else abs(float(value) - mean) / std
+    should_skip = std > 0.0 and zscore >= threshold
+    return should_skip, {
+        "skip_detector_ready": 1.0,
+        "skip_detector_value": float(value),
+        "skip_detector_mean": mean,
+        "skip_detector_std": std,
+        "skip_detector_zscore": zscore,
+        "skip_detector_threshold": float(threshold),
+    }
+
+
 def _normalize_checkpoint_path(path: str) -> tuple[str, bool]:
     normalized = str(path).rstrip("/")
     if normalized.startswith("gs://"):
@@ -437,7 +466,17 @@ def main(c: DictConfig):
     eval_every_steps = int(getattr(c, "eval_every_steps", 100))
     skip_bad_batch = bool(getattr(c, "skip_bad_batch", False))
     revert_idx = int(getattr(c, "revert_idx", -1))
+    skip_bad_batch_metric = str(getattr(c, "skip_bad_batch_metric", "relative_jump")).lower()
+    skip_bad_batch_relative_threshold = float(getattr(c, "skip_bad_batch_relative_threshold", 0.5))
+    skip_bad_batch_window = int(getattr(c, "skip_bad_batch_window", 1000))
+    skip_bad_batch_z_threshold = float(getattr(c, "skip_bad_batch_z_threshold", 7.0))
     rollback_buffer_len = max(revert_idx + 1, 1) if revert_idx >= 0 else max(abs(revert_idx), 1)
+    rolling_skip_history = deque(maxlen=skip_bad_batch_window)
+    if skip_bad_batch_metric not in {"relative_jump", "rolling_zscore"}:
+        raise ValueError(
+            "skip_bad_batch_metric must be one of {'relative_jump', 'rolling_zscore'}, "
+            f"got {skip_bad_batch_metric!r}."
+        )
 
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0:
@@ -478,15 +517,39 @@ def main(c: DictConfig):
         if b2_schedule is not None:
             metrics["b2"] = b2_schedule(step)
 
-        if jax.process_index() == 0:
-            wandb.log(metrics, step)
-            pbar.set_postfix_str(f"loss={float(train_loss_before_update):.2f}")
-
         relative_loss_jump = (
             (train_loss_after_update - train_loss_before_update)
             / (train_loss_before_update + 1e-6)
         )
-        if relative_loss_jump > 0.5 and len(last_opt_states) > 0 and skip_bad_batch:
+        rollback_ready = len(last_opt_states) >= rollback_buffer_len
+        should_skip = False
+        metrics["skip_bad_batch_metric"] = 0.0 if skip_bad_batch_metric == "relative_jump" else 1.0
+        metrics["skip_bad_batch_relative_jump"] = relative_loss_jump
+
+        if skip_bad_batch_metric == "relative_jump":
+            metrics["skip_detector_ready"] = 1.0
+            metrics["skip_detector_value"] = relative_loss_jump
+            metrics["skip_detector_mean"] = 0.0
+            metrics["skip_detector_std"] = 0.0
+            metrics["skip_detector_zscore"] = 0.0
+            metrics["skip_detector_threshold"] = skip_bad_batch_relative_threshold
+            should_skip = bool(relative_loss_jump > skip_bad_batch_relative_threshold)
+        else:
+            should_skip, rolling_metrics = _compute_rolling_zscore_skip(
+                rolling_skip_history,
+                float(train_loss_after_update),
+                skip_bad_batch_z_threshold,
+            )
+            metrics.update(rolling_metrics)
+
+        metrics["skip_bad_batch_triggered"] = float(skip_bad_batch and should_skip)
+        metrics["skip_bad_batch_rollback_ready"] = float(rollback_ready)
+
+        if jax.process_index() == 0:
+            wandb.log(metrics, step)
+            pbar.set_postfix_str(f"loss={float(train_loss_before_update):.2f}")
+
+        if should_skip and rollback_ready and skip_bad_batch:
             rollback_state = list(last_opt_states)[revert_idx]
             opt_state = jax.tree_util.tree_map(
                 lambda arr, ref: (
@@ -498,11 +561,20 @@ def main(c: DictConfig):
                 opt_state,
             )
             if jax.process_index() == 0:
-                pct_jump = 100.0 * float(relative_loss_jump)
-                print(
-                    f"Reversed optimizer update at step {step} due to train loss jump of "
-                    f"{pct_jump:.1f}%"
-                )
+                if skip_bad_batch_metric == "relative_jump":
+                    pct_jump = 100.0 * float(relative_loss_jump)
+                    print(
+                        f"Reversed optimizer update at step {step} due to train loss jump of "
+                        f"{pct_jump:.1f}%"
+                    )
+                else:
+                    print(
+                        f"Reversed optimizer update at step {step} due to rolling loss z-score "
+                        f"{float(metrics['skip_detector_zscore']):.2f} "
+                        f"(threshold={float(metrics['skip_detector_threshold']):.2f})"
+                    )
+        elif skip_bad_batch_metric == "rolling_zscore":
+            rolling_skip_history.append(float(train_loss_after_update))
 
         if step % eval_every_steps == 0:
             (

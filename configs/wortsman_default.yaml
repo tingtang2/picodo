@@ -19,6 +19,12 @@ run_name: null
 num_tp_devices: 1 # optional tensor parallelism
 log_logit_grad_stats: false
 log_logit_grad_scaling_stats: false
+skip_bad_batch: false
+skip_bad_batch_metric: relative_jump
+skip_bad_batch_relative_threshold: 0.5
+skip_bad_batch_window: 1000
+skip_bad_batch_z_threshold: 7.0
+revert_idx: -1
 
 model:
   D: null # model/embed/qkv dim
