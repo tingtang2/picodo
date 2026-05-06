@@ -142,6 +142,13 @@ def _resolve_checkpoint_source(c: DictConfig) -> tuple[str, str, int | None, boo
     return run_name, os.path.join(c.checkpoint.workdir, run_name), c.checkpoint.start_step, False
 
 
+def _checkpoint_restore_explicitly_requested(c: DictConfig) -> bool:
+    return (
+        getattr(c.checkpoint, "load_path", None) is not None
+        or getattr(c.checkpoint, "start_step", None) is not None
+    )
+
+
 def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(
@@ -404,6 +411,7 @@ def main(c: DictConfig):
 
     abstract_opt_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, opt_state)
     run_name, load_ckpt_dir, requested_step_to_load, load_from_gcs = _resolve_checkpoint_source(c)
+    explicit_restore_request = _checkpoint_restore_explicitly_requested(c)
     step_prefix = getattr(c.checkpoint, "step_prefix", None)
     if load_from_gcs:
         restore_options = ocp.CheckpointManagerOptions(
@@ -420,23 +428,27 @@ def main(c: DictConfig):
         else restore_mngr.latest_step()
     )
     if step_to_load is None:
-        raise ValueError(f"No checkpoint found in {load_ckpt_dir} to load base model from.")
-
-    print(f"Restoring base model from step {step_to_load} in {load_ckpt_dir}...")
-    restored_data = restore_mngr.restore(
-        step_to_load,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardRestore(abstract_opt_state),
-            training_metadata=ocp.args.JsonRestore(),
-        ),
-    )
-    opt_state = restored_data["state"]
-    start_step = _restore_start_step(step_to_load, restored_data.get("training_metadata", {}))
-    del restored_data
+        restore_mngr.close()
+        if explicit_restore_request:
+            raise ValueError(f"No checkpoint found in {load_ckpt_dir} to load base model from.")
+        start_step = 0
+        print(f"No checkpoint found in {load_ckpt_dir}. Starting from scratch.")
+    else:
+        print(f"Restoring base model from step {step_to_load} in {load_ckpt_dir}...")
+        restored_data = restore_mngr.restore(
+            step_to_load,
+            args=ocp.args.Composite(
+                state=ocp.args.StandardRestore(abstract_opt_state),
+                training_metadata=ocp.args.JsonRestore(),
+            ),
+        )
+        opt_state = restored_data["state"]
+        start_step = _restore_start_step(step_to_load, restored_data.get("training_metadata", {}))
+        del restored_data
+        restore_mngr.close()
+        print(f"Successfully restored checkpoint. Resuming from step {start_step}.")
     del abstract_opt_state
     gc.collect()
-    restore_mngr.close()
-    print(f"Successfully restored checkpoint. Resuming from step {start_step}.")
 
     save_ckpt_mngr = None
     if c.checkpoint.turn_on:
