@@ -1066,6 +1066,24 @@ def train_and_evaluate(c: DictConfig):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
+
+    # LM-head-only peak LR override. When opt.lm_head_optimizer.peak_lr is set,
+    # the LM head receives a separate warmup-cosine schedule with the same shape
+    # as the trunk schedule but a different peak value. Only takes effect under
+    # split-optimizer modes (sgd_momentum, adamw_b1); ignored under unified
+    # adamw mode.
+    _lm_head_optimizer_cfg_for_lr = getattr(c.opt, "lm_head_optimizer", None)
+    _lm_head_peak_lr_override = None
+    if _lm_head_optimizer_cfg_for_lr is not None:
+        _raw_lm_head_peak_lr = getattr(_lm_head_optimizer_cfg_for_lr, "peak_lr", None)
+        if _raw_lm_head_peak_lr is not None:
+            _lm_head_peak_lr_override = float(_raw_lm_head_peak_lr)
+    if _lm_head_peak_lr_override is not None:
+        lm_head_lr_schedule = optax.schedules.warmup_cosine_decay_schedule(
+            0, _lm_head_peak_lr_override, warmup_steps, num_opt_steps
+        )
+    else:
+        lm_head_lr_schedule = lr_schedule
     b2_schedule = None
     b2_hparam = c.opt.b2
     b2_cosine_cfg = getattr(c.opt, "b2_cosine_anneal", None)
@@ -1123,7 +1141,7 @@ def train_and_evaluate(c: DictConfig):
             )
 
         lm_head_sgd_tx = optax.inject_hyperparams(optax.sgd)(
-            learning_rate=lr_schedule,
+            learning_rate=lm_head_lr_schedule,
             momentum=float(getattr(lm_head_optimizer_cfg, "momentum", 0.9)),
             nesterov=bool(getattr(lm_head_optimizer_cfg, "nesterov", False)),
         )
@@ -1140,11 +1158,17 @@ def train_and_evaluate(c: DictConfig):
             optax.masked(lm_head_sgd_tx, output_embedding_mask),
         )
         if jax.process_index() == 0:
+            _lm_head_lr_log = (
+                f"peak_lr={_lm_head_peak_lr_override} (override)"
+                if _lm_head_peak_lr_override is not None
+                else f"peak_lr={c.opt.peak_lr} (shared with trunk)"
+            )
             print(
                 "split lm-head optimizer enabled: "
                 "default=adamw, lm_head=sgd_momentum, "
                 f"momentum={float(getattr(lm_head_optimizer_cfg, 'momentum', 0.9))}, "
-                f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}"
+                f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}, "
+                f"lm_head_{_lm_head_lr_log}"
             )
     elif lm_head_optimizer_type == "adamw_b1":
         if output_embedding_mask is None:
@@ -1165,7 +1189,7 @@ def train_and_evaluate(c: DictConfig):
         lm_head_b1 = float(getattr(lm_head_optimizer_cfg, "b1", c.opt.b1))
 
         lm_head_adamw_tx = optax.inject_hyperparams(optax.adamw)(
-            lr_schedule,
+            lm_head_lr_schedule,
             lm_head_b1,
             b2_hparam,
             eps=c.opt.eps,
@@ -1184,10 +1208,15 @@ def train_and_evaluate(c: DictConfig):
             optax.masked(lm_head_adamw_tx, output_embedding_mask),
         )
         if jax.process_index() == 0:
+            _lm_head_lr_log = (
+                f"peak_lr={_lm_head_peak_lr_override} (override)"
+                if _lm_head_peak_lr_override is not None
+                else f"peak_lr={c.opt.peak_lr} (shared with trunk)"
+            )
             print(
                 "split lm-head optimizer enabled: "
                 f"default=adamw(b1={c.opt.b1}), "
-                f"lm_head=adamw(b1={lm_head_b1}); "
+                f"lm_head=adamw(b1={lm_head_b1}, {_lm_head_lr_log}); "
                 "all other hparams (b2, eps, weight_decay) shared"
             )
     else:
