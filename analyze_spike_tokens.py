@@ -62,6 +62,7 @@ def main(c: DictConfig):
     key = jax.random.key(c.seed)
     key, key_model, key_dataset = jax.random.split(key, 3)
 
+    utils.sync_lm_head_oblique_model_config(c)
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count())
     print(f"Model vocab size rounded to: {c.model.V}")
 

@@ -108,6 +108,7 @@ def main(c: DictConfig):
 
     # --- 1. Initialize Base Model ---
     print('initializing base model...')
+    utils.sync_lm_head_oblique_model_config(c)
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count()) # round V up to enable sharding
     base_model = model_lib.create_sharded_model(c.model, key_model)
     

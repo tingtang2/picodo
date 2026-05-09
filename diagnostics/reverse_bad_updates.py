@@ -298,7 +298,7 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
             )
 
         lm_head_momentum = float(getattr(lm_head_optimizer_cfg, "momentum", 0.9))
-        lm_head_target_rms = utils.get_lm_head_oblique_target_rms(c.opt)
+        lm_head_target_rms = utils.get_lm_head_oblique_optimizer_target_rms(c.opt)
         lm_head_oblique_eps = float(getattr(lm_head_optimizer_cfg, "eps", c.opt.eps))
         lm_head_oblique_tx = optax.chain(
             utils.scale_by_ema_momentum(lm_head_momentum),
@@ -329,6 +329,7 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
                 "split lm-head optimizer enabled: "
                 f"default=adamw, lm_head={lm_head_optimizer_type}, "
                 f"momentum={lm_head_momentum}, scaled_target_norm={lm_head_target_rms}, "
+                f"learn_target_rms={utils.lm_head_uses_learned_target_rms(c.opt)}, "
                 f"eps={lm_head_oblique_eps}, weight_decay=off_for_lm_head"
             )
     else:
@@ -423,22 +424,27 @@ def main(c: DictConfig):
     print("sharding mesh:", ", ".join(f"{k}={v}" for k, v in mesh.shape.items()))
 
     print("initializing base model...")
+    utils.sync_lm_head_oblique_model_config(c)
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count())
     model = model_lib.create_sharded_model(c.model, key_model)
     utils.validate_row_oblique_lm_head_options(c.opt)
     lm_head_optimizer_type = utils.get_lm_head_optimizer_type(c.opt)
     if lm_head_optimizer_type in {"row_oblique", "column_oblique"}:
-        lm_head_target_rms = utils.get_lm_head_oblique_target_rms(c.opt)
+        lm_head_target_rms = utils.get_lm_head_oblique_optimizer_target_rms(c.opt)
+        initial_target_rms = utils.get_lm_head_oblique_initial_target_rms(c.opt)
+        learn_target_rms = utils.lm_head_uses_learned_target_rms(c.opt)
         if lm_head_optimizer_type == "row_oblique":
             model_lib.row_normalize_output_embeddings(
                 model,
                 target_rms=lm_head_target_rms,
                 eps=float(getattr(getattr(c.opt, "lm_head_optimizer", None), "eps", c.opt.eps)),
             )
-            actual_row_l2 = float(np.sqrt(c.model.D / c.model.V) * lm_head_target_rms)
+            actual_row_l2 = float(np.sqrt(c.model.D / c.model.V) * initial_target_rms)
             init_log_message = (
                 "row-oblique lm-head initialization enabled: "
-                f"scaled_target_norm={lm_head_target_rms}, actual_row_l2={actual_row_l2:.6g}"
+                f"scaled_target_norm={lm_head_target_rms}, "
+                f"learn_target_rms={learn_target_rms}, initial_target_rms={initial_target_rms}, "
+                f"initial_actual_row_l2={actual_row_l2:.6g}"
             )
         else:
             model_lib.column_normalize_output_embeddings(
@@ -446,10 +452,12 @@ def main(c: DictConfig):
                 target_rms=lm_head_target_rms,
                 eps=float(getattr(getattr(c.opt, "lm_head_optimizer", None), "eps", c.opt.eps)),
             )
-            actual_col_l2 = float(np.sqrt(c.model.V / c.model.D) * lm_head_target_rms)
+            actual_col_l2 = float(np.sqrt(c.model.V / c.model.D) * initial_target_rms)
             init_log_message = (
                 "column-oblique lm-head initialization enabled: "
-                f"scaled_target_norm={lm_head_target_rms}, actual_col_l2={actual_col_l2:.6g}"
+                f"scaled_target_norm={lm_head_target_rms}, "
+                f"learn_target_rms={learn_target_rms}, initial_target_rms={initial_target_rms}, "
+                f"initial_actual_col_l2={actual_col_l2:.6g}"
             )
         if jax.process_index() == 0:
             print(init_log_message)

@@ -57,6 +57,7 @@ def main(c: DictConfig):
     key = jax.random.key(c.seed)
     
     # Round vocab size (important for sharding)
+    utils.sync_lm_head_oblique_model_config(c)
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count())
     print(f"Model V rounded to: {c.model.V}")
 

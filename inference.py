@@ -145,6 +145,7 @@ def main(c: DictConfig):
 
     # --- Round Vocab Size ---
     # This MUST match the training config
+    utils.sync_lm_head_oblique_model_config(c)
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count())
     print(f"Model vocab size rounded to: {c.model.V}")
     

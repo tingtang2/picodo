@@ -16,8 +16,18 @@ class TransformerDecoder(nnx.Module):
         lm_head_dtype = getattr(c, "lm_head_dtype", c.activ_dtype)
         self.final_hidden_mean_centering = bool(getattr(c, "final_hidden_mean_centering", False))
         self.final_hidden_mean_centering_coeff = float(getattr(c, "alpha", 1.0))
+        self.lm_head_oblique_learn_target_rms = bool(getattr(c, "lm_head_oblique_learn_target_rms", False))
         self.token_embed_in = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
         self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=lm_head_dtype, rngs=rngs)
+        if self.lm_head_oblique_learn_target_rms:
+            initial_target_rms = float(getattr(c, "lm_head_oblique_initial_target_rms", 1.0))
+            if initial_target_rms <= 0.0:
+                raise ValueError(
+                    f"Expected `model.lm_head_oblique_initial_target_rms` to be positive, got {initial_target_rms}."
+                )
+            self.lm_head_oblique_target_rms_log = nnx.Param(
+                jnp.asarray(jnp.log(initial_target_rms), dtype=jnp.float32)
+            )
         self.blocks = nnx.List(TransformerBlock(c, rngs, layer_idx=i) for i in range(c.L))
         self.out_ln = nnx.RMSNorm(c.D, use_scale=False, dtype=lm_head_dtype, rngs=rngs)
         
@@ -39,7 +49,12 @@ class TransformerDecoder(nnx.Module):
         h = self.out_ln(h)
         if self.final_hidden_mean_centering:
             h = h - self.final_hidden_mean_centering_coeff * jnp.mean(h, axis=-1, keepdims=True)
-        logits = self.token_embed_out.attend(h) # [B, T, V]
+        if self.lm_head_oblique_learn_target_rms:
+            target_rms = jnp.exp(jnp.asarray(self.lm_head_oblique_target_rms_log.value, dtype=h.dtype))
+            output_embeddings = self.token_embed_out.embedding.value.astype(h.dtype) * target_rms
+            logits = jnp.einsum('btd,vd->btv', h, output_embeddings) # [B, T, V]
+        else:
+            logits = self.token_embed_out.attend(h) # [B, T, V]
 
         if return_qkv:
             return logits, qkv_outputs
@@ -247,13 +262,13 @@ def create_sharded_model(c: DictConfig, key):
         def add_sharding(path, v):
             key = jax.tree_util.keystr(path, simple=True, separator='/')
             pspec = None
-            if 'token_embed_in' in key: pspec = P('data', 'model')
+            if key == 'token_embed_in/embedding': pspec = P('data', 'model')
             if 'up_proj' in key: pspec = P('data', 'model')
             if 'down_proj' in key: pspec = P('model', 'data')
             if 'qkv_proj' in key: pspec = P(None, 'model', 'data', None)
             if 'gate_proj' in key: pspec = P('model', 'data', None)
             if 'out_proj' in key: pspec = P('model', None, 'data')
-            if 'token_embed_out' in key: pspec = P('model', 'data')
+            if key == 'token_embed_out/embedding': pspec = P('model', 'data')
             if pspec is None:
                 return v
             return jax.lax.with_sharding_constraint(v, pspec)

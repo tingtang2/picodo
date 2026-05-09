@@ -7,6 +7,7 @@ from functools import partial
 import os
 import numpy as np
 from typing import NamedTuple
+from omegaconf import DictConfig, open_dict
 
 
 def flatten_dict(d, prefix=None, sep='.'):
@@ -32,13 +33,30 @@ def _is_output_embedding_path(path) -> bool:
 
 
 def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
-    if not exclude_input_embedding:
-        return None
     _, params = nnx.split(model, nnx.Param)
+    learned_target_rms_present = False
 
     def mask_leaf(path, _):
+        nonlocal learned_target_rms_present
         key = jax.tree_util.keystr(path, simple=True, separator='/')
-        return 'token_embed_in' not in key
+        if key == 'lm_head_oblique_target_rms_log':
+            learned_target_rms_present = True
+            return False
+        if exclude_input_embedding and 'token_embed_in' in key:
+            return False
+        return True
+
+    if not exclude_input_embedding:
+        for path, leaf in jax.tree_util.tree_leaves_with_path(
+            params,
+            is_leaf=lambda x: isinstance(x, nnx.Param),
+        ):
+            key = jax.tree_util.keystr(path, simple=True, separator='/')
+            if key == 'lm_head_oblique_target_rms_log':
+                learned_target_rms_present = True
+                break
+        if not learned_target_rms_present:
+            return None
 
     return jax.tree_util.tree_map_with_path(
         mask_leaf,
@@ -91,11 +109,56 @@ def get_lm_head_optimizer_type(opt_cfg) -> str:
     return str(getattr(lm_head_optimizer_cfg, "type", "adamw")).lower()
 
 
+def lm_head_uses_learned_target_rms(opt_cfg) -> bool:
+    lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
+    return bool(getattr(lm_head_optimizer_cfg, "learn_target_rms", False))
+
+
+def get_lm_head_oblique_initial_target_rms(opt_cfg) -> float:
+    lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
+    return float(getattr(lm_head_optimizer_cfg, "initial_target_rms", get_lm_head_oblique_target_rms(opt_cfg)))
+
+
+def get_lm_head_oblique_optimizer_target_rms(opt_cfg) -> float:
+    return 1.0 if lm_head_uses_learned_target_rms(opt_cfg) else get_lm_head_oblique_target_rms(opt_cfg)
+
+
+def sync_lm_head_oblique_model_config(c):
+    if not hasattr(c, "model") or not hasattr(c, "opt"):
+        return
+
+    lm_head_optimizer_type = get_lm_head_optimizer_type(c.opt)
+    use_oblique_optimizer = lm_head_optimizer_type in {"row_oblique", "column_oblique"}
+    learn_target_rms = use_oblique_optimizer and lm_head_uses_learned_target_rms(c.opt)
+    initial_target_rms = get_lm_head_oblique_initial_target_rms(c.opt)
+    if initial_target_rms <= 0.0:
+        raise ValueError(f"Expected initial_target_rms to be positive, got {initial_target_rms}.")
+
+    if isinstance(c.model, DictConfig):
+        with open_dict(c.model):
+            c.model.lm_head_oblique_learn_target_rms = learn_target_rms
+            c.model.lm_head_oblique_initial_target_rms = initial_target_rms
+    else:
+        c.model.lm_head_oblique_learn_target_rms = learn_target_rms
+        c.model.lm_head_oblique_initial_target_rms = initial_target_rms
+
+
 def validate_row_oblique_lm_head_options(opt_cfg):
     lm_head_optimizer_type = get_lm_head_optimizer_type(opt_cfg)
+    learn_target_rms = lm_head_uses_learned_target_rms(opt_cfg)
     if lm_head_optimizer_type not in {"row_oblique", "column_oblique"}:
+        if learn_target_rms:
+            raise ValueError(
+                "opt.lm_head_optimizer.learn_target_rms requires "
+                "opt.lm_head_optimizer.type to be 'row_oblique' or 'column_oblique'."
+            )
         return
     manifold_name = "Row-Oblique" if lm_head_optimizer_type == "row_oblique" else "Column-Oblique"
+    initial_target_rms = get_lm_head_oblique_initial_target_rms(opt_cfg)
+    if initial_target_rms <= 0.0:
+        raise ValueError(
+            f"Expected opt.lm_head_optimizer.initial_target_rms to be positive, got {initial_target_rms}."
+        )
 
     if bool(getattr(opt_cfg, "mucentering", False)):
         raise ValueError(
@@ -948,6 +1011,22 @@ def get_output_embedding_group_metrics(opt_state, token_groups, eps: float):
         )
 
     return metrics
+
+
+def get_lm_head_oblique_target_metrics(model_state):
+    try:
+        log_target_rms = _state_leaf_to_array(
+            _get_nested_state_item(model_state, ("lm_head_oblique_target_rms_log",))
+        )
+    except (AttributeError, KeyError, TypeError):
+        return {}
+
+    log_target_rms = jnp.asarray(log_target_rms, dtype=jnp.float32)
+    target_rms = jnp.exp(log_target_rms)
+    return {
+        "lm_head_oblique/log_target_rms": float(jnp.squeeze(log_target_rms)),
+        "lm_head_oblique/target_rms": float(jnp.squeeze(target_rms)),
+    }
 
 def compute_qkv_stats(qkv_dict):
     stats = {}
