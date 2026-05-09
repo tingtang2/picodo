@@ -53,6 +53,30 @@ def center_output_embeddings(model: TransformerDecoder):
     model.token_embed_out.embedding.value = embeddings - mean
 
 
+def row_normalize_output_embeddings(model: TransformerDecoder, target_rms: float = 1.0, eps: float = 1e-8):
+    embeddings = model.token_embed_out.embedding.value
+    embeddings_f32 = embeddings.astype(jnp.float32)
+    scale = jnp.asarray(jnp.sqrt(embeddings.shape[1] / embeddings.shape[0]), dtype=jnp.float32)
+    scaled_embeddings = embeddings_f32 / scale
+    row_norms = jnp.linalg.norm(scaled_embeddings, axis=1, keepdims=True)
+    safe_row_norms = jnp.maximum(row_norms, jnp.asarray(eps, dtype=jnp.float32))
+    model.token_embed_out.embedding.value = (scale * scaled_embeddings * (target_rms / safe_row_norms)).astype(
+        embeddings.dtype
+    )
+
+
+def column_normalize_output_embeddings(model: TransformerDecoder, target_rms: float = 1.0, eps: float = 1e-8):
+    embeddings = model.token_embed_out.embedding.value
+    embeddings_f32 = embeddings.astype(jnp.float32)
+    scale = jnp.asarray(jnp.sqrt(embeddings.shape[0] / embeddings.shape[1]), dtype=jnp.float32)
+    scaled_embeddings = embeddings_f32 / scale
+    col_norms = jnp.linalg.norm(scaled_embeddings, axis=0, keepdims=True)
+    safe_col_norms = jnp.maximum(col_norms, jnp.asarray(eps, dtype=jnp.float32))
+    model.token_embed_out.embedding.value = (scale * scaled_embeddings * (target_rms / safe_col_norms)).astype(
+        embeddings.dtype
+    )
+
+
 class TransformerBlock(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs, layer_idx: int):
         self.ln1 = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)

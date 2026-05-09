@@ -45,9 +45,11 @@ opt:
   weight_decay: 0.02
   exclude_input_embedding_weight_decay: false
   lm_head_optimizer:
-    type: adamw # one of: adamw, sgd_momentum
-    momentum: 0.9
-    nesterov: false
+    type: adamw # one of: adamw, sgd_momentum, adamw_b1, row_oblique, column_oblique
+    momentum: 0.9 # used by sgd_momentum, row_oblique, and column_oblique
+    nesterov: false # used by sgd_momentum
+    target_rms: 1.0 # used by row_oblique/column_oblique: target norm on the notebook's scaled oblique manifold
+    eps: ${opt.eps} # used by row_oblique/column_oblique retraction/normalization
   lm_head_gradient_centering: 'off' # one of: off, pre, post
   lm_head_weighted_columnwise_gradient_centering: 'off' # one of: off, pre, post
   lm_head_adaptive_tuc:

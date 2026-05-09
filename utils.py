@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from functools import partial
 import os
 import numpy as np
+from typing import NamedTuple
 
 
 def flatten_dict(d, prefix=None, sep='.'):
@@ -83,6 +84,292 @@ def normalize_lm_head_centering_mode(raw_value, field_name: str) -> str:
             f"got {raw_value!r}."
         )
     return mode
+
+
+def get_lm_head_optimizer_type(opt_cfg) -> str:
+    lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
+    return str(getattr(lm_head_optimizer_cfg, "type", "adamw")).lower()
+
+
+def validate_row_oblique_lm_head_options(opt_cfg):
+    lm_head_optimizer_type = get_lm_head_optimizer_type(opt_cfg)
+    if lm_head_optimizer_type not in {"row_oblique", "column_oblique"}:
+        return
+    manifold_name = "Row-Oblique" if lm_head_optimizer_type == "row_oblique" else "Column-Oblique"
+
+    if bool(getattr(opt_cfg, "mucentering", False)):
+        raise ValueError(
+            f"opt.mucentering is incompatible with opt.lm_head_optimizer.type={lm_head_optimizer_type!r}. "
+            f"The {manifold_name} optimizer already retracts `token_embed_out.embedding` onto a fixed-scale manifold."
+        )
+
+    incompatible_modes = (
+        ("opt.lm_head_gradient_centering", getattr(opt_cfg, "lm_head_gradient_centering", "off")),
+        (
+            "opt.lm_head_weighted_columnwise_gradient_centering",
+            getattr(opt_cfg, "lm_head_weighted_columnwise_gradient_centering", "off"),
+        ),
+    )
+    for field_name, raw_value in incompatible_modes:
+        if normalize_lm_head_centering_mode(raw_value, field_name) != "off":
+            raise ValueError(
+                f"{field_name} is incompatible with opt.lm_head_optimizer.type={lm_head_optimizer_type!r}. "
+                f"Use the {manifold_name} tangent projection instead of extra LM-head centering transforms."
+            )
+
+    lm_head_adaptive_tuc_cfg = getattr(opt_cfg, "lm_head_adaptive_tuc", None)
+    if bool(getattr(lm_head_adaptive_tuc_cfg, "enabled", False)):
+        raise ValueError(
+            "opt.lm_head_adaptive_tuc.enabled is incompatible with "
+            f"opt.lm_head_optimizer.type={lm_head_optimizer_type!r}."
+        )
+
+
+def get_lm_head_oblique_target_rms(opt_cfg) -> float:
+    lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
+    return float(getattr(lm_head_optimizer_cfg, "target_rms", 1.0))
+
+
+def get_row_oblique_target_rms(opt_cfg) -> float:
+    return get_lm_head_oblique_target_rms(opt_cfg)
+
+
+def _oblique_target_norm(width: int, target_rms: float):
+    return jnp.asarray(target_rms * np.sqrt(width), dtype=jnp.float32)
+
+
+def _matrix_oblique_scale(matrix_shape):
+    if len(matrix_shape) != 2:
+        raise ValueError(f"Expected a rank-2 matrix shape, got {matrix_shape}.")
+    fanout, fanin = matrix_shape
+    return jnp.asarray(np.sqrt(fanout / fanin), dtype=jnp.float32)
+
+
+def row_wise_normalize_to_norm(matrix, target_norm: float = 1.0, eps: float = 1e-8):
+    matrix_f32 = jnp.asarray(matrix, dtype=jnp.float32)
+    if matrix_f32.ndim != 2:
+        raise ValueError(
+            "Expected a rank-2 matrix for row-wise normalization, "
+            f"got shape={matrix_f32.shape}."
+        )
+    row_norms = jnp.linalg.norm(matrix_f32, axis=1, keepdims=True)
+    safe_row_norms = jnp.maximum(row_norms, jnp.asarray(eps, dtype=jnp.float32))
+    return matrix_f32 * (jnp.asarray(target_norm, dtype=jnp.float32) / safe_row_norms)
+
+
+def row_wise_normalize(matrix, target_rms: float = 1.0, eps: float = 1e-8):
+    matrix_f32 = jnp.asarray(matrix, dtype=jnp.float32)
+    return row_wise_normalize_to_norm(
+        matrix_f32,
+        target_norm=_oblique_target_norm(matrix_f32.shape[1], target_rms),
+        eps=eps,
+    )
+
+
+def column_wise_normalize(matrix, target_rms: float = 1.0, eps: float = 1e-8):
+    return row_wise_normalize(jnp.asarray(matrix).T, target_rms=target_rms, eps=eps).T
+
+
+def column_wise_normalize_to_norm(matrix, target_norm: float = 1.0, eps: float = 1e-8):
+    return row_wise_normalize_to_norm(jnp.asarray(matrix).T, target_norm=target_norm, eps=eps).T
+
+
+def project_to_row_oblique_tangent_space(update, param, target_rms: float = 1.0):
+    update_f32 = jnp.asarray(update, dtype=jnp.float32)
+    param_f32 = jnp.asarray(param, dtype=jnp.float32)
+    if update_f32.ndim != 2 or param_f32.ndim != 2:
+        raise ValueError(
+            "Expected rank-2 matrices for Row-Oblique tangent projection, "
+            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+        )
+    if update_f32.shape != param_f32.shape:
+        raise ValueError(
+            "Row-Oblique tangent projection requires matching update/parameter shapes, "
+            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+        )
+
+    width = param_f32.shape[1]
+    denom = jnp.asarray((target_rms ** 2) * width, dtype=jnp.float32)
+    row_alignment = jnp.sum(update_f32 * param_f32, axis=1, keepdims=True)
+    return update_f32 - param_f32 * (row_alignment / denom)
+
+
+def project_to_column_oblique_tangent_space(update, param, target_norm: float = 1.0):
+    update_f32 = jnp.asarray(update, dtype=jnp.float32)
+    param_f32 = jnp.asarray(param, dtype=jnp.float32)
+    if update_f32.ndim != 2 or param_f32.ndim != 2:
+        raise ValueError(
+            "Expected rank-2 matrices for Column-Oblique tangent projection, "
+            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+        )
+    if update_f32.shape != param_f32.shape:
+        raise ValueError(
+            "Column-Oblique tangent projection requires matching update/parameter shapes, "
+            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+        )
+
+    col_alignment = jnp.sum(update_f32 * param_f32, axis=0, keepdims=True)
+    denom = jnp.asarray(target_norm ** 2, dtype=jnp.float32)
+    return update_f32 - param_f32 * (col_alignment / denom)
+
+
+def apply_row_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
+    return apply_column_oblique_update(
+        jnp.asarray(update).T,
+        jnp.asarray(param).T,
+        learning_rate=learning_rate,
+        target_rms=target_rms,
+        eps=eps,
+    ).T
+
+
+def apply_column_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
+    param_f32 = jnp.asarray(param, dtype=jnp.float32)
+    update_f32 = jnp.asarray(update, dtype=jnp.float32)
+    scale = _matrix_oblique_scale(param_f32.shape)
+    scaled_param = param_f32 / scale
+    scaled_update = update_f32 / scale
+    tangent_update = project_to_column_oblique_tangent_space(
+        scaled_update,
+        scaled_param,
+        target_norm=target_rms,
+    )
+    steepest_direction = column_wise_normalize_to_norm(
+        tangent_update,
+        target_norm=target_rms,
+        eps=eps,
+    )
+    lr_f32 = jnp.asarray(learning_rate, dtype=jnp.float32)
+    next_scaled_param = column_wise_normalize_to_norm(
+        scaled_param - lr_f32 * steepest_direction,
+        target_norm=target_rms,
+        eps=eps,
+    )
+    next_param = scale * next_scaled_param
+    return next_param.astype(jnp.asarray(param).dtype) - jnp.asarray(param)
+
+
+class EmaMomentumState(NamedTuple):
+    mu: optax.Updates
+
+
+class RowObliqueState(NamedTuple):
+    count: jax.Array
+
+
+def scale_by_ema_momentum(decay: float) -> optax.GradientTransformation:
+    if not 0.0 <= decay < 1.0:
+        raise ValueError(f"Expected `decay` to be in [0, 1), got {decay}.")
+
+    def init_leaf(param):
+        if isinstance(param, optax.MaskedNode):
+            return param
+        value = getattr(param, "value", param)
+        return jnp.zeros_like(value)
+
+    def init_fn(params):
+        mu = jax.tree_util.tree_map(
+            init_leaf,
+            params,
+            is_leaf=lambda x: isinstance(x, optax.MaskedNode),
+        )
+        return EmaMomentumState(mu=mu)
+
+    def update_leaf(update, mu):
+        if isinstance(update, optax.MaskedNode) or isinstance(mu, optax.MaskedNode):
+            return update
+        new_mu = decay * mu + (1.0 - decay) * jnp.asarray(update)
+        return new_mu.astype(jnp.asarray(update).dtype)
+
+    def update_fn(updates, state, params=None):
+        del params
+        new_mu = jax.tree_util.tree_map(
+            update_leaf,
+            updates,
+            state.mu,
+            is_leaf=lambda x: isinstance(x, optax.MaskedNode),
+        )
+        return new_mu, EmaMomentumState(mu=new_mu)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def row_oblique_steepest_descent(
+    learning_rate,
+    target_rms: float = 1.0,
+    eps: float = 1e-8,
+) -> optax.GradientTransformation:
+    if target_rms <= 0.0:
+        raise ValueError(f"Expected `target_rms` to be positive, got {target_rms}.")
+
+    lr_schedule = learning_rate if callable(learning_rate) else lambda _: learning_rate
+
+    def init_fn(_):
+        return RowObliqueState(count=jnp.zeros([], dtype=jnp.int32))
+
+    def transform_leaf(update, param, lr):
+        if isinstance(update, optax.MaskedNode) or isinstance(param, optax.MaskedNode):
+            return update
+        return apply_row_oblique_update(
+            update,
+            param,
+            learning_rate=lr,
+            target_rms=target_rms,
+            eps=eps,
+        )
+
+    def update_fn(updates, state, params=None):
+        if params is None:
+            raise ValueError("row_oblique_steepest_descent requires `params`.")
+        lr = jnp.asarray(lr_schedule(state.count), dtype=jnp.float32)
+        transformed_updates = jax.tree_util.tree_map(
+            lambda update, param: transform_leaf(update, param, lr),
+            updates,
+            params,
+            is_leaf=lambda x: isinstance(x, optax.MaskedNode),
+        )
+        return transformed_updates, RowObliqueState(count=state.count + jnp.asarray(1, dtype=jnp.int32))
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def column_oblique_steepest_descent(
+    learning_rate,
+    target_rms: float = 1.0,
+    eps: float = 1e-8,
+) -> optax.GradientTransformation:
+    if target_rms <= 0.0:
+        raise ValueError(f"Expected `target_rms` to be positive, got {target_rms}.")
+
+    lr_schedule = learning_rate if callable(learning_rate) else lambda _: learning_rate
+
+    def init_fn(_):
+        return RowObliqueState(count=jnp.zeros([], dtype=jnp.int32))
+
+    def transform_leaf(update, param, lr):
+        if isinstance(update, optax.MaskedNode) or isinstance(param, optax.MaskedNode):
+            return update
+        return apply_column_oblique_update(
+            update,
+            param,
+            learning_rate=lr,
+            target_rms=target_rms,
+            eps=eps,
+        )
+
+    def update_fn(updates, state, params=None):
+        if params is None:
+            raise ValueError("column_oblique_steepest_descent requires `params`.")
+        lr = jnp.asarray(lr_schedule(state.count), dtype=jnp.float32)
+        transformed_updates = jax.tree_util.tree_map(
+            lambda update, param: transform_leaf(update, param, lr),
+            updates,
+            params,
+            is_leaf=lambda x: isinstance(x, optax.MaskedNode),
+        )
+        return transformed_updates, RowObliqueState(count=state.count + jnp.asarray(1, dtype=jnp.int32))
+
+    return optax.GradientTransformation(init_fn, update_fn)
 
 
 def _row_wise_mean_center(update):
@@ -249,6 +536,7 @@ def apply_lm_head_output_update_post_transforms(update, param, opt_cfg):
 
 
 def build_lm_head_update_transforms(model: nnx.Module, opt_cfg):
+    validate_row_oblique_lm_head_options(opt_cfg)
     pre_transforms = []
     post_transforms = []
     output_embedding_mask = None
@@ -558,44 +846,54 @@ def get_output_embedding_group_metrics(opt_state, token_groups, eps: float):
     if not token_groups:
         return {}
 
-    moment_state = _find_moment_state(opt_state)
-    if moment_state is None:
-        return {}
-
     try:
         output_embedding = _state_leaf_to_array(
             _get_nested_state_item(opt_state.model, ("token_embed_out", "embedding"))
         )
-        first_moment = _state_leaf_to_array(
-            _get_first_nested_state_item(
-                _get_state_component(moment_state, "mu"),
-                (
-                    ("token_embed_out", "embedding"),
-                    ("model", "token_embed_out", "embedding"),
-                ),
-            )
-        )
-        second_moment = _state_leaf_to_array(
-            _get_first_nested_state_item(
-                _get_state_component(moment_state, "nu"),
-                (
-                    ("token_embed_out", "embedding"),
-                    ("model", "token_embed_out", "embedding"),
-                ),
-            )
-        )
     except (AttributeError, KeyError, TypeError):
         return {}
 
-    if (
-        output_embedding.ndim != 2
-        or first_moment.shape != output_embedding.shape
-        or second_moment.shape != output_embedding.shape
-    ):
+    if output_embedding.ndim != 2:
         return {}
 
-    sqrt_second_moment = jnp.sqrt(jnp.maximum(second_moment, 0.0))
-    adam_ratio = first_moment / (sqrt_second_moment + jnp.asarray(eps, dtype=jnp.float32))
+    moment_state = _find_moment_state(opt_state)
+    first_moment = None
+    second_moment = None
+    sqrt_second_moment = None
+    adam_ratio = None
+    if moment_state is not None:
+        try:
+            first_moment = _state_leaf_to_array(
+                _get_first_nested_state_item(
+                    _get_state_component(moment_state, "mu"),
+                    (
+                        ("token_embed_out", "embedding"),
+                        ("model", "token_embed_out", "embedding"),
+                    ),
+                )
+            )
+            second_moment = _state_leaf_to_array(
+                _get_first_nested_state_item(
+                    _get_state_component(moment_state, "nu"),
+                    (
+                        ("token_embed_out", "embedding"),
+                        ("model", "token_embed_out", "embedding"),
+                    ),
+                )
+            )
+        except (AttributeError, KeyError, TypeError):
+            first_moment = None
+            second_moment = None
+
+    if (
+        first_moment is not None
+        and second_moment is not None
+        and first_moment.shape == output_embedding.shape
+        and second_moment.shape == output_embedding.shape
+    ):
+        sqrt_second_moment = jnp.sqrt(jnp.maximum(second_moment, 0.0))
+        adam_ratio = first_moment / (sqrt_second_moment + jnp.asarray(eps, dtype=jnp.float32))
+
     vocab_size = int(output_embedding.shape[0])
     metrics = {}
     group_rows_by_name = {}
@@ -611,22 +909,25 @@ def get_output_embedding_group_metrics(opt_state, token_groups, eps: float):
         group_rows = output_embedding[valid_token_ids]
         group_rows_by_name[metric_group_name] = group_rows
         group_token_ids_by_name[metric_group_name] = valid_token_ids
-        group_sqrt_second_moment = sqrt_second_moment[valid_token_ids]
-        group_adam_ratio = adam_ratio[valid_token_ids]
 
         row_l2_norm = jnp.linalg.norm(group_rows, axis=-1)
-        row_sqrt_second_moment_mean = jnp.mean(group_sqrt_second_moment, axis=-1)
-        row_sqrt_second_moment_max = jnp.max(group_sqrt_second_moment, axis=-1)
-        row_adam_ratio_mean = jnp.mean(group_adam_ratio, axis=-1)
+        row_rms = row_l2_norm / jnp.sqrt(jnp.asarray(group_rows.shape[-1], dtype=jnp.float32))
 
         metrics[f"output_embedding_groups/{metric_group_name}/row_l2_norm_mean"] = jnp.mean(row_l2_norm)
-        metrics[f"output_embedding_groups/{metric_group_name}/sqrt_second_moment_mean"] = jnp.mean(
-            row_sqrt_second_moment_mean
-        )
-        metrics[f"output_embedding_groups/{metric_group_name}/sqrt_second_moment_max"] = jnp.mean(
-            row_sqrt_second_moment_max
-        )
-        metrics[f"output_embedding_groups/{metric_group_name}/adam_ratio_mean"] = jnp.mean(row_adam_ratio_mean)
+        metrics[f"output_embedding_groups/{metric_group_name}/row_rms_mean"] = jnp.mean(row_rms)
+        if sqrt_second_moment is not None and adam_ratio is not None:
+            group_sqrt_second_moment = sqrt_second_moment[valid_token_ids]
+            group_adam_ratio = adam_ratio[valid_token_ids]
+            row_sqrt_second_moment_mean = jnp.mean(group_sqrt_second_moment, axis=-1)
+            row_sqrt_second_moment_max = jnp.max(group_sqrt_second_moment, axis=-1)
+            row_adam_ratio_mean = jnp.mean(group_adam_ratio, axis=-1)
+            metrics[f"output_embedding_groups/{metric_group_name}/sqrt_second_moment_mean"] = jnp.mean(
+                row_sqrt_second_moment_mean
+            )
+            metrics[f"output_embedding_groups/{metric_group_name}/sqrt_second_moment_max"] = jnp.mean(
+                row_sqrt_second_moment_max
+            )
+            metrics[f"output_embedding_groups/{metric_group_name}/adam_ratio_mean"] = jnp.mean(row_adam_ratio_mean)
 
     most_frequent_rows = group_rows_by_name.get("most_frequent")
     least_frequent_rows = group_rows_by_name.get("least_frequent")

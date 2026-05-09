@@ -195,7 +195,7 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
             print(log_message)
 
     lm_head_optimizer_cfg = getattr(c.opt, "lm_head_optimizer", None)
-    lm_head_optimizer_type = str(getattr(lm_head_optimizer_cfg, "type", "adamw")).lower()
+    lm_head_optimizer_type = utils.get_lm_head_optimizer_type(c.opt)
     if lm_head_optimizer_type == "adamw":
         base_optimizer_tx = adamw_tx
     elif lm_head_optimizer_type == "sgd_momentum":
@@ -281,10 +281,60 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
                 f"lm_head=adamw(b1={lm_head_b1}); "
                 "all other hparams (b2, eps, weight_decay) shared"
             )
+    elif lm_head_optimizer_type in {"row_oblique", "column_oblique"}:
+        if output_embedding_mask is None:
+            output_embedding_mask = utils.build_output_embedding_mask(model)
+        non_output_embedding_mask = jax.tree_util.tree_map(
+            lambda is_output_embedding: not is_output_embedding,
+            output_embedding_mask,
+        )
+        if wd_mask is None:
+            rest_wd_mask = non_output_embedding_mask
+        else:
+            rest_wd_mask = jax.tree_util.tree_map(
+                lambda use_wd, is_non_output_embedding: bool(use_wd and is_non_output_embedding),
+                wd_mask,
+                non_output_embedding_mask,
+            )
+
+        lm_head_momentum = float(getattr(lm_head_optimizer_cfg, "momentum", 0.9))
+        lm_head_target_rms = utils.get_lm_head_oblique_target_rms(c.opt)
+        lm_head_oblique_eps = float(getattr(lm_head_optimizer_cfg, "eps", c.opt.eps))
+        lm_head_oblique_tx = optax.chain(
+            utils.scale_by_ema_momentum(lm_head_momentum),
+            (
+                utils.row_oblique_steepest_descent
+                if lm_head_optimizer_type == "row_oblique"
+                else utils.column_oblique_steepest_descent
+            )(
+                learning_rate=lr_schedule,
+                target_rms=lm_head_target_rms,
+                eps=lm_head_oblique_eps,
+            )
+        )
+        rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            lr_schedule,
+            c.opt.b1,
+            b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=c.opt.weight_decay,
+            mask=rest_wd_mask,
+        )
+        base_optimizer_tx = optax.chain(
+            optax.masked(rest_adamw_tx, non_output_embedding_mask),
+            optax.masked(lm_head_oblique_tx, output_embedding_mask),
+        )
+        if jax.process_index() == 0:
+            print(
+                "split lm-head optimizer enabled: "
+                f"default=adamw, lm_head={lm_head_optimizer_type}, "
+                f"momentum={lm_head_momentum}, scaled_target_norm={lm_head_target_rms}, "
+                f"eps={lm_head_oblique_eps}, weight_decay=off_for_lm_head"
+            )
     else:
         raise ValueError(
             "Expected `opt.lm_head_optimizer.type` to be one of "
-            "{'adamw', 'sgd_momentum', 'adamw_b1'}, "
+            "{'adamw', 'sgd_momentum', 'adamw_b1', 'row_oblique', 'column_oblique'}, "
             f"got {lm_head_optimizer_type!r}."
         )
 
@@ -375,6 +425,34 @@ def main(c: DictConfig):
     print("initializing base model...")
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count())
     model = model_lib.create_sharded_model(c.model, key_model)
+    utils.validate_row_oblique_lm_head_options(c.opt)
+    lm_head_optimizer_type = utils.get_lm_head_optimizer_type(c.opt)
+    if lm_head_optimizer_type in {"row_oblique", "column_oblique"}:
+        lm_head_target_rms = utils.get_lm_head_oblique_target_rms(c.opt)
+        if lm_head_optimizer_type == "row_oblique":
+            model_lib.row_normalize_output_embeddings(
+                model,
+                target_rms=lm_head_target_rms,
+                eps=float(getattr(getattr(c.opt, "lm_head_optimizer", None), "eps", c.opt.eps)),
+            )
+            actual_row_l2 = float(np.sqrt(c.model.D / c.model.V) * lm_head_target_rms)
+            init_log_message = (
+                "row-oblique lm-head initialization enabled: "
+                f"scaled_target_norm={lm_head_target_rms}, actual_row_l2={actual_row_l2:.6g}"
+            )
+        else:
+            model_lib.column_normalize_output_embeddings(
+                model,
+                target_rms=lm_head_target_rms,
+                eps=float(getattr(getattr(c.opt, "lm_head_optimizer", None), "eps", c.opt.eps)),
+            )
+            actual_col_l2 = float(np.sqrt(c.model.V / c.model.D) * lm_head_target_rms)
+            init_log_message = (
+                "column-oblique lm-head initialization enabled: "
+                f"scaled_target_norm={lm_head_target_rms}, actual_col_l2={actual_col_l2:.6g}"
+            )
+        if jax.process_index() == 0:
+            print(init_log_message)
     model_graphdef = nnx.graphdef(model)
 
     n_params = {
