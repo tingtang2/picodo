@@ -374,8 +374,11 @@ def scale_by_ema_momentum(decay: float) -> optax.GradientTransformation:
     def update_leaf(update, mu):
         if isinstance(update, optax.MaskedNode) or isinstance(mu, optax.MaskedNode):
             return update
-        new_mu = decay * mu + (1.0 - decay) * jnp.asarray(update)
-        return new_mu.astype(jnp.asarray(mu).dtype)
+        mu_arr = jnp.asarray(mu)
+        update_arr = jnp.asarray(update, dtype=mu_arr.dtype)
+        decay_arr = jnp.asarray(decay, dtype=mu_arr.dtype)
+        one_minus_decay_arr = jnp.asarray(1.0 - decay, dtype=mu_arr.dtype)
+        return decay_arr * mu_arr + one_minus_decay_arr * update_arr
 
     def update_fn(updates, state, params=None):
         del params
