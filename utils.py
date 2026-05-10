@@ -209,92 +209,96 @@ def _matrix_oblique_scale(matrix_shape):
 
 
 def row_wise_normalize_to_norm(matrix, target_norm: float = 1.0, eps: float = 1e-8):
-    matrix_f32 = jnp.asarray(matrix, dtype=jnp.float32)
-    if matrix_f32.ndim != 2:
+    matrix_arr = jnp.asarray(matrix)
+    if matrix_arr.ndim != 2:
         raise ValueError(
             "Expected a rank-2 matrix for row-wise normalization, "
-            f"got shape={matrix_f32.shape}."
+            f"got shape={matrix_arr.shape}."
         )
-    row_norms = jnp.linalg.norm(matrix_f32, axis=1, keepdims=True)
+    row_sq_norms = jnp.sum(jnp.square(matrix_arr), axis=1, keepdims=True, dtype=jnp.float32)
+    row_norms = jnp.sqrt(jnp.maximum(row_sq_norms, jnp.asarray(0.0, dtype=jnp.float32)))
     safe_row_norms = jnp.maximum(row_norms, jnp.asarray(eps, dtype=jnp.float32))
-    return matrix_f32 * (jnp.asarray(target_norm, dtype=jnp.float32) / safe_row_norms)
+    row_scale = (jnp.asarray(target_norm, dtype=jnp.float32) / safe_row_norms).astype(matrix_arr.dtype)
+    return matrix_arr * row_scale
 
 
 def row_wise_normalize(matrix, target_rms: float = 1.0, eps: float = 1e-8):
-    matrix_f32 = jnp.asarray(matrix, dtype=jnp.float32)
     return row_wise_normalize_to_norm(
-        matrix_f32,
-        target_norm=_oblique_target_norm(matrix_f32.shape[1], target_rms),
+        matrix,
+        target_norm=_oblique_target_norm(jnp.asarray(matrix).shape[1], target_rms),
         eps=eps,
     )
 
 
 def column_wise_normalize(matrix, target_rms: float = 1.0, eps: float = 1e-8):
-    matrix_f32 = jnp.asarray(matrix, dtype=jnp.float32)
     return column_wise_normalize_to_norm(
-        matrix_f32,
-        target_norm=_oblique_target_norm(matrix_f32.shape[0], target_rms),
+        matrix,
+        target_norm=_oblique_target_norm(jnp.asarray(matrix).shape[0], target_rms),
         eps=eps,
     )
 
 
 def column_wise_normalize_to_norm(matrix, target_norm: float = 1.0, eps: float = 1e-8):
-    matrix_f32 = jnp.asarray(matrix, dtype=jnp.float32)
-    if matrix_f32.ndim != 2:
+    matrix_arr = jnp.asarray(matrix)
+    if matrix_arr.ndim != 2:
         raise ValueError(
             "Expected a rank-2 matrix for column-wise normalization, "
-            f"got shape={matrix_f32.shape}."
+            f"got shape={matrix_arr.shape}."
         )
-    col_norms = jnp.linalg.norm(matrix_f32, axis=0, keepdims=True)
+    col_sq_norms = jnp.sum(jnp.square(matrix_arr), axis=0, keepdims=True, dtype=jnp.float32)
+    col_norms = jnp.sqrt(jnp.maximum(col_sq_norms, jnp.asarray(0.0, dtype=jnp.float32)))
     safe_col_norms = jnp.maximum(col_norms, jnp.asarray(eps, dtype=jnp.float32))
-    return matrix_f32 * (jnp.asarray(target_norm, dtype=jnp.float32) / safe_col_norms)
+    col_scale = (jnp.asarray(target_norm, dtype=jnp.float32) / safe_col_norms).astype(matrix_arr.dtype)
+    return matrix_arr * col_scale
 
 
 def project_to_row_oblique_tangent_space(update, param, target_rms: float = 1.0):
-    update_f32 = jnp.asarray(update, dtype=jnp.float32)
-    param_f32 = jnp.asarray(param, dtype=jnp.float32)
-    if update_f32.ndim != 2 or param_f32.ndim != 2:
+    update_arr = jnp.asarray(update)
+    param_arr = jnp.asarray(param)
+    if update_arr.ndim != 2 or param_arr.ndim != 2:
         raise ValueError(
             "Expected rank-2 matrices for Row-Oblique tangent projection, "
-            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+            f"got update.shape={update_arr.shape}, param.shape={param_arr.shape}."
         )
-    if update_f32.shape != param_f32.shape:
+    if update_arr.shape != param_arr.shape:
         raise ValueError(
             "Row-Oblique tangent projection requires matching update/parameter shapes, "
-            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+            f"got update.shape={update_arr.shape}, param.shape={param_arr.shape}."
         )
 
-    width = param_f32.shape[1]
+    width = param_arr.shape[1]
     denom = jnp.asarray((target_rms ** 2) * width, dtype=jnp.float32)
-    row_alignment = jnp.sum(update_f32 * param_f32, axis=1, keepdims=True)
-    return update_f32 - param_f32 * (row_alignment / denom)
+    row_alignment = jnp.sum(update_arr * param_arr, axis=1, keepdims=True, dtype=jnp.float32)
+    alignment_scale = (row_alignment / denom).astype(param_arr.dtype)
+    return update_arr - param_arr * alignment_scale
 
 
 def project_to_column_oblique_tangent_space(update, param, target_norm: float = 1.0):
-    update_f32 = jnp.asarray(update, dtype=jnp.float32)
-    param_f32 = jnp.asarray(param, dtype=jnp.float32)
-    if update_f32.ndim != 2 or param_f32.ndim != 2:
+    update_arr = jnp.asarray(update)
+    param_arr = jnp.asarray(param)
+    if update_arr.ndim != 2 or param_arr.ndim != 2:
         raise ValueError(
             "Expected rank-2 matrices for Column-Oblique tangent projection, "
-            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+            f"got update.shape={update_arr.shape}, param.shape={param_arr.shape}."
         )
-    if update_f32.shape != param_f32.shape:
+    if update_arr.shape != param_arr.shape:
         raise ValueError(
             "Column-Oblique tangent projection requires matching update/parameter shapes, "
-            f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
+            f"got update.shape={update_arr.shape}, param.shape={param_arr.shape}."
         )
 
-    col_alignment = jnp.sum(update_f32 * param_f32, axis=0, keepdims=True)
+    col_alignment = jnp.sum(update_arr * param_arr, axis=0, keepdims=True, dtype=jnp.float32)
     denom = jnp.asarray(target_norm ** 2, dtype=jnp.float32)
-    return update_f32 - param_f32 * (col_alignment / denom)
+    alignment_scale = (col_alignment / denom).astype(param_arr.dtype)
+    return update_arr - param_arr * alignment_scale
 
 
 def apply_row_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
-    param_f32 = jnp.asarray(param, dtype=jnp.float32)
-    update_f32 = jnp.asarray(update, dtype=jnp.float32)
-    scale = _matrix_oblique_scale(param_f32.shape)
-    scaled_param = param_f32 / scale
-    scaled_update = update_f32 / scale
+    param_arr = jnp.asarray(param)
+    update_arr = jnp.asarray(update, dtype=param_arr.dtype)
+    scale = jnp.asarray(_matrix_oblique_scale(param_arr.shape), dtype=param_arr.dtype)
+    scaled_param = param_arr / scale
+    scaled_update = update_arr / scale
     tangent_update = project_to_row_oblique_tangent_space(
         scaled_update,
         scaled_param,
@@ -305,22 +309,22 @@ def apply_row_oblique_update(update, param, learning_rate, target_rms: float = 1
         target_norm=target_rms,
         eps=eps,
     )
-    lr_f32 = jnp.asarray(learning_rate, dtype=jnp.float32)
+    lr = jnp.asarray(learning_rate, dtype=param_arr.dtype)
     next_scaled_param = row_wise_normalize_to_norm(
-        scaled_param - lr_f32 * steepest_direction,
+        scaled_param - lr * steepest_direction,
         target_norm=target_rms,
         eps=eps,
     )
     next_param = scale * next_scaled_param
-    return next_param.astype(jnp.asarray(param).dtype) - jnp.asarray(param)
+    return next_param.astype(param_arr.dtype) - param_arr
 
 
 def apply_column_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
-    param_f32 = jnp.asarray(param, dtype=jnp.float32)
-    update_f32 = jnp.asarray(update, dtype=jnp.float32)
-    scale = _matrix_oblique_scale(param_f32.shape)
-    scaled_param = param_f32 / scale
-    scaled_update = update_f32 / scale
+    param_arr = jnp.asarray(param)
+    update_arr = jnp.asarray(update, dtype=param_arr.dtype)
+    scale = jnp.asarray(_matrix_oblique_scale(param_arr.shape), dtype=param_arr.dtype)
+    scaled_param = param_arr / scale
+    scaled_update = update_arr / scale
     tangent_update = project_to_column_oblique_tangent_space(
         scaled_update,
         scaled_param,
@@ -331,14 +335,14 @@ def apply_column_oblique_update(update, param, learning_rate, target_rms: float 
         target_norm=target_rms,
         eps=eps,
     )
-    lr_f32 = jnp.asarray(learning_rate, dtype=jnp.float32)
+    lr = jnp.asarray(learning_rate, dtype=param_arr.dtype)
     next_scaled_param = column_wise_normalize_to_norm(
-        scaled_param - lr_f32 * steepest_direction,
+        scaled_param - lr * steepest_direction,
         target_norm=target_rms,
         eps=eps,
     )
     next_param = scale * next_scaled_param
-    return next_param.astype(jnp.asarray(param).dtype) - jnp.asarray(param)
+    return next_param.astype(param_arr.dtype) - param_arr
 
 
 class EmaMomentumState(NamedTuple):
@@ -371,7 +375,7 @@ def scale_by_ema_momentum(decay: float) -> optax.GradientTransformation:
         if isinstance(update, optax.MaskedNode) or isinstance(mu, optax.MaskedNode):
             return update
         new_mu = decay * mu + (1.0 - decay) * jnp.asarray(update)
-        return new_mu.astype(jnp.asarray(update).dtype)
+        return new_mu.astype(jnp.asarray(mu).dtype)
 
     def update_fn(updates, state, params=None):
         del params
