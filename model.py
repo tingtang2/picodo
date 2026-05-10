@@ -51,10 +51,8 @@ class TransformerDecoder(nnx.Module):
             h = h - self.final_hidden_mean_centering_coeff * jnp.mean(h, axis=-1, keepdims=True)
         if self.lm_head_oblique_learn_target_rms:
             target_rms = jnp.exp(jnp.asarray(self.lm_head_oblique_target_rms_log.value, dtype=h.dtype))
-            output_embeddings = self.token_embed_out.embedding.value.astype(h.dtype) * target_rms
-            logits = jnp.einsum('btd,vd->btv', h, output_embeddings) # [B, T, V]
-        else:
-            logits = self.token_embed_out.attend(h) # [B, T, V]
+            h = h * target_rms
+        logits = self.token_embed_out.attend(h) # [B, T, V]
 
         if return_qkv:
             return logits, qkv_outputs

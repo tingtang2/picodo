@@ -230,11 +230,24 @@ def row_wise_normalize(matrix, target_rms: float = 1.0, eps: float = 1e-8):
 
 
 def column_wise_normalize(matrix, target_rms: float = 1.0, eps: float = 1e-8):
-    return row_wise_normalize(jnp.asarray(matrix).T, target_rms=target_rms, eps=eps).T
+    matrix_f32 = jnp.asarray(matrix, dtype=jnp.float32)
+    return column_wise_normalize_to_norm(
+        matrix_f32,
+        target_norm=_oblique_target_norm(matrix_f32.shape[0], target_rms),
+        eps=eps,
+    )
 
 
 def column_wise_normalize_to_norm(matrix, target_norm: float = 1.0, eps: float = 1e-8):
-    return row_wise_normalize_to_norm(jnp.asarray(matrix).T, target_norm=target_norm, eps=eps).T
+    matrix_f32 = jnp.asarray(matrix, dtype=jnp.float32)
+    if matrix_f32.ndim != 2:
+        raise ValueError(
+            "Expected a rank-2 matrix for column-wise normalization, "
+            f"got shape={matrix_f32.shape}."
+        )
+    col_norms = jnp.linalg.norm(matrix_f32, axis=0, keepdims=True)
+    safe_col_norms = jnp.maximum(col_norms, jnp.asarray(eps, dtype=jnp.float32))
+    return matrix_f32 * (jnp.asarray(target_norm, dtype=jnp.float32) / safe_col_norms)
 
 
 def project_to_row_oblique_tangent_space(update, param, target_rms: float = 1.0):
@@ -277,13 +290,29 @@ def project_to_column_oblique_tangent_space(update, param, target_norm: float = 
 
 
 def apply_row_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
-    return apply_column_oblique_update(
-        jnp.asarray(update).T,
-        jnp.asarray(param).T,
-        learning_rate=learning_rate,
+    param_f32 = jnp.asarray(param, dtype=jnp.float32)
+    update_f32 = jnp.asarray(update, dtype=jnp.float32)
+    scale = _matrix_oblique_scale(param_f32.shape)
+    scaled_param = param_f32 / scale
+    scaled_update = update_f32 / scale
+    tangent_update = project_to_row_oblique_tangent_space(
+        scaled_update,
+        scaled_param,
         target_rms=target_rms,
+    )
+    steepest_direction = row_wise_normalize_to_norm(
+        tangent_update,
+        target_norm=target_rms,
         eps=eps,
-    ).T
+    )
+    lr_f32 = jnp.asarray(learning_rate, dtype=jnp.float32)
+    next_scaled_param = row_wise_normalize_to_norm(
+        scaled_param - lr_f32 * steepest_direction,
+        target_norm=target_rms,
+        eps=eps,
+    )
+    next_param = scale * next_scaled_param
+    return next_param.astype(jnp.asarray(param).dtype) - jnp.asarray(param)
 
 
 def apply_column_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
