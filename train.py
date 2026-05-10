@@ -406,8 +406,19 @@ def loss_fn_z_loss_with_soft_cap(
     return capped_ce + lam * z_loss, (losses, qkv_stats, cap_stats)
 
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats'), donate_argnames=('opt_state'))
-def train_step(opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats: bool = True):
+@partial(
+    jax.jit,
+    static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats', 'return_grads'),
+    donate_argnames=('opt_state'),
+)
+def train_step(
+    opt_state,
+    opt_graphdef,
+    model_graphdef,
+    batch,
+    collect_qkv_stats: bool = True,
+    return_grads: bool = False,
+):
     # Use has_aux=True to get the raw losses
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
         opt_state.model, model_graphdef, batch, collect_qkv_stats
@@ -417,10 +428,21 @@ def train_step(opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss, grads
+    return opt_state, loss, raw_loss, grads if return_grads else None
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats'), donate_argnames=('opt_state'))
-def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats: bool = True):
+@partial(
+    jax.jit,
+    static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats', 'return_grads'),
+    donate_argnames=('opt_state'),
+)
+def train_step_z_loss(
+    opt_state,
+    opt_graphdef,
+    model_graphdef,
+    batch,
+    collect_qkv_stats: bool = True,
+    return_grads: bool = False,
+):
     # Use has_aux=True to get the raw losses
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(
         opt_state.model, model_graphdef, batch, collect_qkv_stats
@@ -430,10 +452,21 @@ def train_step_z_loss(opt_state, opt_graphdef, model_graphdef, batch, collect_qk
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss, grads
+    return opt_state, loss, raw_loss, grads if return_grads else None
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats'), donate_argnames=('opt_state'))
-def train_step_centered(opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats: bool = True):
+@partial(
+    jax.jit,
+    static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats', 'return_grads'),
+    donate_argnames=('opt_state'),
+)
+def train_step_centered(
+    opt_state,
+    opt_graphdef,
+    model_graphdef,
+    batch,
+    collect_qkv_stats: bool = True,
+    return_grads: bool = False,
+):
     # Use has_aux=True to get the raw losses
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
         opt_state.model, model_graphdef, batch, collect_qkv_stats
@@ -444,10 +477,21 @@ def train_step_centered(opt_state, opt_graphdef, model_graphdef, batch, collect_
     model_lib.center_output_embeddings(optimizer.model)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss, grads
+    return opt_state, loss, raw_loss, grads if return_grads else None
 
-@partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats'), donate_argnames=('opt_state'))
-def train_step_z_loss_centered(opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats: bool = True):
+@partial(
+    jax.jit,
+    static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats', 'return_grads'),
+    donate_argnames=('opt_state'),
+)
+def train_step_z_loss_centered(
+    opt_state,
+    opt_graphdef,
+    model_graphdef,
+    batch,
+    collect_qkv_stats: bool = True,
+    return_grads: bool = False,
+):
     # Use has_aux=True to get the raw losses
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(
         opt_state.model, model_graphdef, batch, collect_qkv_stats
@@ -458,7 +502,7 @@ def train_step_z_loss_centered(opt_state, opt_graphdef, model_graphdef, batch, c
     model_lib.center_output_embeddings(optimizer.model)
     opt_state = nnx.state(optimizer)
     
-    return opt_state, loss, raw_loss, grads
+    return opt_state, loss, raw_loss, grads if return_grads else None
 
 
 @partial(jax.jit, static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats'), donate_argnames=('opt_state'))
@@ -1508,6 +1552,7 @@ def train_and_evaluate(c: DictConfig):
         will_log_heavy_metrics = log_metrics_per_step_full or (
             (train_loss_num + 1) * tokens_per_opt_step >= c.log_every_tokens
         )
+        need_step_grads = bool(will_log_heavy_metrics)
         pre_output_logit_mean = None
         pre_output_logit_norm = None
         pre_output_logit_std = None
@@ -1731,20 +1776,40 @@ def train_and_evaluate(c: DictConfig):
             if c.opt.use_z_loss:
                 if mucentering:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss_centered(
-                        opt_state, opt_graphdef, model_graphdef, rewritten_batch, collect_qkv_stats
+                        opt_state,
+                        opt_graphdef,
+                        model_graphdef,
+                        rewritten_batch,
+                        collect_qkv_stats,
+                        need_step_grads,
                     )
                 else:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(
-                        opt_state, opt_graphdef, model_graphdef, rewritten_batch, collect_qkv_stats
+                        opt_state,
+                        opt_graphdef,
+                        model_graphdef,
+                        rewritten_batch,
+                        collect_qkv_stats,
+                        need_step_grads,
                     )
             else:
                 if mucentering:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_centered(
-                        opt_state, opt_graphdef, model_graphdef, rewritten_batch, collect_qkv_stats
+                        opt_state,
+                        opt_graphdef,
+                        model_graphdef,
+                        rewritten_batch,
+                        collect_qkv_stats,
+                        need_step_grads,
                     )
                 else:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(
-                        opt_state, opt_graphdef, model_graphdef, rewritten_batch, collect_qkv_stats
+                        opt_state,
+                        opt_graphdef,
+                        model_graphdef,
+                        rewritten_batch,
+                        collect_qkv_stats,
+                        need_step_grads,
                     )
             num_replaced = int(np.count_nonzero(rewrite_hard_mask_np))
             total_rewrite_tokens = int(rewrite_hard_mask_np.size)
@@ -1765,20 +1830,40 @@ def train_and_evaluate(c: DictConfig):
             if c.opt.use_z_loss:
                 if mucentering:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss_centered(
-                        opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
+                        opt_state,
+                        opt_graphdef,
+                        model_graphdef,
+                        batch,
+                        collect_qkv_stats,
+                        need_step_grads,
                     )
                 else:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss(
-                        opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
+                        opt_state,
+                        opt_graphdef,
+                        model_graphdef,
+                        batch,
+                        collect_qkv_stats,
+                        need_step_grads,
                     )
             else:
                 if mucentering:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_centered(
-                        opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
+                        opt_state,
+                        opt_graphdef,
+                        model_graphdef,
+                        batch,
+                        collect_qkv_stats,
+                        need_step_grads,
                     )
                 else:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step(
-                        opt_state, opt_graphdef, model_graphdef, batch, collect_qkv_stats
+                        opt_state,
+                        opt_graphdef,
+                        model_graphdef,
+                        batch,
+                        collect_qkv_stats,
+                        need_step_grads,
                     )
         if loss_skip_enabled:
             raw_np = _to_host_numpy(train_raw_loss, dtype=np.float32, flatten=True)
