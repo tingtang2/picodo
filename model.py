@@ -20,13 +20,18 @@ class TransformerDecoder(nnx.Module):
         self.lm_head_oblique_initial_target_rms_from_random_init = bool(
             getattr(c, "lm_head_oblique_initial_target_rms_from_random_init", False)
         )
+        self.lm_head_oblique_optimizer_type = str(getattr(c, "lm_head_oblique_optimizer_type", "row_oblique")).lower()
         self.token_embed_in = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
         self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=lm_head_dtype, rngs=rngs)
         if self.lm_head_oblique_learn_target_rms:
             if self.lm_head_oblique_initial_target_rms_from_random_init:
                 output_embedding = jnp.asarray(self.token_embed_out.embedding.value, dtype=jnp.float32)
-                row_rms = jnp.sqrt(jnp.mean(jnp.square(output_embedding), axis=1))
-                initial_target_rms = jnp.mean(row_rms)
+                if self.lm_head_oblique_optimizer_type == "column_oblique":
+                    col_rms = jnp.sqrt(jnp.mean(jnp.square(output_embedding), axis=0))
+                    initial_target_rms = jnp.mean(col_rms)
+                else:
+                    row_rms = jnp.sqrt(jnp.mean(jnp.square(output_embedding), axis=1))
+                    initial_target_rms = jnp.mean(row_rms)
             else:
                 initial_target_rms = float(getattr(c, "lm_head_oblique_initial_target_rms", 1.0))
                 if initial_target_rms <= 0.0:
@@ -80,14 +85,21 @@ def get_average_output_embedding_row_rms(model: TransformerDecoder):
     return float(jnp.mean(row_rms))
 
 
+def get_average_output_embedding_col_rms(model: TransformerDecoder):
+    embeddings = jnp.asarray(model.token_embed_out.embedding.value, dtype=jnp.float32)
+    col_rms = jnp.sqrt(jnp.mean(jnp.square(embeddings), axis=0))
+    return float(jnp.mean(col_rms))
+
+
 def row_normalize_output_embeddings(model: TransformerDecoder, target_rms: float = 1.0, eps: float = 1e-8):
     embeddings = model.token_embed_out.embedding.value
     embeddings_f32 = embeddings.astype(jnp.float32)
-    scale = jnp.asarray(jnp.sqrt(embeddings.shape[1] / embeddings.shape[0]), dtype=jnp.float32)
-    scaled_embeddings = embeddings_f32 / scale
-    row_norms = jnp.linalg.norm(scaled_embeddings, axis=1, keepdims=True)
+    row_norms = jnp.linalg.norm(embeddings_f32, axis=1, keepdims=True)
     safe_row_norms = jnp.maximum(row_norms, jnp.asarray(eps, dtype=jnp.float32))
-    model.token_embed_out.embedding.value = (scale * scaled_embeddings * (target_rms / safe_row_norms)).astype(
+    target_norm = jnp.asarray(target_rms, dtype=jnp.float32) * jnp.sqrt(
+        jnp.asarray(embeddings.shape[1], dtype=jnp.float32)
+    )
+    model.token_embed_out.embedding.value = (embeddings_f32 * (target_norm / safe_row_norms)).astype(
         embeddings.dtype
     )
 
@@ -95,11 +107,12 @@ def row_normalize_output_embeddings(model: TransformerDecoder, target_rms: float
 def column_normalize_output_embeddings(model: TransformerDecoder, target_rms: float = 1.0, eps: float = 1e-8):
     embeddings = model.token_embed_out.embedding.value
     embeddings_f32 = embeddings.astype(jnp.float32)
-    scale = jnp.asarray(jnp.sqrt(embeddings.shape[0] / embeddings.shape[1]), dtype=jnp.float32)
-    scaled_embeddings = embeddings_f32 / scale
-    col_norms = jnp.linalg.norm(scaled_embeddings, axis=0, keepdims=True)
+    col_norms = jnp.linalg.norm(embeddings_f32, axis=0, keepdims=True)
     safe_col_norms = jnp.maximum(col_norms, jnp.asarray(eps, dtype=jnp.float32))
-    model.token_embed_out.embedding.value = (scale * scaled_embeddings * (target_rms / safe_col_norms)).astype(
+    target_norm = jnp.asarray(target_rms, dtype=jnp.float32) * jnp.sqrt(
+        jnp.asarray(embeddings.shape[0], dtype=jnp.float32)
+    )
+    model.token_embed_out.embedding.value = (embeddings_f32 * (target_norm / safe_col_norms)).astype(
         embeddings.dtype
     )
 

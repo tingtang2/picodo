@@ -152,10 +152,12 @@ def sync_lm_head_oblique_model_config(c):
             c.model.lm_head_oblique_learn_target_rms = learn_target_rms
             c.model.lm_head_oblique_initial_target_rms = initial_target_rms
             c.model.lm_head_oblique_initial_target_rms_from_random_init = initial_target_rms_from_random_init
+            c.model.lm_head_oblique_optimizer_type = lm_head_optimizer_type
     else:
         c.model.lm_head_oblique_learn_target_rms = learn_target_rms
         c.model.lm_head_oblique_initial_target_rms = initial_target_rms
         c.model.lm_head_oblique_initial_target_rms_from_random_init = initial_target_rms_from_random_init
+        c.model.lm_head_oblique_optimizer_type = lm_head_optimizer_type
 
 
 def validate_row_oblique_lm_head_options(opt_cfg):
@@ -236,14 +238,9 @@ def get_row_oblique_target_rms(opt_cfg) -> float:
 
 
 def _oblique_target_norm(width: int, target_rms: float):
-    return jnp.asarray(target_rms * np.sqrt(width), dtype=jnp.float32)
-
-
-def _matrix_oblique_scale(matrix_shape):
-    if len(matrix_shape) != 2:
-        raise ValueError(f"Expected a rank-2 matrix shape, got {matrix_shape}.")
-    fanout, fanin = matrix_shape
-    return jnp.asarray(np.sqrt(fanout / fanin), dtype=jnp.float32)
+    return jnp.asarray(target_rms, dtype=jnp.float32) * jnp.sqrt(
+        jnp.asarray(width, dtype=jnp.float32)
+    )
 
 
 def row_wise_normalize_to_norm(matrix, target_norm: float = 1.0, eps: float = 1e-8):
@@ -308,7 +305,7 @@ def project_to_row_oblique_tangent_space(update, param, target_rms: float = 1.0)
     return update_f32 - param_f32 * (row_alignment / denom)
 
 
-def project_to_column_oblique_tangent_space(update, param, target_norm: float = 1.0):
+def project_to_column_oblique_tangent_space(update, param, target_rms: float = 1.0):
     update_f32 = jnp.asarray(update, dtype=jnp.float32)
     param_f32 = jnp.asarray(param, dtype=jnp.float32)
     if update_f32.ndim != 2 or param_f32.ndim != 2:
@@ -322,60 +319,53 @@ def project_to_column_oblique_tangent_space(update, param, target_norm: float = 
             f"got update.shape={update_f32.shape}, param.shape={param_f32.shape}."
         )
 
+    height = param_f32.shape[0]
     col_alignment = jnp.sum(update_f32 * param_f32, axis=0, keepdims=True)
-    denom = jnp.asarray(target_norm ** 2, dtype=jnp.float32)
+    denom = jnp.asarray((target_rms ** 2) * height, dtype=jnp.float32)
     return update_f32 - param_f32 * (col_alignment / denom)
 
 
 def apply_row_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
     param_f32 = jnp.asarray(param, dtype=jnp.float32)
     update_f32 = jnp.asarray(update, dtype=jnp.float32)
-    scale = _matrix_oblique_scale(param_f32.shape)
-    scaled_param = param_f32 / scale
-    scaled_update = update_f32 / scale
     tangent_update = project_to_row_oblique_tangent_space(
-        scaled_update,
-        scaled_param,
+        update_f32,
+        param_f32,
         target_rms=target_rms,
     )
-    steepest_direction = row_wise_normalize_to_norm(
+    steepest_direction = row_wise_normalize(
         tangent_update,
-        target_norm=target_rms,
+        target_rms=target_rms,
         eps=eps,
     )
     lr_f32 = jnp.asarray(learning_rate, dtype=jnp.float32)
-    next_scaled_param = row_wise_normalize_to_norm(
-        scaled_param - lr_f32 * steepest_direction,
-        target_norm=target_rms,
+    next_param = row_wise_normalize(
+        param_f32 - lr_f32 * steepest_direction,
+        target_rms=target_rms,
         eps=eps,
     )
-    next_param = scale * next_scaled_param
     return next_param.astype(jnp.asarray(param).dtype) - jnp.asarray(param)
 
 
 def apply_column_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
     param_f32 = jnp.asarray(param, dtype=jnp.float32)
     update_f32 = jnp.asarray(update, dtype=jnp.float32)
-    scale = _matrix_oblique_scale(param_f32.shape)
-    scaled_param = param_f32 / scale
-    scaled_update = update_f32 / scale
     tangent_update = project_to_column_oblique_tangent_space(
-        scaled_update,
-        scaled_param,
-        target_norm=target_rms,
+        update_f32,
+        param_f32,
+        target_rms=target_rms,
     )
-    steepest_direction = column_wise_normalize_to_norm(
+    steepest_direction = column_wise_normalize(
         tangent_update,
-        target_norm=target_rms,
+        target_rms=target_rms,
         eps=eps,
     )
     lr_f32 = jnp.asarray(learning_rate, dtype=jnp.float32)
-    next_scaled_param = column_wise_normalize_to_norm(
-        scaled_param - lr_f32 * steepest_direction,
-        target_norm=target_rms,
+    next_param = column_wise_normalize(
+        param_f32 - lr_f32 * steepest_direction,
+        target_rms=target_rms,
         eps=eps,
     )
-    next_param = scale * next_scaled_param
     return next_param.astype(jnp.asarray(param).dtype) - jnp.asarray(param)
 
 
@@ -783,38 +773,34 @@ def get_layer_grad_norms_split(grads):
     return norms
 
 def get_layer_weight_norms(params):
+    leaves = _collect_weight_leaves_with_effective_lm_head(params)
     norms = {}
-    norms['weight_norm/global'] = get_l2_norm(params)
-    
-    for key, value in params.items():
-        if key == 'blocks':
-            for i, block_params in value.items():
-                norms[f'weight_norm/blocks.{i}'] = get_l2_norm(block_params)
+    global_sq_sum = sum((jnp.sum(value * value) for value in leaves.values()), jnp.asarray(0.0, dtype=jnp.float32))
+    norms['weight_norm/global'] = jnp.sqrt(global_sq_sum)
+
+    grouped_sq_sums = {}
+    for path, value in leaves.items():
+        path_parts = path.split(".")
+        if path_parts[0] == "blocks" and len(path_parts) > 1:
+            group_key = f"blocks.{path_parts[1]}"
         else:
-            norms[f'weight_norm/{key}'] = get_l2_norm(value)
-            
+            group_key = path_parts[0]
+        grouped_sq_sums[group_key] = grouped_sq_sums.get(group_key, jnp.asarray(0.0, dtype=jnp.float32)) + jnp.sum(
+            value * value
+        )
+
+    for key, sq_sum in grouped_sq_sums.items():
+        norms[f'weight_norm/{key}'] = jnp.sqrt(sq_sum)
+
     return norms
 
 def get_layer_weight_norms_split(params):
+    leaves = _collect_weight_leaves_with_effective_lm_head(params)
     norms = {}
-    norms['weight_norm/global'] = float(get_l2_norm(params))
-    def visit(path, node):
-        # Case 1: Param leaf
-        if hasattr(node, "value"):      # nnx.Param
-            norms[f"weight_norm/{path}"] = float(get_l2_norm(node.value))
-            return
-        # Case 2: State or dict-like object
-        if hasattr(node, "items"):      # nnx.State, nested dicts
-            for key, value in node.items():
-                key = str(key)
-                new_path = key if path == "" else f"{path}.{key}"
-                visit(new_path, value)
-            return
-        # Case 3: raw array leaf
-        if isinstance(node, (jnp.ndarray, np.ndarray)):
-            norms[f"weight_norm/{path}"] = float(get_l2_norm(node))
-            return
-    visit("", params)
+    global_sq_sum = sum((jnp.sum(value * value) for value in leaves.values()), jnp.asarray(0.0, dtype=jnp.float32))
+    norms['weight_norm/global'] = float(jnp.sqrt(global_sq_sum))
+    for path, value in leaves.items():
+        norms[f"weight_norm/{path}"] = float(get_l2_norm(value))
     return norms
 
 
@@ -858,6 +844,46 @@ def _get_nested_state_item(tree, path):
 def _state_leaf_to_array(node, dtype=jnp.float32):
     value = node.value if hasattr(node, "value") else node
     return jnp.asarray(value, dtype=dtype)
+
+
+def _get_lm_head_effective_scale(model_state, dtype=jnp.float32):
+    try:
+        log_target_rms = _state_leaf_to_array(
+            _get_nested_state_item(model_state, ("lm_head_oblique_target_rms_log",)),
+            dtype=dtype,
+        )
+    except (AttributeError, KeyError, TypeError):
+        return None
+    return jnp.exp(jnp.asarray(log_target_rms, dtype=dtype))
+
+
+def _maybe_scale_output_embedding_array(path: str, value, lm_head_effective_scale):
+    value = jnp.asarray(value, dtype=jnp.float32)
+    if path == "token_embed_out.embedding" and lm_head_effective_scale is not None:
+        return value * jnp.asarray(lm_head_effective_scale, dtype=value.dtype)
+    return value
+
+
+def _collect_weight_leaves_with_effective_lm_head(tree):
+    leaves = {}
+    lm_head_effective_scale = _get_lm_head_effective_scale(tree, dtype=jnp.float32)
+
+    def visit(path, node):
+        if hasattr(node, "value"):
+            leaves[path] = _maybe_scale_output_embedding_array(path, node.value, lm_head_effective_scale)
+            return
+        if hasattr(node, "items"):
+            for key, value in node.items():
+                key = str(key)
+                child_path = key if path == "" else f"{path}.{key}"
+                visit(child_path, value)
+            return
+        if isinstance(node, (jnp.ndarray, np.ndarray)):
+            leaves[path] = _maybe_scale_output_embedding_array(path, node, lm_head_effective_scale)
+            return
+
+    visit("", tree)
+    return leaves
 
 
 def _get_first_nested_state_item(tree, candidate_paths):
@@ -983,6 +1009,10 @@ def get_output_embedding_group_metrics(opt_state, token_groups, eps: float):
     except (AttributeError, KeyError, TypeError):
         return {}
 
+    lm_head_effective_scale = _get_lm_head_effective_scale(opt_state.model, dtype=jnp.float32)
+    if lm_head_effective_scale is not None:
+        output_embedding = output_embedding * lm_head_effective_scale
+
     if output_embedding.ndim != 2:
         return {}
 
@@ -1095,6 +1125,7 @@ def get_lm_head_oblique_target_metrics(model_state):
         "lm_head_oblique/target_rms": float(jnp.squeeze(target_rms)),
     }
 
+
 def compute_qkv_stats(qkv_dict):
     stats = {}
     for i, (q, k, v) in qkv_dict.items():
@@ -1112,6 +1143,7 @@ def compute_qkv_stats(qkv_dict):
         stats[f'k/layer_{i}/fro_norm'] = get_l2_norm(k)
         stats[f'v/layer_{i}/fro_norm'] = get_l2_norm(v)
     return stats
+
 
 @partial(jax.jit, static_argnames=('model_graphdef', 'vocab_size'))
 def _per_token_loss_sum_and_count(model_state, model_graphdef, x, vocab_size):
@@ -1150,6 +1182,7 @@ def _per_batch_grad_W_U(model_state, model_graphdef, x):
     g_W_U = _get_nested_state_item(grads, ("token_embed_out", "embedding"))
     return _state_leaf_to_array(g_W_U)  # [V, D]
 
+
 def _compute_adam_update_W_U(model_state, opt_state, lr_at_step, eps, weight_decay):
     """Returns (update_W_U, m_W_U, v_W_U) — AdamW update plus the stored
     first/second moments that produced it."""
@@ -1160,6 +1193,7 @@ def _compute_adam_update_W_U(model_state, opt_state, lr_at_step, eps, weight_dec
     update_W_U = -lr_at_step * m_W_U / (jnp.sqrt(v_W_U) + eps)
     update_W_U -= lr_at_step * weight_decay * W_U
     return update_W_U, m_W_U, v_W_U
+
 
 def _dist_stats(x):
     """Return (median, p90, p99, max, mean) as Python floats for a [V] array."""

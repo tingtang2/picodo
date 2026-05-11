@@ -1097,18 +1097,13 @@ def train_and_evaluate(c: DictConfig):
     if lm_head_optimizer_type in {"row_oblique", "column_oblique"}:
         learn_target_rms = utils.lm_head_uses_learned_target_rms(c.opt)
         target_rms_from_random_init = utils.lm_head_target_rms_from_random_init(c.opt)
-        random_init_row_rms = (
-            model_lib.get_average_output_embedding_row_rms(model)
-            if target_rms_from_random_init
-            else None
-        )
         if learn_target_rms:
             resolved_lm_head_target_rms = utils.get_lm_head_oblique_optimizer_target_rms(c.opt)
         elif target_rms_from_random_init:
             resolved_lm_head_target_rms = (
-                float(random_init_row_rms * np.sqrt(c.model.V))
+                float(model_lib.get_average_output_embedding_row_rms(model))
                 if lm_head_optimizer_type == "row_oblique"
-                else float(random_init_row_rms * np.sqrt(c.model.D))
+                else float(model_lib.get_average_output_embedding_col_rms(model))
             )
         else:
             resolved_lm_head_target_rms = utils.get_lm_head_oblique_optimizer_target_rms(c.opt)
@@ -1119,7 +1114,9 @@ def train_and_evaluate(c: DictConfig):
         )
         initial_target_rms_source = (
             "random_init_row_rms"
-            if utils.lm_head_initial_target_rms_from_random_init(c.opt)
+            if utils.lm_head_initial_target_rms_from_random_init(c.opt) and lm_head_optimizer_type == "row_oblique"
+            else "random_init_col_rms"
+            if utils.lm_head_initial_target_rms_from_random_init(c.opt) and lm_head_optimizer_type == "column_oblique"
             else "fixed_target_rms_from_random_init"
             if target_rms_from_random_init
             else "config"
@@ -1130,7 +1127,9 @@ def train_and_evaluate(c: DictConfig):
                 target_rms=resolved_lm_head_target_rms,
                 eps=float(getattr(getattr(c.opt, "lm_head_optimizer", None), "eps", c.opt.eps)),
             )
-            actual_row_l2 = float(np.sqrt(c.model.D / c.model.V) * initial_target_rms)
+            actual_row_l2 = float(
+                jnp.sqrt(jnp.asarray(c.model.D, dtype=jnp.float32)) * jnp.asarray(initial_target_rms, dtype=jnp.float32)
+            )
             init_log_message = (
                 "row-oblique lm-head initialization enabled: "
                 f"scaled_target_norm={resolved_lm_head_target_rms}, "
@@ -1144,7 +1143,9 @@ def train_and_evaluate(c: DictConfig):
                 target_rms=resolved_lm_head_target_rms,
                 eps=float(getattr(getattr(c.opt, "lm_head_optimizer", None), "eps", c.opt.eps)),
             )
-            actual_col_l2 = float(np.sqrt(c.model.V / c.model.D) * initial_target_rms)
+            actual_col_l2 = float(
+                jnp.sqrt(jnp.asarray(c.model.V, dtype=jnp.float32)) * jnp.asarray(initial_target_rms, dtype=jnp.float32)
+            )
             init_log_message = (
                 "column-oblique lm-head initialization enabled: "
                 f"scaled_target_norm={resolved_lm_head_target_rms}, "
