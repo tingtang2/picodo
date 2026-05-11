@@ -938,12 +938,13 @@ def _build_heavy_train_metrics(
         metrics['train_output_logit_std'] = output_logit_std
         metrics['train_output_logit_entropy'] = output_logit_entropy
     if include_model_diagnostics:
-        metrics.update(utils.get_layer_grad_norms_split(grads))
         metrics.update(utils.get_layer_weight_norms_split(opt_state.model))
         metrics.update(utils.get_layer_moment_norms(opt_state))
-        metrics.update(utils.get_layer_second_moment_rms_metrics(grads, opt_state))
         metrics.update(utils.get_output_embedding_group_metrics(opt_state, output_embedding_metric_groups, eps=adam_eps))
         metrics.update(utils.get_lm_head_oblique_target_metrics(opt_state.model))
+        if grads is not None:
+            metrics.update(utils.get_layer_grad_norms_split(grads))
+            metrics.update(utils.get_layer_second_moment_rms_metrics(grads, opt_state))
     if logit_grad_stats is not None:
         metrics.update(logit_grad_stats)
     if logit_grad_scaling_stats is not None:
@@ -1552,7 +1553,7 @@ def train_and_evaluate(c: DictConfig):
         will_log_heavy_metrics = log_metrics_per_step_full or (
             (train_loss_num + 1) * tokens_per_opt_step >= c.log_every_tokens
         )
-        need_step_grads = bool(will_log_heavy_metrics)
+        need_step_grads = False
         pre_output_logit_mean = None
         pre_output_logit_norm = None
         pre_output_logit_std = None
