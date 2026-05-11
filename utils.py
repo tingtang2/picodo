@@ -114,6 +114,16 @@ def lm_head_uses_learned_target_rms(opt_cfg) -> bool:
     return bool(getattr(lm_head_optimizer_cfg, "learn_target_rms", False))
 
 
+def lm_head_initial_target_rms_from_random_init(opt_cfg) -> bool:
+    lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
+    return bool(getattr(lm_head_optimizer_cfg, "initial_target_rms_from_random_init", False))
+
+
+def lm_head_target_rms_from_random_init(opt_cfg) -> bool:
+    lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
+    return bool(getattr(lm_head_optimizer_cfg, "target_rms_from_random_init", False))
+
+
 def get_lm_head_oblique_initial_target_rms(opt_cfg) -> float:
     lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
     return float(getattr(lm_head_optimizer_cfg, "initial_target_rms", get_lm_head_oblique_target_rms(opt_cfg)))
@@ -130,32 +140,60 @@ def sync_lm_head_oblique_model_config(c):
     lm_head_optimizer_type = get_lm_head_optimizer_type(c.opt)
     use_oblique_optimizer = lm_head_optimizer_type in {"row_oblique", "column_oblique"}
     learn_target_rms = use_oblique_optimizer and lm_head_uses_learned_target_rms(c.opt)
+    initial_target_rms_from_random_init = (
+        use_oblique_optimizer and learn_target_rms and lm_head_initial_target_rms_from_random_init(c.opt)
+    )
     initial_target_rms = get_lm_head_oblique_initial_target_rms(c.opt)
-    if initial_target_rms <= 0.0:
+    if (not initial_target_rms_from_random_init) and initial_target_rms <= 0.0:
         raise ValueError(f"Expected initial_target_rms to be positive, got {initial_target_rms}.")
 
     if isinstance(c.model, DictConfig):
         with open_dict(c.model):
             c.model.lm_head_oblique_learn_target_rms = learn_target_rms
             c.model.lm_head_oblique_initial_target_rms = initial_target_rms
+            c.model.lm_head_oblique_initial_target_rms_from_random_init = initial_target_rms_from_random_init
     else:
         c.model.lm_head_oblique_learn_target_rms = learn_target_rms
         c.model.lm_head_oblique_initial_target_rms = initial_target_rms
+        c.model.lm_head_oblique_initial_target_rms_from_random_init = initial_target_rms_from_random_init
 
 
 def validate_row_oblique_lm_head_options(opt_cfg):
     lm_head_optimizer_type = get_lm_head_optimizer_type(opt_cfg)
     learn_target_rms = lm_head_uses_learned_target_rms(opt_cfg)
+    initial_target_rms_from_random_init = lm_head_initial_target_rms_from_random_init(opt_cfg)
+    target_rms_from_random_init = lm_head_target_rms_from_random_init(opt_cfg)
     if lm_head_optimizer_type not in {"row_oblique", "column_oblique"}:
         if learn_target_rms:
             raise ValueError(
                 "opt.lm_head_optimizer.learn_target_rms requires "
                 "opt.lm_head_optimizer.type to be 'row_oblique' or 'column_oblique'."
             )
+        if initial_target_rms_from_random_init:
+            raise ValueError(
+                "opt.lm_head_optimizer.initial_target_rms_from_random_init requires "
+                "opt.lm_head_optimizer.type to be 'row_oblique' or 'column_oblique'."
+            )
+        if target_rms_from_random_init:
+            raise ValueError(
+                "opt.lm_head_optimizer.target_rms_from_random_init requires "
+                "opt.lm_head_optimizer.type to be 'row_oblique' or 'column_oblique'."
+            )
         return
     manifold_name = "Row-Oblique" if lm_head_optimizer_type == "row_oblique" else "Column-Oblique"
+    if initial_target_rms_from_random_init and not learn_target_rms:
+        raise ValueError(
+            "opt.lm_head_optimizer.initial_target_rms_from_random_init requires "
+            "opt.lm_head_optimizer.learn_target_rms=true."
+        )
+    if target_rms_from_random_init and learn_target_rms:
+        raise ValueError(
+            "opt.lm_head_optimizer.target_rms_from_random_init is only for the fixed target_rms path. "
+            "Use opt.lm_head_optimizer.initial_target_rms_from_random_init when "
+            "opt.lm_head_optimizer.learn_target_rms=true."
+        )
     initial_target_rms = get_lm_head_oblique_initial_target_rms(opt_cfg)
-    if initial_target_rms <= 0.0:
+    if (not initial_target_rms_from_random_init) and initial_target_rms <= 0.0:
         raise ValueError(
             f"Expected opt.lm_head_optimizer.initial_target_rms to be positive, got {initial_target_rms}."
         )

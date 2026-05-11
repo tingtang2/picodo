@@ -49,8 +49,10 @@ opt:
     momentum: 0.9 # used by sgd_momentum, row_oblique, and column_oblique
     nesterov: false # used by sgd_momentum
     target_rms: 1.0 # used by row_oblique/column_oblique: target norm on the notebook's scaled oblique manifold
+    target_rms_from_random_init: false # if true, initialize the fixed oblique target_rms from the random LM-head's average per-row RMS before oblique renormalization
     learn_target_rms: false # if true, learn a positive scalar multiplier on top of the unit oblique LM head
     initial_target_rms: ${opt.lm_head_optimizer.target_rms} # initial value for the learned target rms scalar
+    initial_target_rms_from_random_init: false # if true, initialize the learned scalar from the random LM-head's average per-row RMS before oblique renormalization
     eps: ${opt.eps} # used by row_oblique/column_oblique retraction/normalization
   lm_head_gradient_centering: 'off' # one of: off, pre, post
   lm_head_weighted_columnwise_gradient_centering: 'off' # one of: off, pre, post

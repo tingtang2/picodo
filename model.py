@@ -17,10 +17,18 @@ class TransformerDecoder(nnx.Module):
         self.final_hidden_mean_centering = bool(getattr(c, "final_hidden_mean_centering", False))
         self.final_hidden_mean_centering_coeff = float(getattr(c, "alpha", 1.0))
         self.lm_head_oblique_learn_target_rms = bool(getattr(c, "lm_head_oblique_learn_target_rms", False))
+        self.lm_head_oblique_initial_target_rms_from_random_init = bool(
+            getattr(c, "lm_head_oblique_initial_target_rms_from_random_init", False)
+        )
         self.token_embed_in = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
         self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=lm_head_dtype, rngs=rngs)
         if self.lm_head_oblique_learn_target_rms:
-            initial_target_rms = float(getattr(c, "lm_head_oblique_initial_target_rms", 1.0))
+            if self.lm_head_oblique_initial_target_rms_from_random_init:
+                output_embedding = jnp.asarray(self.token_embed_out.embedding.value, dtype=jnp.float32)
+                row_rms = jnp.sqrt(jnp.mean(jnp.square(output_embedding), axis=1))
+                initial_target_rms = float(jnp.mean(row_rms))
+            else:
+                initial_target_rms = float(getattr(c, "lm_head_oblique_initial_target_rms", 1.0))
             if initial_target_rms <= 0.0:
                 raise ValueError(
                     f"Expected `model.lm_head_oblique_initial_target_rms` to be positive, got {initial_target_rms}."
@@ -64,6 +72,12 @@ def center_output_embeddings(model: TransformerDecoder):
     embeddings = model.token_embed_out.embedding.value
     mean = jnp.mean(embeddings.astype(jnp.float32), axis=0, keepdims=True).astype(embeddings.dtype)
     model.token_embed_out.embedding.value = embeddings - mean
+
+
+def get_average_output_embedding_row_rms(model: TransformerDecoder):
+    embeddings = jnp.asarray(model.token_embed_out.embedding.value, dtype=jnp.float32)
+    row_rms = jnp.sqrt(jnp.mean(jnp.square(embeddings), axis=1))
+    return float(jnp.mean(row_rms))
 
 
 def row_normalize_output_embeddings(model: TransformerDecoder, target_rms: float = 1.0, eps: float = 1e-8):

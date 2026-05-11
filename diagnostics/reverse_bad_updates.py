@@ -196,6 +196,7 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
 
     lm_head_optimizer_cfg = getattr(c.opt, "lm_head_optimizer", None)
     lm_head_optimizer_type = utils.get_lm_head_optimizer_type(c.opt)
+    resolved_lm_head_target_rms = None
     if lm_head_optimizer_type == "adamw":
         base_optimizer_tx = adamw_tx
     elif lm_head_optimizer_type == "sgd_momentum":
@@ -298,7 +299,17 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
             )
 
         lm_head_momentum = float(getattr(lm_head_optimizer_cfg, "momentum", 0.9))
-        lm_head_target_rms = utils.get_lm_head_oblique_optimizer_target_rms(c.opt)
+        if utils.lm_head_uses_learned_target_rms(c.opt):
+            resolved_lm_head_target_rms = utils.get_lm_head_oblique_optimizer_target_rms(c.opt)
+        elif utils.lm_head_target_rms_from_random_init(c.opt):
+            random_init_row_rms = model_lib.get_average_output_embedding_row_rms(model)
+            resolved_lm_head_target_rms = (
+                float(random_init_row_rms * np.sqrt(c.model.V))
+                if lm_head_optimizer_type == "row_oblique"
+                else float(random_init_row_rms * np.sqrt(c.model.D))
+            )
+        else:
+            resolved_lm_head_target_rms = utils.get_lm_head_oblique_optimizer_target_rms(c.opt)
         lm_head_oblique_eps = float(getattr(lm_head_optimizer_cfg, "eps", c.opt.eps))
         lm_head_oblique_tx = optax.chain(
             utils.scale_by_ema_momentum(lm_head_momentum),
@@ -308,7 +319,7 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
                 else utils.column_oblique_steepest_descent
             )(
                 learning_rate=lr_schedule,
-                target_rms=lm_head_target_rms,
+                target_rms=resolved_lm_head_target_rms,
                 eps=lm_head_oblique_eps,
             )
         )
@@ -328,7 +339,7 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
             print(
                 "split lm-head optimizer enabled: "
                 f"default=adamw, lm_head={lm_head_optimizer_type}, "
-                f"momentum={lm_head_momentum}, scaled_target_norm={lm_head_target_rms}, "
+                f"momentum={lm_head_momentum}, scaled_target_norm={resolved_lm_head_target_rms}, "
                 f"learn_target_rms={utils.lm_head_uses_learned_target_rms(c.opt)}, "
                 f"eps={lm_head_oblique_eps}, weight_decay=off_for_lm_head"
             )
@@ -430,33 +441,46 @@ def main(c: DictConfig):
     utils.validate_row_oblique_lm_head_options(c.opt)
     lm_head_optimizer_type = utils.get_lm_head_optimizer_type(c.opt)
     if lm_head_optimizer_type in {"row_oblique", "column_oblique"}:
-        lm_head_target_rms = utils.get_lm_head_oblique_optimizer_target_rms(c.opt)
-        initial_target_rms = utils.get_lm_head_oblique_initial_target_rms(c.opt)
         learn_target_rms = utils.lm_head_uses_learned_target_rms(c.opt)
+        target_rms_from_random_init = utils.lm_head_target_rms_from_random_init(c.opt)
+        initial_target_rms = (
+            float(jnp.exp(jnp.asarray(model.lm_head_oblique_target_rms_log.value, dtype=jnp.float32)))
+            if learn_target_rms and hasattr(model, "lm_head_oblique_target_rms_log")
+            else resolved_lm_head_target_rms
+        )
+        initial_target_rms_source = (
+            "random_init_row_rms"
+            if utils.lm_head_initial_target_rms_from_random_init(c.opt)
+            else "fixed_target_rms_from_random_init"
+            if target_rms_from_random_init
+            else "config"
+        )
         if lm_head_optimizer_type == "row_oblique":
             model_lib.row_normalize_output_embeddings(
                 model,
-                target_rms=lm_head_target_rms,
+                target_rms=resolved_lm_head_target_rms,
                 eps=float(getattr(getattr(c.opt, "lm_head_optimizer", None), "eps", c.opt.eps)),
             )
             actual_row_l2 = float(np.sqrt(c.model.D / c.model.V) * initial_target_rms)
             init_log_message = (
                 "row-oblique lm-head initialization enabled: "
-                f"scaled_target_norm={lm_head_target_rms}, "
+                f"scaled_target_norm={resolved_lm_head_target_rms}, "
                 f"learn_target_rms={learn_target_rms}, initial_target_rms={initial_target_rms}, "
+                f"initial_target_rms_source={initial_target_rms_source}, "
                 f"initial_actual_row_l2={actual_row_l2:.6g}"
             )
         else:
             model_lib.column_normalize_output_embeddings(
                 model,
-                target_rms=lm_head_target_rms,
+                target_rms=resolved_lm_head_target_rms,
                 eps=float(getattr(getattr(c.opt, "lm_head_optimizer", None), "eps", c.opt.eps)),
             )
             actual_col_l2 = float(np.sqrt(c.model.V / c.model.D) * initial_target_rms)
             init_log_message = (
                 "column-oblique lm-head initialization enabled: "
-                f"scaled_target_norm={lm_head_target_rms}, "
+                f"scaled_target_norm={resolved_lm_head_target_rms}, "
                 f"learn_target_rms={learn_target_rms}, initial_target_rms={initial_target_rms}, "
+                f"initial_target_rms_source={initial_target_rms_source}, "
                 f"initial_actual_col_l2={actual_col_l2:.6g}"
             )
         if jax.process_index() == 0:
