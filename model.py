@@ -26,13 +26,13 @@ class TransformerDecoder(nnx.Module):
             if self.lm_head_oblique_initial_target_rms_from_random_init:
                 output_embedding = jnp.asarray(self.token_embed_out.embedding.value, dtype=jnp.float32)
                 row_rms = jnp.sqrt(jnp.mean(jnp.square(output_embedding), axis=1))
-                initial_target_rms = float(jnp.mean(row_rms))
+                initial_target_rms = jnp.mean(row_rms)
             else:
                 initial_target_rms = float(getattr(c, "lm_head_oblique_initial_target_rms", 1.0))
-            if initial_target_rms <= 0.0:
-                raise ValueError(
-                    f"Expected `model.lm_head_oblique_initial_target_rms` to be positive, got {initial_target_rms}."
-                )
+                if initial_target_rms <= 0.0:
+                    raise ValueError(
+                        f"Expected `model.lm_head_oblique_initial_target_rms` to be positive, got {initial_target_rms}."
+                    )
             self.lm_head_oblique_target_rms_log = nnx.Param(
                 jnp.asarray(jnp.log(initial_target_rms), dtype=jnp.float32)
             )
