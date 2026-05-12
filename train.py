@@ -901,6 +901,7 @@ def _build_lightweight_train_metrics(
     train_lower_90th_mean_loss,
     lr_schedule,
     b2_schedule,
+    lm_head_lr_schedule=None,
     loss_skip_stats=None,
 ):
     metrics = {}
@@ -909,6 +910,8 @@ def _build_lightweight_train_metrics(
     metrics['train_lower_90th_mean_loss'] = train_lower_90th_mean_loss
     metrics['train_tokens_seen'] = (step + 1) * tokens_per_opt_step
     metrics['lr'] = lr_schedule(step)
+    if lm_head_lr_schedule is not None:
+        metrics['lm_head_lr'] = lm_head_lr_schedule(step)
     if b2_schedule is not None:
         metrics['b2'] = b2_schedule(step)
     if loss_skip_stats is not None:
@@ -969,6 +972,7 @@ def _build_train_metrics(
     grads,
     lr_schedule,
     b2_schedule,
+    lm_head_lr_schedule,
     qkv_stats,
     logit_grad_stats,
     logit_grad_scaling_stats,
@@ -985,6 +989,7 @@ def _build_train_metrics(
         train_lower_90th_mean_loss,
         lr_schedule,
         b2_schedule,
+        lm_head_lr_schedule,
         loss_skip_stats,
     )
     metrics.update(_build_heavy_train_metrics(
@@ -1177,6 +1182,23 @@ def train_and_evaluate(c: DictConfig):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
+    lm_head_peak_lr = utils.get_lm_head_peak_lr(c.opt)
+    lm_head_tx_lr_schedule = lr_schedule
+    lm_head_metric_lr_schedule = None
+    if not math.isclose(lm_head_peak_lr, float(c.opt.peak_lr)):
+        lm_head_tx_lr_schedule = optax.schedules.warmup_cosine_decay_schedule(
+            0,
+            lm_head_peak_lr,
+            warmup_steps,
+            num_opt_steps,
+        )
+        lm_head_metric_lr_schedule = lm_head_tx_lr_schedule
+        if jax.process_index() == 0:
+            print(
+                "split lm-head peak lr enabled: "
+                f"default_peak_lr={c.opt.peak_lr}, lm_head_peak_lr={lm_head_peak_lr}, "
+                f"warmup_steps={warmup_steps}"
+            )
     b2_schedule = None
     b2_hparam = c.opt.b2
     b2_cosine_cfg = getattr(c.opt, "b2_cosine_anneal", None)
@@ -1216,7 +1238,57 @@ def train_and_evaluate(c: DictConfig):
     lm_head_optimizer_cfg = getattr(c.opt, "lm_head_optimizer", None)
     lm_head_optimizer_type = utils.get_lm_head_optimizer_type(c.opt)
     if lm_head_optimizer_type == "adamw":
-        base_optimizer_tx = adamw_tx
+        if lm_head_metric_lr_schedule is None:
+            base_optimizer_tx = adamw_tx
+        else:
+            if output_embedding_mask is None:
+                output_embedding_mask = utils.build_output_embedding_mask(model)
+            non_output_embedding_mask = jax.tree_util.tree_map(
+                lambda is_output_embedding: not is_output_embedding,
+                output_embedding_mask,
+            )
+            if wd_mask is None:
+                rest_wd_mask = non_output_embedding_mask
+                lm_head_wd_mask = output_embedding_mask
+            else:
+                rest_wd_mask = jax.tree_util.tree_map(
+                    lambda use_wd, is_non_output_embedding: bool(use_wd and is_non_output_embedding),
+                    wd_mask,
+                    non_output_embedding_mask,
+                )
+                lm_head_wd_mask = jax.tree_util.tree_map(
+                    lambda use_wd, is_output_embedding: bool(use_wd and is_output_embedding),
+                    wd_mask,
+                    output_embedding_mask,
+                )
+
+            lm_head_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+                lm_head_tx_lr_schedule,
+                c.opt.b1,
+                b2_hparam,
+                eps=c.opt.eps,
+                weight_decay=c.opt.weight_decay,
+                mask=lm_head_wd_mask,
+            )
+            rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+                lr_schedule,
+                c.opt.b1,
+                b2_hparam,
+                eps=c.opt.eps,
+                weight_decay=c.opt.weight_decay,
+                mask=rest_wd_mask,
+            )
+            base_optimizer_tx = optax.chain(
+                optax.masked(rest_adamw_tx, non_output_embedding_mask),
+                optax.masked(lm_head_adamw_tx, output_embedding_mask),
+            )
+            if jax.process_index() == 0:
+                print(
+                    "split lm-head optimizer enabled: "
+                    "default=adamw, lm_head=adamw, "
+                    f"lm_head_peak_lr={lm_head_peak_lr}; "
+                    "all other hparams shared"
+                )
     elif lm_head_optimizer_type == "sgd_momentum":
         if output_embedding_mask is None:
             output_embedding_mask = utils.build_output_embedding_mask(model)
@@ -1234,7 +1306,7 @@ def train_and_evaluate(c: DictConfig):
             )
 
         lm_head_sgd_tx = optax.inject_hyperparams(optax.sgd)(
-            learning_rate=lr_schedule,
+            learning_rate=lm_head_tx_lr_schedule,
             momentum=float(getattr(lm_head_optimizer_cfg, "momentum", 0.9)),
             nesterov=bool(getattr(lm_head_optimizer_cfg, "nesterov", False)),
         )
@@ -1254,6 +1326,7 @@ def train_and_evaluate(c: DictConfig):
             print(
                 "split lm-head optimizer enabled: "
                 "default=adamw, lm_head=sgd_momentum, "
+                f"lm_head_peak_lr={lm_head_peak_lr}, "
                 f"momentum={float(getattr(lm_head_optimizer_cfg, 'momentum', 0.9))}, "
                 f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}"
             )
@@ -1276,7 +1349,7 @@ def train_and_evaluate(c: DictConfig):
         lm_head_b1 = float(getattr(lm_head_optimizer_cfg, "b1", c.opt.b1))
 
         lm_head_adamw_tx = optax.inject_hyperparams(optax.adamw)(
-            lr_schedule,
+            lm_head_tx_lr_schedule,
             lm_head_b1,
             b2_hparam,
             eps=c.opt.eps,
@@ -1298,7 +1371,7 @@ def train_and_evaluate(c: DictConfig):
             print(
                 "split lm-head optimizer enabled: "
                 f"default=adamw(b1={c.opt.b1}), "
-                f"lm_head=adamw(b1={lm_head_b1}); "
+                f"lm_head=adamw(b1={lm_head_b1}, peak_lr={lm_head_peak_lr}); "
                 "all other hparams (b2, eps, weight_decay) shared"
             )
     elif lm_head_optimizer_type in {"row_oblique", "column_oblique"}:
@@ -1331,7 +1404,7 @@ def train_and_evaluate(c: DictConfig):
                 if lm_head_optimizer_type == "row_oblique"
                 else utils.column_oblique_steepest_descent
             )(
-                learning_rate=lr_schedule,
+                learning_rate=lm_head_tx_lr_schedule,
                 target_rms=lm_head_target_rms,
                 eps=lm_head_oblique_eps,
             )
@@ -1352,7 +1425,8 @@ def train_and_evaluate(c: DictConfig):
             print(
                 "split lm-head optimizer enabled: "
                 f"default=adamw, lm_head={lm_head_optimizer_type}, "
-                f"momentum={lm_head_momentum}, scaled_target_norm={lm_head_target_rms}, "
+                f"lm_head_peak_lr={lm_head_peak_lr}, momentum={lm_head_momentum}, "
+                f"scaled_target_norm={lm_head_target_rms}, "
                 f"learn_target_rms={utils.lm_head_uses_learned_target_rms(c.opt)}, "
                 f"eps={lm_head_oblique_eps}, weight_decay=off_for_lm_head"
             )
@@ -1956,6 +2030,7 @@ def train_and_evaluate(c: DictConfig):
                 utils.compute_lower_90th_percentile_mean(train_raw_loss),
                 lr_schedule,
                 b2_schedule,
+                lm_head_metric_lr_schedule,
                 loss_skip_stats,
             )
             if log_metrics_per_step_full:
@@ -2010,6 +2085,7 @@ def train_and_evaluate(c: DictConfig):
                     grads,
                     lr_schedule,
                     b2_schedule,
+                    lm_head_metric_lr_schedule,
                     qkv_stats,
                     logit_grad_stats,
                     logit_grad_scaling_stats,

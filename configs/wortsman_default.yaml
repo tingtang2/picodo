@@ -55,6 +55,7 @@ opt:
   exclude_input_embedding_weight_decay: false
   lm_head_optimizer:
     type: adamw # one of: adamw, sgd_momentum, adamw_b1, row_oblique, column_oblique
+    peak_lr: ${opt.peak_lr} # optional LM-head-specific peak LR; defaults to the global optimizer peak LR
     momentum: 0.9 # used by sgd_momentum, row_oblique, and column_oblique
     nesterov: false # used by sgd_momentum
     b1: 0.9 # used by adamw_b1: per-LM-head first-moment decay (defaults to opt.b1 if absent)

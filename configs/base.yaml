@@ -46,6 +46,7 @@ opt:
   exclude_input_embedding_weight_decay: false
   lm_head_optimizer:
     type: adamw # one of: adamw, sgd_momentum, adamw_b1, row_oblique, column_oblique
+    peak_lr: ${opt.peak_lr} # optional LM-head-specific peak LR; defaults to the global optimizer peak LR
     momentum: 0.9 # used by sgd_momentum, row_oblique, and column_oblique
     nesterov: false # used by sgd_momentum
     target_rms: 1.0 # used by row_oblique/column_oblique: target norm on the notebook's scaled oblique manifold

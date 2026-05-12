@@ -109,6 +109,11 @@ def get_lm_head_optimizer_type(opt_cfg) -> str:
     return str(getattr(lm_head_optimizer_cfg, "type", "adamw")).lower()
 
 
+def get_lm_head_peak_lr(opt_cfg) -> float:
+    lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
+    return float(getattr(lm_head_optimizer_cfg, "peak_lr", opt_cfg.peak_lr))
+
+
 def lm_head_uses_learned_target_rms(opt_cfg) -> bool:
     lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
     return bool(getattr(lm_head_optimizer_cfg, "learn_target_rms", False))
@@ -162,9 +167,14 @@ def sync_lm_head_oblique_model_config(c):
 
 def validate_row_oblique_lm_head_options(opt_cfg):
     lm_head_optimizer_type = get_lm_head_optimizer_type(opt_cfg)
+    lm_head_peak_lr = get_lm_head_peak_lr(opt_cfg)
     learn_target_rms = lm_head_uses_learned_target_rms(opt_cfg)
     initial_target_rms_from_random_init = lm_head_initial_target_rms_from_random_init(opt_cfg)
     target_rms_from_random_init = lm_head_target_rms_from_random_init(opt_cfg)
+    if lm_head_peak_lr <= 0.0:
+        raise ValueError(
+            f"Expected opt.lm_head_optimizer.peak_lr to be positive, got {lm_head_peak_lr}."
+        )
     if lm_head_optimizer_type not in {"row_oblique", "column_oblique"}:
         if learn_target_rms:
             raise ValueError(
