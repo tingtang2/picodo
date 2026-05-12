@@ -1140,10 +1140,17 @@ def train_and_evaluate(c: DictConfig):
                 non_output_embedding_mask,
             )
 
-        lm_head_sgd_tx = optax.inject_hyperparams(optax.sgd)(
-            learning_rate=lm_head_lr_schedule,
-            momentum=float(getattr(lm_head_optimizer_cfg, "momentum", 0.9)),
-            nesterov=bool(getattr(lm_head_optimizer_cfg, "nesterov", False)),
+        lm_head_momentum = float(getattr(lm_head_optimizer_cfg, "momentum", 0.9))
+        lm_head_nesterov = bool(getattr(lm_head_optimizer_cfg, "nesterov", False))
+        lm_head_weight_decay = float(getattr(lm_head_optimizer_cfg, "weight_decay", 0.0))
+
+        # Decoupled WD (AdamW-style): update = -lr * (momentum_buffer(g) + wd * w).
+        # add_decayed_weights with wd=0 is a no-op, so the WD=0 path is identical
+        # to plain SGD-with-momentum.
+        lm_head_sgd_tx = optax.chain(
+            optax.trace(decay=lm_head_momentum, nesterov=lm_head_nesterov),
+            optax.add_decayed_weights(lm_head_weight_decay),
+            optax.scale_by_learning_rate(lm_head_lr_schedule),
         )
         rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
             lr_schedule,
@@ -1166,8 +1173,9 @@ def train_and_evaluate(c: DictConfig):
             print(
                 "split lm-head optimizer enabled: "
                 "default=adamw, lm_head=sgd_momentum, "
-                f"momentum={float(getattr(lm_head_optimizer_cfg, 'momentum', 0.9))}, "
-                f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}, "
+                f"momentum={lm_head_momentum}, "
+                f"nesterov={lm_head_nesterov}, "
+                f"weight_decay={lm_head_weight_decay}, "
                 f"lm_head_{_lm_head_lr_log}"
             )
     elif lm_head_optimizer_type == "adamw_b1":
