@@ -1219,6 +1219,7 @@ def train_and_evaluate(c: DictConfig):
 
         couple_vocab_axis = bool(getattr(lm_head_optimizer_cfg, "couple_vocab_axis", True))
         couple_feature_axis = bool(getattr(lm_head_optimizer_cfg, "couple_feature_axis", False))
+        lm_head_b1 = float(getattr(lm_head_optimizer_cfg, "b1", c.opt.b1))
         lm_head_coupled_tx = optax.inject_hyperparams(
             coupled_adam.coupled_adamw,
             static_args=(
@@ -1230,7 +1231,7 @@ def train_and_evaluate(c: DictConfig):
             ),
         )(
             lr_schedule,
-            c.opt.b1,
+            lm_head_b1,
             b2_hparam,
             eps=c.opt.eps,
             weight_decay=c.opt.weight_decay,
@@ -1256,7 +1257,8 @@ def train_and_evaluate(c: DictConfig):
                 "split lm-head optimizer enabled: "
                 "default=adamw, lm_head=coupled_adam, "
                 f"couple_vocab_axis={couple_vocab_axis}, "
-                f"couple_feature_axis={couple_feature_axis}"
+                f"couple_feature_axis={couple_feature_axis}, "
+                f"lm_head_b1={lm_head_b1} (trunk b1={c.opt.b1})"
             )
     else:
         raise ValueError(

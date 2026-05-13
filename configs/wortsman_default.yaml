@@ -48,9 +48,12 @@ opt:
   weight_decay: 1e-4
   exclude_input_embedding_weight_decay: false
   lm_head_optimizer:
-    type: adamw # one of: adamw, sgd_momentum
-    momentum: 0.9
-    nesterov: false
+    type: adamw # one of: adamw, sgd_momentum, coupled_adam
+    momentum: 0.9 # used by sgd_momentum
+    nesterov: false # used by sgd_momentum
+    b1: 0.9 # used by coupled_adam: per-LM-head first-moment decay (defaults to opt.b1 if absent)
+    couple_vocab_axis: true # used by coupled_adam (paper default; averages v_hat across the vocabulary axis)
+    couple_feature_axis: false # used by coupled_adam (extension; averages v_hat across the feature axis)
   lm_head_gradient_centering: 'off' # one of: off, pre, post
   lm_head_weighted_columnwise_gradient_centering: 'off' # one of: off, pre, post
   clip_by_global_norm: 1.0
