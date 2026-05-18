@@ -36,7 +36,7 @@ model:
   V: null # vocab size -> must match dataset tokenizer!
   activ_dtype: 'bfloat16'
   use_flash_attn: true
-  use_qk_norm: true
+  use_qk_norm: false
   elementwise_attn_output_gate: false
   final_hidden_mean_centering: false
   alpha: 1.0
@@ -44,7 +44,7 @@ model:
   
 opt:
   batch_size: 256
-  peak_lr: 0.15
+  peak_lr: 3e-3   # trunk AdamW peak LR (meeting winner for GPT-2M)
   warmup_frac: 0.05
   b1: 0.9
   b2: 0.95
@@ -53,10 +53,16 @@ opt:
     final_b2: 0.95
   weight_decay: 1e-4
   exclude_input_embedding_weight_decay: false
+  use_qkv_opt: true #if false, don't even create mask / chain
+  qkv_optimizer:
+    type: sgd_momentum
+    peak_lr: 3e-1   # FIXED, NOT ${opt.peak_lr} — SGD-M needs much larger nominal LR than AdamW
+    momentum: 0.9   # starting point; sweep this if needed
+    nesterov: false
   lm_head_optimizer:
-    type: adamw # one of: adamw, sgd_momentum, adamw_b1, row_oblique, column_oblique
-    peak_lr: ${opt.peak_lr} # optional LM-head-specific peak LR; defaults to the global optimizer peak LR
-    momentum: 0.9 # used by sgd_momentum, row_oblique, and column_oblique
+    type: sgd_momentum # one of: adamw, sgd_momentum, adamw_b1, row_oblique, column_oblique
+    peak_lr: 3e-1   # FIXED at meeting-settled value, NOT ${opt.peak_lr}
+    momentum: 0.99  # meeting-settled β for LM head SGD-M
     nesterov: false # used by sgd_momentum
     b1: 0.9 # used by adamw_b1: per-LM-head first-moment decay (defaults to opt.b1 if absent)
     target_rms: 1.0 # used by row_oblique/column_oblique: target norm on the notebook's scaled oblique manifold

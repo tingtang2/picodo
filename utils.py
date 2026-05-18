@@ -31,6 +31,9 @@ def _is_output_embedding_path(path) -> bool:
     key = jax.tree_util.keystr(path, simple=True, separator='/')
     return key == 'token_embed_out/embedding'
 
+def _is_qkv_proj_path(path) -> bool: 
+    key = jax.tree_util.keystr(path, simple=True, separator='/')
+    return key.endswith('attn/qkv_proj/kernel')
 
 def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
     _, params = nnx.split(model, nnx.Param)
@@ -85,6 +88,30 @@ def build_output_embedding_mask(model: nnx.Module):
         is_leaf=lambda x: isinstance(x, nnx.Param),
     )
 
+def _is_qkv_proj_path(path) -> bool:
+    key = jax.tree_util.keystr(path, simple=True, separator='/')
+    return key.endswith('attn/qkv_proj/kernel')
+
+
+def build_qkv_proj_mask(model: nnx.Module):
+    _, params = nnx.split(model, nnx.Param)
+
+    def mask_leaf(path, leaf):
+        if not _is_qkv_proj_path(path):
+            return False
+        value = getattr(leaf, "value", leaf)
+        if value.ndim != 4:
+            raise ValueError(
+                "Expected a rank-4 tensor (S=3, N, D, H), "
+                f"got shape={value.shape}."
+            )
+        return True
+
+    return jax.tree_util.tree_map_with_path(
+        mask_leaf,
+        params,
+        is_leaf=lambda x: isinstance(x, nnx.Param),
+    )
 
 def normalize_lm_head_centering_mode(raw_value, field_name: str) -> str:
     if isinstance(raw_value, bool):
@@ -112,6 +139,10 @@ def get_lm_head_optimizer_type(opt_cfg) -> str:
 def get_lm_head_peak_lr(opt_cfg) -> float:
     lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
     return float(getattr(lm_head_optimizer_cfg, "peak_lr", opt_cfg.peak_lr))
+
+def get_qkv_peak_lr(opt_cfg) -> float:
+    qkv_cfg = getattr(opt_cfg, "qkv_optimizer", None)
+    return float(getattr(qkv_cfg, "peak_lr", opt_cfg.peak_lr))
 
 
 def lm_head_uses_learned_target_rms(opt_cfg) -> bool:
