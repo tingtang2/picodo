@@ -1246,7 +1246,11 @@ def train_and_evaluate(c: DictConfig):
     lm_head_optimizer_cfg = getattr(c.opt, "lm_head_optimizer", None)
     lm_head_optimizer_type = utils.get_lm_head_optimizer_type(c.opt)
     if lm_head_optimizer_type == "adamw":
-        if lm_head_metric_lr_schedule is None:
+        qkv_proj_mask, qkv_sgd_tx, qkv_log_suffix = utils.maybe_build_qkv_split(
+            model, c.opt, qkv_tx_lr_schedule,
+        )
+        needs_split = (lm_head_metric_lr_schedule is not None) or (qkv_proj_mask is not None)
+        if not needs_split:
             base_optimizer_tx = adamw_tx
         else:
             if output_embedding_mask is None:
@@ -1255,14 +1259,15 @@ def train_and_evaluate(c: DictConfig):
                 lambda is_output_embedding: not is_output_embedding,
                 output_embedding_mask,
             )
+            rest_routing_mask = utils.carve_out_qkv_from_mask(non_output_embedding_mask, qkv_proj_mask)
             if wd_mask is None:
-                rest_wd_mask = non_output_embedding_mask
+                rest_wd_mask = rest_routing_mask
                 lm_head_wd_mask = output_embedding_mask
             else:
                 rest_wd_mask = jax.tree_util.tree_map(
-                    lambda use_wd, is_non_output_embedding: bool(use_wd and is_non_output_embedding),
+                    lambda use_wd, is_rest: bool(use_wd and is_rest),
                     wd_mask,
-                    non_output_embedding_mask,
+                    rest_routing_mask,
                 )
                 lm_head_wd_mask = jax.tree_util.tree_map(
                     lambda use_wd, is_output_embedding: bool(use_wd and is_output_embedding),
@@ -1286,16 +1291,20 @@ def train_and_evaluate(c: DictConfig):
                 weight_decay=c.opt.weight_decay,
                 mask=rest_wd_mask,
             )
-            base_optimizer_tx = optax.chain(
-                optax.masked(rest_adamw_tx, non_output_embedding_mask),
+            chained = [
+                optax.masked(rest_adamw_tx, rest_routing_mask),
                 optax.masked(lm_head_adamw_tx, output_embedding_mask),
-            )
+            ]
+            if qkv_proj_mask is not None:
+                chained.append(optax.masked(qkv_sgd_tx, qkv_proj_mask))
+            base_optimizer_tx = optax.chain(*chained)
             if jax.process_index() == 0:
                 print(
                     "split lm-head optimizer enabled: "
                     "default=adamw, lm_head=adamw, "
                     f"lm_head_peak_lr={lm_head_peak_lr}; "
                     "all other hparams shared"
+                    + qkv_log_suffix
                 )
     elif lm_head_optimizer_type == "sgd_momentum":
         if output_embedding_mask is None:
@@ -1305,25 +1314,11 @@ def train_and_evaluate(c: DictConfig):
             output_embedding_mask,
         )
 
-        use_qkv_opt = bool(getattr(c.opt, "use_qkv_opt", False))
-        if use_qkv_opt: 
-            qkv_proj_mask = utils.build_qkv_proj_mask(model)
-            non_qkv_proj_mask = jax.tree_util.tree_map(
-                lambda is_qkv: not is_qkv, 
-                qkv_proj_mask,
-            )
-
-            #rest = not lmhead AND not qkv
-            rest_routing_mask = jax.tree_util.tree_map(
-                lambda is_non_output, is_non_qkv: bool(is_non_output and is_non_qkv), 
-                non_output_embedding_mask, non_qkv_proj_mask)
-        else: 
-            qkv_proj_mask = None
-            rest_routing_mask = non_output_embedding_mask
-
-        #build adamW weight-deacy mask
+        qkv_proj_mask, qkv_sgd_tx, qkv_log_suffix = utils.maybe_build_qkv_split(
+            model, c.opt, qkv_tx_lr_schedule,
+        )
+        rest_routing_mask = utils.carve_out_qkv_from_mask(non_output_embedding_mask, qkv_proj_mask)
         if wd_mask is None:
-            #rest_wd_mask = non_output_embedding_mask
             rest_wd_mask = rest_routing_mask
         else:
             rest_wd_mask = jax.tree_util.tree_map(
@@ -1348,36 +1343,21 @@ def train_and_evaluate(c: DictConfig):
 
         chained = [
             optax.masked(rest_adamw_tx, rest_routing_mask),
-            optax.masked(lm_head_sgd_tx, output_embedding_mask),                
+            optax.masked(lm_head_sgd_tx, output_embedding_mask),
         ]
-
-        if use_qkv_opt: 
-            qkv_cfg = getattr(c.opt, "qkv_optimizer", None)
-            qkv_sgd_tx = optax.inject_hyperparams(optax.sgd)(
-                learning_rate = qkv_tx_lr_schedule, 
-                momentum=float(getattr(qkv_cfg, "momentum", 0.9)),
-                nesterov=bool(getattr(qkv_cfg, "nesterov", False)),
-            )
+        if qkv_proj_mask is not None:
             chained.append(optax.masked(qkv_sgd_tx, qkv_proj_mask))
-
         base_optimizer_tx = optax.chain(*chained)
 
         if jax.process_index() == 0:
-            msg = (
+            print(
                 "split lm-head optimizer enabled: "
                 "default=adamw, lm_head=sgd_momentum, "
                 f"lm_head_peak_lr={lm_head_peak_lr}, "
                 f"momentum={float(getattr(lm_head_optimizer_cfg, 'momentum', 0.9))}, "
                 f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}"
+                + qkv_log_suffix
             )
-
-            if use_qkv_opt: 
-                msg += (
-                    f"; qkv=sgd_momentum, qkv_peak_lr={qkv_peak_lr}, "
-                    f"momentum={float(getattr(qkv_cfg, 'momentum', 0.9))},"
-                    f"nesterov={bool(getattr(qkv_cfg, 'nesterov', False))}"
-                )
-            print(msg)
 
     elif lm_head_optimizer_type == "adamw_b1":
         if output_embedding_mask is None:

@@ -113,6 +113,40 @@ def build_qkv_proj_mask(model: nnx.Module):
         is_leaf=lambda x: isinstance(x, nnx.Param),
     )
 
+
+def maybe_build_qkv_split(model: nnx.Module, opt_cfg, qkv_tx_lr_schedule):
+    """If opt.use_qkv_opt is True, build the qkv routing pieces shared by every LM-head branch.
+    Returns (qkv_proj_mask, qkv_sgd_tx, log_suffix); each is None / '' when disabled."""
+    if not bool(getattr(opt_cfg, "use_qkv_opt", False)):
+        return None, None, ""
+    qkv_proj_mask = build_qkv_proj_mask(model)
+    qkv_cfg = getattr(opt_cfg, "qkv_optimizer", None)
+    qkv_peak_lr = float(getattr(qkv_cfg, "peak_lr", opt_cfg.peak_lr))
+    qkv_momentum = float(getattr(qkv_cfg, "momentum", 0.9))
+    qkv_nesterov = bool(getattr(qkv_cfg, "nesterov", False))
+    qkv_sgd_tx = optax.inject_hyperparams(optax.sgd)(
+        learning_rate=qkv_tx_lr_schedule,
+        momentum=qkv_momentum,
+        nesterov=qkv_nesterov,
+    )
+    log_suffix = (
+        f"; qkv=sgd_momentum, qkv_peak_lr={qkv_peak_lr}, "
+        f"momentum={qkv_momentum}, nesterov={qkv_nesterov}"
+    )
+    return qkv_proj_mask, qkv_sgd_tx, log_suffix
+
+
+def carve_out_qkv_from_mask(base_mask, qkv_proj_mask):
+    """Return `base_mask AND NOT qkv_proj_mask`, leaf-wise. If qkv_proj_mask is None, returns base_mask unchanged."""
+    if qkv_proj_mask is None:
+        return base_mask
+    return jax.tree_util.tree_map(
+        lambda is_in_base, is_qkv: bool(is_in_base and not is_qkv),
+        base_mask,
+        qkv_proj_mask,
+    )
+
+
 def normalize_lm_head_centering_mode(raw_value, field_name: str) -> str:
     if isinstance(raw_value, bool):
         if raw_value:
