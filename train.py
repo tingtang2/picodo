@@ -98,6 +98,31 @@ def loss_fn_z_loss(model_state, model_graphdef, x, collect_qkv_stats: bool = Tru
     
     return losses.mean() + lam * z_loss, (losses, qkv_stats)
 
+@partial(jax.jit, static_argnames=('model_graphdef', 'collect_qkv_stats'))
+def loss_fn_attn_z_loss(model_state, model_graphdef, x, collect_qkv_stats: bool = True): # [B, T]
+    model = nnx.merge(model_graphdef, model_state)
+    y = jnp.roll(x, -1, axis = 1) 
+    if collect_qkv_stats:
+        logits, qkv_dict, attn_z_loss = model(x, return_qkv=True, return_attn_z_loss=True)
+    else:
+        logits, attn_z_loss = model(x, return_attn_z_loss=True)
+        qkv_dict = None
+
+    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
+    losses = losses[:, :-1]
+
+    lam = 1e-3
+
+    if collect_qkv_stats:
+        qkv_dict_detached = jax.tree.map(jax.lax.stop_gradient, qkv_dict)
+        qkv_stats = utils.compute_qkv_stats(qkv_dict_detached)
+    else:
+        qkv_stats = {}
+    
+
+    return losses.mean() + lam * attn_z_loss, (losses, qkv_stats)
+
 
 def _build_loss_skip_weights(
     losses,
@@ -447,11 +472,34 @@ def train_step_z_loss(
     (loss, raw_loss), grads = jax.value_and_grad(loss_fn_z_loss, has_aux=True)(
         opt_state.model, model_graphdef, batch, collect_qkv_stats
     )
-    
+
     optimizer = nnx.merge(opt_graphdef, opt_state)
     optimizer.update(grads)
     opt_state = nnx.state(optimizer)
-    
+
+    return opt_state, loss, raw_loss, grads if return_grads else None
+
+@partial(
+    jax.jit,
+    static_argnames=('opt_graphdef', 'model_graphdef', 'collect_qkv_stats', 'return_grads'),
+    donate_argnames=('opt_state'),
+)
+def train_step_attn_z_loss(
+    opt_state,
+    opt_graphdef,
+    model_graphdef,
+    batch,
+    collect_qkv_stats: bool = True,
+    return_grads: bool = False,
+):
+    (loss, raw_loss), grads = jax.value_and_grad(loss_fn_attn_z_loss, has_aux=True)(
+        opt_state.model, model_graphdef, batch, collect_qkv_stats
+    )
+
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    optimizer.update(grads)
+    opt_state = nnx.state(optimizer)
+
     return opt_state, loss, raw_loss, grads if return_grads else None
 
 @partial(
@@ -859,7 +907,11 @@ def eval_step(c, model_state, model_graphdef, dataset, collect_qkv_stats: bool =
     
     for i in range(len(dataset)):
         batch = dataset[i]
-        if c.opt.use_z_loss:
+        if getattr(c.model, 'use_attn_z_loss', False):
+            batch_loss, (raw_loss, _) = loss_fn_attn_z_loss(
+                model_state, model_graphdef, batch, collect_qkv_stats
+            )
+        elif c.opt.use_z_loss:
             batch_loss, (raw_loss, _) = loss_fn_z_loss(
                 model_state, model_graphdef, batch, collect_qkv_stats
             )
@@ -1965,7 +2017,16 @@ def train_and_evaluate(c: DictConfig):
                 'loss_rewrite_use_log_loss': float(loss_rewrite_use_log_loss),
             }
         else:
-            if c.opt.use_z_loss:
+            if getattr(c.model, 'use_attn_z_loss', False):
+                opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_attn_z_loss(
+                    opt_state,
+                    opt_graphdef,
+                    model_graphdef,
+                    batch,
+                    collect_qkv_stats,
+                    need_step_grads,
+                )
+            elif c.opt.use_z_loss:
                 if mucentering:
                     opt_state, batch_loss, (train_raw_loss, qkv_stats), grads = train_step_z_loss_centered(
                         opt_state,

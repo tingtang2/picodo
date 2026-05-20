@@ -44,17 +44,26 @@ class TransformerDecoder(nnx.Module):
         self.blocks = nnx.List(TransformerBlock(c, rngs, layer_idx=i) for i in range(c.L))
         self.out_ln = nnx.RMSNorm(c.D, use_scale=False, dtype=lm_head_dtype, rngs=rngs)
         
-    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, S]
+    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False, return_attn_z_loss: bool = False): # [B, S]
 
         qkv_outputs = {}
         # token embedding
         h = self.token_embed_in(x) # [B, T, D]
 
+        total_attn_z_loss = jnp.zeros(())
+
         # transformer blocks
         for i, block in enumerate(self.blocks):
-            if return_qkv:
+            if return_qkv and return_attn_z_loss:
+                h, qkv, z_loss_layer = block(h, attention_mask=attention_mask, return_qkv=True, return_attn_z_loss=True)
+                qkv_outputs[i] = qkv
+                total_attn_z_loss = total_attn_z_loss + z_loss_layer
+            elif return_qkv:
                 h, qkv = block(h, attention_mask=attention_mask, return_qkv=True)
                 qkv_outputs[i] = qkv
+            elif return_attn_z_loss:
+                h, z_loss_layer = block(h, attention_mask=attention_mask, return_attn_z_loss=True)
+                total_attn_z_loss = total_attn_z_loss + z_loss_layer
             else:
                 h = block(h, attention_mask=attention_mask)
 
@@ -67,9 +76,12 @@ class TransformerDecoder(nnx.Module):
             h = h * target_rms
         logits = self.token_embed_out.attend(h) # [B, T, V]
 
+        if return_qkv and return_attn_z_loss:
+            return logits, qkv_outputs, total_attn_z_loss
         if return_qkv:
             return logits, qkv_outputs
-
+        if return_attn_z_loss:
+            return logits, total_attn_z_loss
         return logits
 
 
@@ -132,18 +144,25 @@ class TransformerBlock(nnx.Module):
         self.attn = MultiHeadAttention(c, rngs, use_qk_norm=use_qk_norm)
         self.mlp = MLP(c, rngs)
         
-    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, T, D]
-        if return_qkv:
+    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False, return_attn_z_loss: bool = False): # [B, T, D]
+        if return_qkv and return_attn_z_loss:
+            attn_out, qkv, z_loss_layer = self.attn(self.ln1(x), attention_mask=attention_mask, return_qkv=True, return_attn_z_loss=True)
+        elif return_qkv:
             attn_out, qkv = self.attn(self.ln1(x), attention_mask=attention_mask, return_qkv=True)
-            x = x + attn_out
+        elif return_attn_z_loss:
+            attn_out, z_loss_layer = self.attn(self.ln1(x), attention_mask=attention_mask, return_attn_z_loss=True)
         else:
-            x = x + self.attn(self.ln1(x), attention_mask=attention_mask)
-        
+            attn_out = self.attn(self.ln1(x), attention_mask=attention_mask)
+
+        x = x + attn_out
         x = x + self.mlp(self.ln2(x)) # MLP block
 
+        if return_qkv and return_attn_z_loss:
+            return x, qkv, z_loss_layer
         if return_qkv:
             return x, qkv
-
+        if return_attn_z_loss:
+            return x, z_loss_layer
         return x
 
 
@@ -167,8 +186,9 @@ class MultiHeadAttention(nnx.Module):
         c.use_flash_attn &= (c.H % 128 == 0)
         self.attention = partial(tpu_causal_flash_attention) if c.use_flash_attn else partial(jax.nn.dot_product_attention, is_causal=False)
         self.use_flash_attn = c.use_flash_attn
+        self.use_attn_z_loss = bool(getattr(c, 'use_attn_z_loss', False))
 
-    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, T, D]
+    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False, return_attn_z_loss: bool = False): # [B, T, D]
         B, T, D = x.shape
 
         # input projection
@@ -186,8 +206,32 @@ class MultiHeadAttention(nnx.Module):
         q = apply_rope(q, position[None])
         k = apply_rope(k, position[None])
 
+        # default — overwritten only by manual path when z-loss is on
+        z_loss_attn_layer = jnp.zeros(())
+
         # attention
-        if self.use_flash_attn:
+        if self.use_attn_z_loss:
+            causal_mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_)).reshape(1, 1, T, T)
+            if attention_mask is not None:
+                padding_mask = attention_mask.astype(jnp.bool_).reshape(B, 1, 1, T)
+                # broadcasts to [B, 1, T, T]
+                combined_mask = jnp.logical_and(causal_mask, padding_mask)
+            else:
+                combined_mask = causal_mask
+
+            # q, k are [B, T, N, H]
+            H = q.shape[-1]
+            scores = jnp.einsum("btnh,bsnh->bnts", q, k) / jnp.sqrt(H)
+            # scores: [B, N, T_q, T_k] — one attention logit per (batch, head, query, key)
+            scores = jnp.where(combined_mask, scores, -1e9)
+            attn_probs = jax.nn.softmax(scores, axis=-1)
+            out = jnp.einsum("bnts,bsnh->btnh", attn_probs, v)
+
+            scores_fp32 = scores.astype(jnp.float32)
+            z = jax.nn.logsumexp(scores_fp32, axis=-1)
+            z_loss_attn_layer = (z ** 2).mean()  # note asymmetry: later queries have more unmasked positions
+
+        elif self.use_flash_attn:
             out = self.attention(q, k, v) # [B, T, N, H]
         else:
              # 1. Create causal mask (allows attending to past)
@@ -211,13 +255,20 @@ class MultiHeadAttention(nnx.Module):
             # The mask will be broadcast by dot_product_attention to [B, N, T, T]
             out = self.attention(q, k, v, mask=combined_mask) # [B, T, N, H]
 
+
+
         if self.elementwise_attn_output_gate:
             out = out * jax.nn.sigmoid(gate_score)
 
         # output projection followed by contraction back to original dims
         out = self.out_proj(out) # [B, T, D]
+
+        if return_qkv and return_attn_z_loss:
+            return out, raw_qkv, z_loss_attn_layer
         if return_qkv:
             return out, raw_qkv
+        if return_attn_z_loss:
+            return out, z_loss_attn_layer
         return out
 
 

@@ -37,6 +37,7 @@ model:
   activ_dtype: 'bfloat16'
   use_flash_attn: true
   use_qk_norm: false
+  use_attn_z_loss: false   # if true, takes manual attention path and adds z-loss aux term on attn logits
   elementwise_attn_output_gate: false
   final_hidden_mean_centering: false
   alpha: 1.0

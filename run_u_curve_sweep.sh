@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
-# U-curve LR sensitivity sweep — QK-Norm removal experiment (todos #6 + #7).
+# U-curve LR sensitivity sweep.
 #
-# Five conditions per trunk LR, interleaved:
-#   method            = QK-Norm OFF, lm_head SGD-M (3e-1, β=0.99), qkv SGD-M (3e-1, β=0.9)
-#   sgd_head          = QK-Norm ON,  lm_head SGD-M (3e-1, β=0.99), qkv AdamW (the prior method)
-#   baseline          = QK-Norm ON,  lm_head AdamW, qkv AdamW (pure AdamW everywhere)
-#   nothing_qkv3e-2   = QK-Norm OFF, lm_head AdamW, qkv SGD-M (3e-2, β=0.9)   (Ting's "nothing on head")
-#   nothing_qkv3e-1   = QK-Norm OFF, lm_head AdamW, qkv SGD-M (3e-1, β=0.9)   (same condition, higher qkv LR for ablation vs method)
+# ACTIVE condition (pivot — Ting's z-loss-on-attn-logits as a QK-Norm replacement):
+#   nothing_attnz = QK-Norm OFF, lm_head AdamW (trunk LR), qkv AdamW, attn z-loss ON, LM-head z-loss OFF
 #
-# Ablation chain:
-#   baseline          vs sgd_head        : does SGD-M-on-LM-head help?       (prior contribution)
-#   sgd_head          vs method          : does removing QK-Norm + qkv SGD-M help on top?
-#   baseline          vs method          : does the full new stack beat vanilla?
-#   baseline          vs nothing_qkv*    : isolates qkv-SGD-M as QK-Norm replacement (no LM-head intervention)
-#   method            vs nothing_qkv3e-1 : isolates whether the LM-head SGD-M matters in the new stack
+# Direct analog of the earlier "nothing_qkv*" experiments but with z-loss
+# (a soft magnitude penalty) instead of qkv-SGD-M as the QK-Norm replacement.
 #
-# Trunk LRs span 1e-5 .. 1e-1 to capture BOTH sides of the U.
-# Interleaved ordering: each LR gets all 5 conditions before moving on.
+# Trunk LR is swept; everything else fixed.
 
 set -uo pipefail
 
@@ -95,8 +86,8 @@ for lr in "${LRS[@]}"; do
     || echo "=== ${name_baseline} FAILED, continuing ==="
     '''
 
-    name_nothing_low="ucurve_nothing_qkv3e-2_lr${lr}-s${SEED}"
-    echo "--- NOTHING (qkv LR 3e-2): ${name_nothing_low} ---"
+    name_nothing_attnz="ucurve_nothing_attnz_lr${lr}-s${SEED}"
+    echo "--- NOTHING + ATTN Z-LOSS (QK-Norm OFF, lm_head AdamW, attn z-loss ON): ${name_nothing_attnz} ---"
     python3 main.py \
         --config-name=wortsman_default \
         +model=gpt2s +dataset=fw_gpt2 \
@@ -104,40 +95,17 @@ for lr in "${LRS[@]}"; do
         opt.peak_lr=${lr} \
         opt.batch_size=256 \
         model.use_qk_norm=false \
+        model.use_attn_z_loss=true \
         opt.lm_head_optimizer.type=adamw \
         opt.lm_head_optimizer.peak_lr=${lr} \
-        opt.use_qkv_opt=true \
-        opt.qkv_optimizer.type=sgd_momentum \
-        opt.qkv_optimizer.peak_lr=3e-2 \
-        opt.qkv_optimizer.momentum=0.9 \
+        opt.use_qkv_opt=false \
+        opt.use_z_loss=false \
         checkpoint.turn_on=false \
         checkpoint.workdir=/home/sophieli/picodo/checkpoints \
         log_metrics_per_step=true \
         wandb_mode=online \
-        run_name="${name_nothing_low}" \
-    || echo "=== ${name_nothing_low} FAILED, continuing ==="
-
-    name_nothing_high="ucurve_nothing_qkv3e-1_lr${lr}-s${SEED}"
-    echo "--- NOTHING (qkv LR 3e-1): ${name_nothing_high} ---"
-    python3 main.py \
-        --config-name=wortsman_default \
-        +model=gpt2s +dataset=fw_gpt2 \
-        seed=${SEED} \
-        opt.peak_lr=${lr} \
-        opt.batch_size=256 \
-        model.use_qk_norm=false \
-        opt.lm_head_optimizer.type=adamw \
-        opt.lm_head_optimizer.peak_lr=${lr} \
-        opt.use_qkv_opt=true \
-        opt.qkv_optimizer.type=sgd_momentum \
-        opt.qkv_optimizer.peak_lr=3e-1 \
-        opt.qkv_optimizer.momentum=0.9 \
-        checkpoint.turn_on=false \
-        checkpoint.workdir=/home/sophieli/picodo/checkpoints \
-        log_metrics_per_step=true \
-        wandb_mode=online \
-        run_name="${name_nothing_high}" \
-    || echo "=== ${name_nothing_high} FAILED, continuing ==="
+        run_name="${name_nothing_attnz}" \
+    || echo "=== ${name_nothing_attnz} FAILED, continuing ==="
 done
 
 echo "===================== SWEEP COMPLETE ====================="
