@@ -1,0 +1,8 @@
+# @package _global_
+
+num_tokens_train: 10_000_000_000
+
+model:
+  D: 4096
+  L: 32
+  T: 2048
