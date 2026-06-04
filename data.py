@@ -28,8 +28,8 @@ def load_ds(key, mesh, ds_path, seq_len, batch_size, n_tokens_valid, n_tokens_tr
     print('reading data...')
     data = np.memmap(ds_path, dtype=np.uint16, shape=[n_batch, batch_size, seq_len], mode='r')
     
-    # load data onto jax devices, sharded across batch dimension
-    sharding = jax.sharding.NamedSharding(mesh, P(None, 'data', 'model'))
+    # Load data onto devices with only the batch axis sharded.
+    sharding = jax.sharding.NamedSharding(mesh, P(None, 'data', None))
     callback = lambda index: data[index]
     data = jax.make_array_from_callback(data.shape, sharding, callback)
 

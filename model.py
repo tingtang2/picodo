@@ -48,7 +48,7 @@ class TransformerDecoder(nnx.Module):
 
         qkv_outputs = {}
         # token embedding
-        h = self.token_embed_in(x) # [B, T, D]
+        h = self.token_embed_in(x, out_sharding=P('data', None, None)) # [B, T, D]
 
         # transformer blocks
         for i, block in enumerate(self.blocks):
@@ -65,7 +65,7 @@ class TransformerDecoder(nnx.Module):
         if self.lm_head_oblique_learn_target_rms:
             target_rms = jnp.exp(jnp.asarray(self.lm_head_oblique_target_rms_log.value, dtype=h.dtype))
             h = h * target_rms
-        logits = self.token_embed_out.attend(h) # [B, T, V]
+        logits = self.token_embed_out.attend(h, out_sharding=P('data', None, 'model')) # [B, T, V]
 
         if return_qkv:
             return logits, qkv_outputs
@@ -172,8 +172,12 @@ class MultiHeadAttention(nnx.Module):
         B, T, D = x.shape
 
         # input projection
-        q, k, v = self.qkv_proj(x) # [B, T, N, H]
-        gate_score = self.gate_proj(x) if self.elementwise_attn_output_gate else None
+        q, k, v = self.qkv_proj(x, out_sharding=P(None, 'data', None, 'model', None)) # [B, T, N, H]
+        gate_score = (
+            self.gate_proj(x, out_sharding=P('data', None, 'model', None))
+            if self.elementwise_attn_output_gate
+            else None
+        )
         if return_qkv:
             raw_qkv = (q, k, v)
 
@@ -215,7 +219,7 @@ class MultiHeadAttention(nnx.Module):
             out = out * jax.nn.sigmoid(gate_score)
 
         # output projection followed by contraction back to original dims
-        out = self.out_proj(out) # [B, T, D]
+        out = self.out_proj(out, out_sharding=P('data', None, None)) # [B, T, D]
         if return_qkv:
             return out, raw_qkv
         return out
@@ -271,8 +275,8 @@ class MLP(nnx.Module):
         self.down_proj = nnx.Linear(in_features=c.F, out_features=c.D, use_bias=False, dtype=c.activ_dtype, rngs=rngs)
         
     def __call__(self, x): # [B, T, D]
-        h = jax.nn.gelu(self.up_proj(x)) # [B, T, F]
-        return self.down_proj(h) # [B, T, D]
+        h = jax.nn.gelu(self.up_proj(x, out_sharding=P('data', None, 'model'))) # [B, T, F]
+        return self.down_proj(h, out_sharding=P('data', None, None)) # [B, T, D]
 
 
 def create_sharded_model(c: DictConfig, key):
@@ -287,16 +291,18 @@ def create_sharded_model(c: DictConfig, key):
         def add_sharding(path, v):
             key = jax.tree_util.keystr(path, simple=True, separator='/')
             pspec = None
-            if key == 'token_embed_in/embedding': pspec = P('data', 'model')
-            if 'up_proj' in key: pspec = P('data', 'model')
-            if 'down_proj' in key: pspec = P('model', 'data')
-            if 'qkv_proj' in key: pspec = P(None, 'model', 'data', None)
-            if 'gate_proj' in key: pspec = P('model', 'data', None)
-            if 'out_proj' in key: pspec = P('model', None, 'data')
-            if key == 'token_embed_out/embedding': pspec = P('model', 'data')
+            if key == 'token_embed_in/embedding/value': pspec = P('model', None)
+            if 'up_proj' in key: pspec = P(None, 'model')
+            if 'down_proj' in key: pspec = P('model', None)
+            if 'qkv_proj' in key: pspec = P(None, 'model', None, None)
+            if 'gate_proj' in key: pspec = P('model', None, None)
+            if 'out_proj' in key: pspec = P('model', None, None)
+            if key == 'token_embed_out/embedding/value': pspec = P('model', None)
             if pspec is None:
                 return v
-            return jax.lax.with_sharding_constraint(v, pspec)
+            # In explicit-sharding mode, with_sharding_constraint is only an
+            # assertion in newer JAX releases; use an actual reshard here.
+            return jax.reshard(v, pspec)
         state = jax.tree.map_with_path(add_sharding, state)
         nnx.update(model, state) # the model is sharded now
         
