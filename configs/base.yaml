@@ -62,6 +62,9 @@ opt:
     enabled: false
     lambda_scale: 0.05
     eps: ${opt.eps}
+  clip_by_global_norm: null
+  use_z_loss: false
+  eps: 1e-8
   loss_skip:
     enabled: false
     warmup_steps: 1000
@@ -86,3 +89,39 @@ opt:
     z_hard: 8.0
     eps: 1e-6
     use_log_loss: false
+
+checkpoint:
+  turn_on: true
+  workdir: ""
+  gcp_bucket: null
+  load_path: null
+  step_prefix: null
+  checkpoint_every_steps: 2000
+  max_to_keep: 100
+  start_step: null
+  checkpoint_steps: null
+
+diagnostics:
+  end_step: null
+  save_raw_losses: false
+  collect_qkv_stats: false
+  spike_analysis_top_k: 15
+  spike_analysis_min_count: 5
+
+analysis:
+  checkpoint_steps: null
+  split: valid
+  batch_indices: null
+  align_train_batches_to_checkpoints: true
+  start_batch: 0
+  num_batches: 4
+  tau: 6.0
+  use_mean: true
+  top_k: 8
+  include_weights: true
+  include_activations: true
+  include_attention: true
+  force_no_flash_attn: false
+  save_per_batch: false
+  compare_reference_index: 0
+  output_dir: null

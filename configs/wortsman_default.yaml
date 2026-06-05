@@ -116,3 +116,21 @@ diagnostics:
   collect_qkv_stats: false
   spike_analysis_top_k: 15
   spike_analysis_min_count: 5
+
+analysis:
+  checkpoint_steps: null
+  split: valid
+  batch_indices: null
+  align_train_batches_to_checkpoints: true
+  start_batch: 0
+  num_batches: 4
+  tau: 6.0
+  use_mean: true
+  top_k: 8
+  include_weights: true
+  include_activations: true
+  include_attention: true
+  force_no_flash_attn: false
+  save_per_batch: false
+  compare_reference_index: 0
+  output_dir: null

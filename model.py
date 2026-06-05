@@ -44,17 +44,36 @@ class TransformerDecoder(nnx.Module):
         self.blocks = nnx.List(TransformerBlock(c, rngs, layer_idx=i) for i in range(c.L))
         self.out_ln = nnx.RMSNorm(c.D, use_scale=False, dtype=lm_head_dtype, rngs=rngs)
         
-    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, S]
+    def __call__(
+        self,
+        x,
+        attention_mask: jax.Array | None = None,
+        return_qkv: bool = False,
+        return_analysis_tensors: bool = False,
+    ): # [B, S]
 
         qkv_outputs = {}
+        analysis_outputs = {}
         # token embedding
         h = self.token_embed_in(x, out_sharding=P('data', None, None)) # [B, T, D]
 
         # transformer blocks
         for i, block in enumerate(self.blocks):
-            if return_qkv:
+            if return_qkv and return_analysis_tensors:
+                h, qkv, analysis = block(
+                    h,
+                    attention_mask=attention_mask,
+                    return_qkv=True,
+                    return_analysis_tensors=True,
+                )
+                qkv_outputs[i] = qkv
+                analysis_outputs[i] = analysis
+            elif return_qkv:
                 h, qkv = block(h, attention_mask=attention_mask, return_qkv=True)
                 qkv_outputs[i] = qkv
+            elif return_analysis_tensors:
+                h, analysis = block(h, attention_mask=attention_mask, return_analysis_tensors=True)
+                analysis_outputs[i] = analysis
             else:
                 h = block(h, attention_mask=attention_mask)
 
@@ -67,8 +86,12 @@ class TransformerDecoder(nnx.Module):
             h = h * target_rms
         logits = self.token_embed_out.attend(h, out_sharding=P('data', None, 'model')) # [B, T, V]
 
+        if return_qkv and return_analysis_tensors:
+            return logits, qkv_outputs, analysis_outputs
         if return_qkv:
             return logits, qkv_outputs
+        if return_analysis_tensors:
+            return logits, analysis_outputs
 
         return logits
 
@@ -132,14 +155,53 @@ class TransformerBlock(nnx.Module):
         self.attn = MultiHeadAttention(c, rngs, use_qk_norm=use_qk_norm)
         self.mlp = MLP(c, rngs)
         
-    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, T, D]
-        if return_qkv:
-            attn_out, qkv = self.attn(self.ln1(x), attention_mask=attention_mask, return_qkv=True)
+    def __call__(
+        self,
+        x,
+        attention_mask: jax.Array | None = None,
+        return_qkv: bool = False,
+        return_analysis_tensors: bool = False,
+    ): # [B, T, D]
+        attn_input = self.ln1(x)
+        if return_qkv and return_analysis_tensors:
+            attn_out, qkv, attn_analysis = self.attn(
+                attn_input,
+                attention_mask=attention_mask,
+                return_qkv=True,
+                return_analysis_tensors=True,
+            )
+            x = x + attn_out
+        elif return_qkv:
+            attn_out, qkv = self.attn(attn_input, attention_mask=attention_mask, return_qkv=True)
+            x = x + attn_out
+        elif return_analysis_tensors:
+            attn_out, attn_analysis = self.attn(
+                attn_input,
+                attention_mask=attention_mask,
+                return_analysis_tensors=True,
+            )
             x = x + attn_out
         else:
-            x = x + self.attn(self.ln1(x), attention_mask=attention_mask)
-        
-        x = x + self.mlp(self.ln2(x)) # MLP block
+            x = x + self.attn(attn_input, attention_mask=attention_mask)
+
+        mlp_input = self.ln2(x)
+        if return_analysis_tensors:
+            mlp_out, mlp_hidden = self.mlp(mlp_input, return_hidden=True)
+        else:
+            mlp_out = self.mlp(mlp_input)
+            mlp_hidden = None
+        x = x + mlp_out # MLP block
+
+        if return_analysis_tensors:
+            analysis = {
+                'attn_input': attn_input,
+                'mlp_input': mlp_input,
+                'mlp_hidden': mlp_hidden,
+                **attn_analysis,
+            }
+            if return_qkv:
+                return x, qkv, analysis
+            return x, analysis
 
         if return_qkv:
             return x, qkv
@@ -168,7 +230,32 @@ class MultiHeadAttention(nnx.Module):
         self.attention = partial(tpu_causal_flash_attention) if c.use_flash_attn else partial(jax.nn.dot_product_attention, is_causal=False)
         self.use_flash_attn = c.use_flash_attn
 
-    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, T, D]
+    def _build_attention_mask(self, B: int, T: int, attention_mask: jax.Array | None):
+        causal_mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_)).reshape(1, 1, T, T)
+        if attention_mask is None:
+            return causal_mask
+        padding_mask = attention_mask.astype(jnp.bool_).reshape(B, 1, 1, T)
+        return jnp.logical_and(causal_mask, padding_mask)
+
+    def _analysis_attention_probs(self, q, k, attention_mask: jax.Array | None):
+        B, T, _, H = q.shape
+        q_f32 = jnp.asarray(q, dtype=jnp.float32) / jnp.sqrt(jnp.asarray(H, dtype=jnp.float32))
+        k_f32 = jnp.asarray(k, dtype=jnp.float32)
+        scores = jnp.einsum('btnh,bsnh->bnts', q_f32, k_f32).transpose(0, 2, 1, 3)
+        mask = self._build_attention_mask(B, T, attention_mask)
+        neg_inf = jnp.asarray(-jnp.inf, dtype=scores.dtype)
+        scores = jnp.where(mask, scores, neg_inf)
+        probs = jax.nn.softmax(scores, axis=-1)
+        valid_rows = jnp.any(mask, axis=-1, keepdims=True)
+        return jnp.where(valid_rows, probs, 0.0)
+
+    def __call__(
+        self,
+        x,
+        attention_mask: jax.Array | None = None,
+        return_qkv: bool = False,
+        return_analysis_tensors: bool = False,
+    ): # [B, T, D]
         B, T, D = x.shape
 
         # input projection
@@ -194,25 +281,7 @@ class MultiHeadAttention(nnx.Module):
         if self.use_flash_attn:
             out = self.attention(q, k, v) # [B, T, N, H]
         else:
-             # 1. Create causal mask (allows attending to past)
-            # Shape [1, 1, T, T]
-            causal_mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_)).reshape(1, 1, T, T)
-            
-            # 2. Create padding mask (if provided)
-            if attention_mask is not None:
-                # attention_mask is [B, T]. Reshape to [B, 1, 1, T] (for broadcasting)
-                # This mask is 1 (True) for real tokens and 0 (False) for padding
-                padding_mask = attention_mask.astype(jnp.bool_).reshape(B, 1, 1, T)
-                
-                # 3. Combine masks: Both must be True to attend.
-                # causal_mask broadcasts to [B, 1, T, T]
-                # padding_mask broadcasts to [B, 1, T, T]
-                # combined_mask shape [B, 1, T, T]
-                combined_mask = jnp.logical_and(causal_mask, padding_mask)
-            else:
-                combined_mask = causal_mask
-            
-            # The mask will be broadcast by dot_product_attention to [B, N, T, T]
+            combined_mask = self._build_attention_mask(B, T, attention_mask)
             out = self.attention(q, k, v, mask=combined_mask) # [B, T, N, H]
 
         if self.elementwise_attn_output_gate:
@@ -220,6 +289,16 @@ class MultiHeadAttention(nnx.Module):
 
         # output projection followed by contraction back to original dims
         out = self.out_proj(out, out_sharding=P('data', None, None)) # [B, T, D]
+        if return_analysis_tensors:
+            analysis = {
+                'q': q,
+                'k': k,
+                'v': v,
+                'attention_probs': self._analysis_attention_probs(q, k, attention_mask),
+            }
+            if return_qkv:
+                return out, raw_qkv, analysis
+            return out, analysis
         if return_qkv:
             return out, raw_qkv
         return out
@@ -274,9 +353,12 @@ class MLP(nnx.Module):
         self.up_proj = nnx.Linear(in_features=c.D, out_features=c.F, use_bias=False, dtype=c.activ_dtype, rngs=rngs)
         self.down_proj = nnx.Linear(in_features=c.F, out_features=c.D, use_bias=False, dtype=c.activ_dtype, rngs=rngs)
         
-    def __call__(self, x): # [B, T, D]
+    def __call__(self, x, return_hidden: bool = False): # [B, T, D]
         h = jax.nn.gelu(self.up_proj(x, out_sharding=P('data', None, 'model'))) # [B, T, F]
-        return self.down_proj(h, out_sharding=P('data', None, None)) # [B, T, D]
+        out = self.down_proj(h, out_sharding=P('data', None, None)) # [B, T, D]
+        if return_hidden:
+            return out, h
+        return out
 
 
 def create_sharded_model(c: DictConfig, key):
