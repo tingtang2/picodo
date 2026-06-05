@@ -1595,6 +1595,11 @@ def train_and_evaluate(c: DictConfig):
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
     collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
+    eval_every_steps = getattr(c, "eval_every_steps", 100)
+    if eval_every_steps is not None:
+        eval_every_steps = int(eval_every_steps)
+        if eval_every_steps <= 0:
+            raise ValueError("eval_every_steps must be a positive integer or null to disable eval.")
     loss_skip_cfg = getattr(c.opt, "loss_skip", None)
     loss_skip_enabled = bool(getattr(loss_skip_cfg, "enabled", False))
     loss_skip_warmup_steps = int(getattr(loss_skip_cfg, "warmup_steps", 1000))
@@ -1648,6 +1653,8 @@ def train_and_evaluate(c: DictConfig):
             f"min_history={loss_rewrite_min_history}, z_hard={loss_rewrite_z_hard}, "
             f"use_log_loss={loss_rewrite_use_log_loss}"
         )
+    if eval_every_steps is None and jax.process_index() == 0:
+        print("eval disabled: eval_every_steps=null")
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
@@ -2102,7 +2109,7 @@ def train_and_evaluate(c: DictConfig):
             train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
         # eval and checkpointing
-        if step % c.eval_every_steps == 0:
+        if (eval_every_steps is not None) and (step % eval_every_steps == 0):
             (
                 eval_loss,
                 eval_raw_loss,
@@ -2155,32 +2162,35 @@ def train_and_evaluate(c: DictConfig):
         sys.exit(1)
 
     # eval at end of training
-    (
-        eval_loss,
-        eval_raw_loss,
-        eval_logits,
-        mean_eval_output_logit,
-        mean_eval_output_logit_std,
-        mean_eval_output_logit_entropy,
-    ) = eval_step(c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats)
-    metrics = {}
-    flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
-    flattened_eval_raw_loss_np = _to_host_numpy(flattened_eval_raw_loss, dtype=np.float32, flatten=True)
-    metrics['eval_loss'] = eval_loss
-    metrics['eval_output_logit_mean'] = mean_eval_output_logit
-    metrics['eval_output_logit_std'] = mean_eval_output_logit_std
-    metrics['eval_output_logit_entropy'] = mean_eval_output_logit_entropy
-    metrics['eval_med_loss'] = float(np.median(flattened_eval_raw_loss_np))
-    metrics['eval_lower_90th_mean_loss'] = float(
-        utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss_np)
-    )
+    if eval_every_steps is not None:
+        (
+            eval_loss,
+            eval_raw_loss,
+            eval_logits,
+            mean_eval_output_logit,
+            mean_eval_output_logit_std,
+            mean_eval_output_logit_entropy,
+        ) = eval_step(c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats)
+        metrics = {}
+        flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
+        flattened_eval_raw_loss_np = _to_host_numpy(flattened_eval_raw_loss, dtype=np.float32, flatten=True)
+        metrics['eval_loss'] = eval_loss
+        metrics['eval_output_logit_mean'] = mean_eval_output_logit
+        metrics['eval_output_logit_std'] = mean_eval_output_logit_std
+        metrics['eval_output_logit_entropy'] = mean_eval_output_logit_entropy
+        metrics['eval_med_loss'] = float(np.median(flattened_eval_raw_loss_np))
+        metrics['eval_lower_90th_mean_loss'] = float(
+            utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss_np)
+        )
+        if jax.process_index() == 0:
+            wandb.log(metrics)
+            if c.diagnostics.save_raw_losses:
+                diagnostics_dir = _resolve_diagnostics_dir(ckpt_dir)
+                if diagnostics_dir:
+                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{num_opt_steps}.npy', data=eval_raw_loss)
+
     if jax.process_index() == 0:
-        wandb.log(metrics)
         wandb.finish()
-        if c.diagnostics.save_raw_losses:
-            diagnostics_dir = _resolve_diagnostics_dir(ckpt_dir)
-            if diagnostics_dir:
-                utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{num_opt_steps}.npy', data=eval_raw_loss)
             
     # final checkpoint
     if c.checkpoint.turn_on and not c.diagnostics.save_raw_losses:

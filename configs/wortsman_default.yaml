@@ -11,7 +11,7 @@ log_every_tokens: 1_000_000
 log_metrics_per_step: True
 log_metrics_per_step_full: false
 log_output_embedding_group_metrics: true
-eval_every_steps: 100
+eval_every_steps: 100 # set to null to disable eval entirely
 num_tokens_valid: 20_000_000
 wandb_project: 'picodo-loss-spikes'
 wandb_mode: 'disabled'
