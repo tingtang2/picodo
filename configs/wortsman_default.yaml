@@ -120,6 +120,7 @@ diagnostics:
 analysis:
   checkpoint_steps: null
   split: valid
+  layer_indices: null
   batch_indices: null
   align_train_batches_to_checkpoints: true
   start_batch: 0

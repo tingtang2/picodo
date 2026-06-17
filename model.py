@@ -50,6 +50,9 @@ class TransformerDecoder(nnx.Module):
         attention_mask: jax.Array | None = None,
         return_qkv: bool = False,
         return_analysis_tensors: bool = False,
+        collect_activation_tensors: bool = True,
+        collect_attention_tensors: bool = True,
+        analysis_layer_indices: tuple[int, ...] | None = None,
     ): # [B, S]
 
         qkv_outputs = {}
@@ -59,20 +62,32 @@ class TransformerDecoder(nnx.Module):
 
         # transformer blocks
         for i, block in enumerate(self.blocks):
-            if return_qkv and return_analysis_tensors:
+            should_collect_layer_analysis = (
+                return_analysis_tensors
+                and (analysis_layer_indices is None or i in analysis_layer_indices)
+            )
+            if return_qkv and should_collect_layer_analysis:
                 h, qkv, analysis = block(
                     h,
                     attention_mask=attention_mask,
                     return_qkv=True,
                     return_analysis_tensors=True,
+                    collect_activation_tensors=collect_activation_tensors,
+                    collect_attention_tensors=collect_attention_tensors,
                 )
                 qkv_outputs[i] = qkv
                 analysis_outputs[i] = analysis
             elif return_qkv:
                 h, qkv = block(h, attention_mask=attention_mask, return_qkv=True)
                 qkv_outputs[i] = qkv
-            elif return_analysis_tensors:
-                h, analysis = block(h, attention_mask=attention_mask, return_analysis_tensors=True)
+            elif should_collect_layer_analysis:
+                h, analysis = block(
+                    h,
+                    attention_mask=attention_mask,
+                    return_analysis_tensors=True,
+                    collect_activation_tensors=collect_activation_tensors,
+                    collect_attention_tensors=collect_attention_tensors,
+                )
                 analysis_outputs[i] = analysis
             else:
                 h = block(h, attention_mask=attention_mask)
@@ -161,7 +176,10 @@ class TransformerBlock(nnx.Module):
         attention_mask: jax.Array | None = None,
         return_qkv: bool = False,
         return_analysis_tensors: bool = False,
+        collect_activation_tensors: bool = True,
+        collect_attention_tensors: bool = True,
     ): # [B, T, D]
+        attn_analysis = {}
         attn_input = self.ln1(x)
         if return_qkv and return_analysis_tensors:
             attn_out, qkv, attn_analysis = self.attn(
@@ -169,6 +187,8 @@ class TransformerBlock(nnx.Module):
                 attention_mask=attention_mask,
                 return_qkv=True,
                 return_analysis_tensors=True,
+                collect_activation_tensors=collect_activation_tensors,
+                collect_attention_tensors=collect_attention_tensors,
             )
             x = x + attn_out
         elif return_qkv:
@@ -179,13 +199,15 @@ class TransformerBlock(nnx.Module):
                 attn_input,
                 attention_mask=attention_mask,
                 return_analysis_tensors=True,
+                collect_activation_tensors=collect_activation_tensors,
+                collect_attention_tensors=collect_attention_tensors,
             )
             x = x + attn_out
         else:
             x = x + self.attn(attn_input, attention_mask=attention_mask)
 
         mlp_input = self.ln2(x)
-        if return_analysis_tensors:
+        if return_analysis_tensors and collect_activation_tensors:
             mlp_out, mlp_hidden = self.mlp(mlp_input, return_hidden=True)
         else:
             mlp_out = self.mlp(mlp_input)
@@ -193,12 +215,13 @@ class TransformerBlock(nnx.Module):
         x = x + mlp_out # MLP block
 
         if return_analysis_tensors:
-            analysis = {
-                'attn_input': attn_input,
-                'mlp_input': mlp_input,
-                'mlp_hidden': mlp_hidden,
-                **attn_analysis,
-            }
+            analysis = dict(attn_analysis)
+            if collect_activation_tensors:
+                analysis.update({
+                    'attn_input': attn_input,
+                    'mlp_input': mlp_input,
+                    'mlp_hidden': mlp_hidden,
+                })
             if return_qkv:
                 return x, qkv, analysis
             return x, analysis
@@ -241,7 +264,8 @@ class MultiHeadAttention(nnx.Module):
         B, T, _, H = q.shape
         q_f32 = jnp.asarray(q, dtype=jnp.float32) / jnp.sqrt(jnp.asarray(H, dtype=jnp.float32))
         k_f32 = jnp.asarray(k, dtype=jnp.float32)
-        scores = jnp.einsum('btnh,bsnh->bnts', q_f32, k_f32).transpose(0, 2, 1, 3)
+        # Keep the layout [B, N, T, T] so it matches the causal/padding mask.
+        scores = jnp.einsum('btnh,bsnh->bnts', q_f32, k_f32)
         mask = self._build_attention_mask(B, T, attention_mask)
         neg_inf = jnp.asarray(-jnp.inf, dtype=scores.dtype)
         scores = jnp.where(mask, scores, neg_inf)
@@ -255,6 +279,8 @@ class MultiHeadAttention(nnx.Module):
         attention_mask: jax.Array | None = None,
         return_qkv: bool = False,
         return_analysis_tensors: bool = False,
+        collect_activation_tensors: bool = True,
+        collect_attention_tensors: bool = True,
     ): # [B, T, D]
         B, T, D = x.shape
 
@@ -290,12 +316,9 @@ class MultiHeadAttention(nnx.Module):
         # output projection followed by contraction back to original dims
         out = self.out_proj(out, out_sharding=P('data', None, None)) # [B, T, D]
         if return_analysis_tensors:
-            analysis = {
-                'q': q,
-                'k': k,
-                'v': v,
-                'attention_probs': self._analysis_attention_probs(q, k, attention_mask),
-            }
+            analysis = {}
+            if collect_attention_tensors:
+                analysis['attention_probs'] = self._analysis_attention_probs(q, k, attention_mask)
             if return_qkv:
                 return out, raw_qkv, analysis
             return out, analysis

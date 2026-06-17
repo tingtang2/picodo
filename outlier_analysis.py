@@ -28,7 +28,7 @@ def _topk_flattened(x, k: int):
     idx = np.argpartition(flat, -kk)[-kk:]
     idx = idx[np.argsort(flat[idx])[::-1]]
     values = [float(flat[i]) for i in idx.tolist()]
-    indices = [list(np.unravel_index(int(i), arr.shape)) for i in idx.tolist()]
+    indices = [[int(v) for v in np.unravel_index(int(i), arr.shape)] for i in idx.tolist()]
     return values, indices
 
 
@@ -156,7 +156,7 @@ def summarize_analysis_outputs(analysis_outputs, tau: float = 6.0, use_mean: boo
             attention_summaries[layer_name] = summarize_attention_probs(
                 attn_probs, tau=tau, use_mean=use_mean, top_k=top_k
             )
-        for tensor_name in ("attn_input", "mlp_input", "mlp_hidden", "q", "k", "v"):
+        for tensor_name in ("attn_input", "mlp_input", "mlp_hidden"):
             value = tensors.get(tensor_name)
             if value is None:
                 continue

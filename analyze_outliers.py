@@ -29,6 +29,7 @@ import orbax.checkpoint as ocp
 from etils import epath
 from flax import nnx
 from omegaconf import DictConfig, OmegaConf, open_dict
+from tqdm.auto import tqdm
 
 from configs import resolver_setup
 import data
@@ -36,6 +37,29 @@ import model as model_lib
 import outlier_analysis
 import utils
 from train import _StandardNameFormatHNS
+
+def _to_jsonable(value):
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, jax.Array):
+        return _to_jsonable(jax.device_get(value))
+    if isinstance(value, jnp.ndarray):
+        return _to_jsonable(jax.device_get(value))
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+        return _to_jsonable(value.tolist())
+    try:
+        import numpy as np
+        if isinstance(value, np.integer):
+            return int(value)
+        if isinstance(value, np.floating):
+            return float(value)
+        if isinstance(value, np.bool_):
+            return bool(value)
+    except ImportError:
+        pass
+    return value
 
 
 def _cfg_get(c: DictConfig, path: str, default):
@@ -298,11 +322,38 @@ def _resolve_target_rms(model, c: DictConfig):
     return resolved
 
 
-@partial(jax.jit, static_argnames=("model_graphdef", "use_z_loss"))
-def forward_analysis(model_state, model_graphdef, x, use_z_loss: bool = False):
+@partial(
+    jax.jit,
+    static_argnames=(
+        "model_graphdef",
+        "use_z_loss",
+        "collect_activation_tensors",
+        "collect_attention_tensors",
+        "analysis_layer_indices",
+    ),
+)
+def forward_analysis(
+    model_state,
+    model_graphdef,
+    x,
+    use_z_loss: bool = False,
+    collect_activation_tensors: bool = True,
+    collect_attention_tensors: bool = True,
+    analysis_layer_indices: tuple[int, ...] | None = None,
+):
     model = nnx.merge(model_graphdef, model_state)
     y = jnp.roll(x, -1, axis=1)
-    logits, analysis_outputs = model(x, return_analysis_tensors=True)
+    if collect_activation_tensors or collect_attention_tensors:
+        logits, analysis_outputs = model(
+            x,
+            return_analysis_tensors=True,
+            collect_activation_tensors=collect_activation_tensors,
+            collect_attention_tensors=collect_attention_tensors,
+            analysis_layer_indices=analysis_layer_indices,
+        )
+    else:
+        logits = model(x)
+        analysis_outputs = {}
     logits = logits.astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     losses = utils.cross_entropy_losses_from_log_probs(log_probs, y)[:, :-1]
@@ -375,6 +426,7 @@ def main(c: DictConfig):
     include_weights = bool(_cfg_get(c, "analysis.include_weights", True))
     include_activations = bool(_cfg_get(c, "analysis.include_activations", True))
     include_attention = bool(_cfg_get(c, "analysis.include_attention", True))
+    requested_layer_indices = _normalize_int_list(_cfg_get(c, "analysis.layer_indices", None))
     save_per_batch = bool(_cfg_get(c, "analysis.save_per_batch", False))
     compare_reference_index = int(_cfg_get(c, "analysis.compare_reference_index", 0))
     checkpoint_steps_cfg = _normalize_int_list(_cfg_get(c, "analysis.checkpoint_steps", None))
@@ -400,6 +452,11 @@ def main(c: DictConfig):
             c.model.use_flash_attn = False
         print("Disabled flash attention for offline outlier analysis.")
     c.model.V = int(math.ceil(c.model.V / jax.device_count()) * jax.device_count())
+    target_layer_indices = (
+        tuple(requested_layer_indices)
+        if requested_layer_indices is not None
+        else tuple(range(int(c.model.L)))
+    )
 
     print("Initializing model...")
     model = model_lib.create_sharded_model(c.model, key_model)
@@ -460,7 +517,10 @@ def main(c: DictConfig):
 
     checkpoint_reports = []
     t0 = time.time()
-    for step in checkpoint_steps:
+    checkpoint_pbar = checkpoint_steps
+    if jax.process_index() == 0:
+        checkpoint_pbar = tqdm(checkpoint_steps, desc="checkpoints")
+    for step in checkpoint_pbar:
         print(f"Restoring checkpoint {step}...")
         model_state = _restore_model_state(ckpt_mngr, step, abstract_opt_state)
 
@@ -469,22 +529,49 @@ def main(c: DictConfig):
         batch_loss_values = []
         batch_reports = []
 
-        for batch_idx in batch_indices:
+        batch_pbar = batch_indices
+        if jax.process_index() == 0:
+            batch_pbar = tqdm(batch_indices, desc=f"step {step} batches", leave=False)
+        for batch_idx in batch_pbar:
             batch = dataset[batch_idx]
-            batch_loss, analysis_outputs = forward_analysis(
-                model_state, model_graphdef, batch, use_z_loss=use_z_loss
+            batch_loss, _ = forward_analysis(
+                model_state,
+                model_graphdef,
+                batch,
+                use_z_loss=use_z_loss,
+                collect_activation_tensors=False,
+                collect_attention_tensors=False,
+                analysis_layer_indices=None,
             )
             batch_loss_values.append(float(jax.device_get(batch_loss)))
 
-            analysis_outputs_host = jax.device_get(analysis_outputs)
-            activation_summary, attention_summary = outlier_analysis.summarize_analysis_outputs(
-                analysis_outputs_host,
-                tau=tau,
-                use_mean=use_mean,
-                top_k=top_k,
-            )
-            activation_per_batch.append(activation_summary)
-            attention_per_batch.append(attention_summary)
+            if include_activations or include_attention:
+                layer_activation_summary = {}
+                layer_attention_summary = {}
+                layer_pbar = target_layer_indices
+                if jax.process_index() == 0:
+                    layer_pbar = tqdm(target_layer_indices, desc=f"step {step} batch {batch_idx} layers", leave=False)
+                for layer_idx in layer_pbar:
+                    _, layer_analysis_outputs = forward_analysis(
+                        model_state,
+                        model_graphdef,
+                        batch,
+                        use_z_loss=use_z_loss,
+                        collect_activation_tensors=include_activations,
+                        collect_attention_tensors=include_attention,
+                        analysis_layer_indices=(int(layer_idx),),
+                    )
+                    layer_analysis_outputs_host = jax.device_get(layer_analysis_outputs)
+                    activation_summary, attention_summary = outlier_analysis.summarize_analysis_outputs(
+                        layer_analysis_outputs_host,
+                        tau=tau,
+                        use_mean=use_mean,
+                        top_k=top_k,
+                    )
+                    layer_activation_summary.update(activation_summary)
+                    layer_attention_summary.update(attention_summary)
+                activation_per_batch.append(layer_activation_summary)
+                attention_per_batch.append(layer_attention_summary)
             if save_per_batch:
                 batch_report = {
                     "batch_index": int(batch_idx),
@@ -548,8 +635,9 @@ def main(c: DictConfig):
     }
 
     report_path = output_dir_path / "outlier_analysis_report.json"
+    print(type(final_report["checkpoints"][0]["weights"]))
     with report_path.open("w") as f:
-        json.dump(final_report, f, indent=2)
+        json.dump(_to_jsonable(final_report), f, indent=2)
     print(f"Saved outlier analysis report to: {report_path}")
 
 
