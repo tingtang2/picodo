@@ -71,7 +71,8 @@ def batch_loss_stats(model_state, model_graphdef, x):
     y = jnp.roll(x, -1, axis=1)
     logits = model(x).astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    token_losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
+    # Explicit sharding requires an output PartitionSpec for token gathers.
+    token_losses = -utils.gather_token_values(log_probs, y)
     token_losses = token_losses[:, :-1]
     per_example_loss = token_losses.mean(axis=1)
     batch_mean_loss = per_example_loss.mean()
@@ -85,15 +86,14 @@ def forward_logits(model_state, model_graphdef, x):
 
 
 def forward_logits_mesh_safe(model_state, model_graphdef, x, data_axis_size: int):
-    """Pads batch dimension so it is divisible by mesh data axis, then slices back."""
+    """Pads batch dimension so it is divisible by mesh data axis."""
     batch_size = int(x.shape[0])
     if batch_size % data_axis_size == 0:
         return forward_logits(model_state, model_graphdef, x)
 
     pad = data_axis_size - (batch_size % data_axis_size)
     x_padded = jnp.concatenate([x, jnp.repeat(x[-1:, :], pad, axis=0)], axis=0)
-    logits_padded = forward_logits(model_state, model_graphdef, x_padded)
-    return logits_padded[:batch_size]
+    return forward_logits(model_state, model_graphdef, x_padded)
 
 
 def _cfg_get(c: DictConfig, path: str, default):
@@ -190,7 +190,7 @@ def _eval_single_event_loss(
     target_id: int,
     data_axis_size: int,
 ):
-    logits_vec = np.asarray(
+    logits_host = np.asarray(
         jax.device_get(
             forward_logits_mesh_safe(
                 model_state,
@@ -200,7 +200,8 @@ def _eval_single_event_loss(
             )
         ),
         dtype=np.float32,
-    )[0, pos]
+    )
+    logits_vec = logits_host[0, pos]
     return _loss_at_position_from_logits(logits_vec, target_id), logits_vec
 
 
@@ -560,6 +561,7 @@ def main(c: DictConfig):
                 model_state, model_graphdef, train_batch
             )
             train_batch_np = np.asarray(jax.device_get(train_batch), dtype=np.int32)
+            train_per_example_loss_np = np.asarray(jax.device_get(train_per_example_loss), dtype=np.float32)
             train_token_losses_np = np.asarray(jax.device_get(train_token_losses), dtype=np.float32)
             train_top_candidates = _top_token_candidates(train_token_losses_np, next_train_top_token_events)
 
@@ -612,10 +614,8 @@ def main(c: DictConfig):
                 'train_step': int(next_train_step),
                 'batch_shape': [int(x) for x in train_batch_np.shape],
                 'batch_mean_loss': float(jax.device_get(train_batch_mean_loss)),
-                'batch_med_example_loss': float(jax.device_get(jnp.median(train_per_example_loss))),
-                'batch_lower_90th_mean_loss': float(
-                    jax.device_get(utils.compute_lower_90th_percentile_mean(train_token_losses))
-                ),
+                'batch_med_example_loss': float(np.median(train_per_example_loss_np)),
+                'batch_lower_90th_mean_loss': float(utils.compute_lower_90th_percentile_mean(train_token_losses_np)),
                 'batch_max_token_loss': float(train_token_losses_np.max()) if train_token_losses_np.size else float('-inf'),
                 'top_token_events': [asdict(x) for x in train_top_event_records],
             }
