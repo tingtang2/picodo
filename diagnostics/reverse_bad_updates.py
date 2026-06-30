@@ -353,17 +353,19 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
     elif lm_head_optimizer_type in {"row_oblique", "column_oblique"}:
         if output_embedding_mask is None:
             output_embedding_mask = utils.build_output_embedding_mask(model)
-        non_output_embedding_mask = jax.tree_util.tree_map(
-            lambda is_output_embedding: not is_output_embedding,
+        lm_head_target_rms_mask = utils.build_lm_head_oblique_target_rms_mask(model)
+        non_lm_head_mask = jax.tree_util.tree_map(
+            lambda is_output_embedding, is_target_rms: not (is_output_embedding or is_target_rms),
             output_embedding_mask,
+            lm_head_target_rms_mask,
         )
         if wd_mask is None:
-            rest_wd_mask = non_output_embedding_mask
+            rest_wd_mask = non_lm_head_mask
         else:
             rest_wd_mask = jax.tree_util.tree_map(
-                lambda use_wd, is_non_output_embedding: bool(use_wd and is_non_output_embedding),
+                lambda use_wd, is_non_lm_head: bool(use_wd and is_non_lm_head),
                 wd_mask,
-                non_output_embedding_mask,
+                non_lm_head_mask,
             )
 
         lm_head_momentum = float(getattr(lm_head_optimizer_cfg, "momentum", 0.9))
@@ -400,8 +402,16 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
             weight_decay=c.opt.weight_decay,
             mask=rest_wd_mask,
         )
+        lm_head_target_rms_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            lm_head_tx_lr_schedule,
+            c.opt.b1,
+            b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=0.0,
+        )
         base_optimizer_tx = optax.chain(
-            optax.masked(rest_adamw_tx, non_output_embedding_mask),
+            optax.masked(rest_adamw_tx, non_lm_head_mask),
+            optax.masked(lm_head_target_rms_adamw_tx, lm_head_target_rms_mask),
             optax.masked(lm_head_oblique_tx, output_embedding_mask),
         )
         if jax.process_index() == 0:
@@ -412,6 +422,7 @@ def _build_optimizer(c: DictConfig, model, num_opt_steps: int):
                 f"target_rms={resolved_lm_head_target_rms}, "
                 f"direction_target_rms={lm_head_direction_target_rms}, "
                 f"learn_target_rms={utils.lm_head_uses_learned_target_rms(c.opt)}, "
+                f"target_rms_log_peak_lr={lm_head_peak_lr}, "
                 f"eps={lm_head_oblique_eps}, weight_decay=off_for_lm_head"
             )
     else:

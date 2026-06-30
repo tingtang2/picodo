@@ -32,6 +32,11 @@ def _is_output_embedding_path(path) -> bool:
     return key == 'token_embed_out/embedding'
 
 
+def _is_lm_head_oblique_target_rms_log_path(path) -> bool:
+    key = jax.tree_util.keystr(path, simple=True, separator='/')
+    return key == 'lm_head_oblique_target_rms_log'
+
+
 def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
     _, params = nnx.split(model, nnx.Param)
     learned_target_rms_present = False
@@ -81,6 +86,16 @@ def build_output_embedding_mask(model: nnx.Module):
 
     return jax.tree_util.tree_map_with_path(
         mask_leaf,
+        params,
+        is_leaf=lambda x: isinstance(x, nnx.Param),
+    )
+
+
+def build_lm_head_oblique_target_rms_mask(model: nnx.Module):
+    _, params = nnx.split(model, nnx.Param)
+
+    return jax.tree_util.tree_map_with_path(
+        lambda path, _: _is_lm_head_oblique_target_rms_log_path(path),
         params,
         is_leaf=lambda x: isinstance(x, nnx.Param),
     )
