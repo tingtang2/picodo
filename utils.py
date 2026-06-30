@@ -29,39 +29,7 @@ def get_num_model_params(model: nnx.Module):
 
 def _is_output_embedding_path(path) -> bool:
     key = jax.tree_util.keystr(path, simple=True, separator='/')
-    return key == 'token_embed_out/embedding/value'
-
-
-def gather_token_values(values: jax.Array, token_ids: jax.Array) -> jax.Array:
-    """Gather per-token values from a `[B, T, V]` tensor in explicit-sharding mode."""
-    if values.ndim != 3:
-        raise ValueError(f"Expected `values` to have shape [B, T, V], got {values.shape}.")
-    if token_ids.shape != values.shape[:2]:
-        raise ValueError(
-            f"Expected `token_ids.shape == values.shape[:2]`, got {token_ids.shape} vs {values.shape[:2]}."
-        )
-    batch_idx = jnp.arange(values.shape[0])[:, None]
-    time_idx = jnp.arange(values.shape[1])[None, :]
-    return values.at[batch_idx, time_idx, token_ids].get(out_sharding=jax.sharding.PartitionSpec('data', None))
-
-
-def gather_rows(values: jax.Array, row_ids) -> jax.Array:
-    """Gather rows from a rank-N array along axis 0 in explicit-sharding mode."""
-    row_ids = jnp.asarray(row_ids, dtype=jnp.int32)
-    out_sharding = jax.sharding.PartitionSpec(*([None] * values.ndim))
-    return values.at[row_ids].get(out_sharding=out_sharding)
-
-
-def cross_entropy_losses_from_log_probs(log_probs: jax.Array, token_ids: jax.Array) -> jax.Array:
-    """Per-token CE from `[B, T, V]` log-probs and integer token ids `[B, T]`."""
-    if log_probs.ndim != 3:
-        raise ValueError(f"Expected `log_probs` to have shape [B, T, V], got {log_probs.shape}.")
-    if token_ids.shape != log_probs.shape[:2]:
-        raise ValueError(
-            f"Expected `token_ids.shape == log_probs.shape[:2]`, got {token_ids.shape} vs {log_probs.shape[:2]}."
-        )
-    one_hot = jax.nn.one_hot(token_ids, log_probs.shape[-1], dtype=log_probs.dtype)
-    return -jnp.sum(one_hot * log_probs, axis=-1)
+    return key == 'token_embed_out/embedding'
 
 
 def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
@@ -769,10 +737,6 @@ def save_to_numpy(save_dir: str, name: str, data):
     
 
 def compute_lower_90th_percentile_mean(x):
-    if isinstance(x, np.ndarray):
-        k = int(0.9 * x.size)
-        top_90th = np.partition(x.reshape(-1), k)[:k]
-        return float(top_90th.mean())
     k = int(0.9 * x.size)
     top_90th = jnp.partition(x.flatten(), k)[:k]
     return top_90th.mean()
@@ -1112,7 +1076,7 @@ def get_output_embedding_group_metrics(opt_state, token_groups, eps: float):
             continue
 
         metric_group_name = _sanitize_metric_name(group["name"])
-        group_rows = gather_rows(output_embedding, valid_token_ids)
+        group_rows = output_embedding[valid_token_ids]
         group_rows_by_name[metric_group_name] = group_rows
         group_token_ids_by_name[metric_group_name] = valid_token_ids
 
@@ -1122,8 +1086,8 @@ def get_output_embedding_group_metrics(opt_state, token_groups, eps: float):
         metrics[f"output_embedding_groups/{metric_group_name}/row_l2_norm_mean"] = jnp.mean(row_l2_norm)
         metrics[f"output_embedding_groups/{metric_group_name}/row_rms_mean"] = jnp.mean(row_rms)
         if sqrt_second_moment is not None and adam_ratio is not None:
-            group_sqrt_second_moment = gather_rows(sqrt_second_moment, valid_token_ids)
-            group_adam_ratio = gather_rows(adam_ratio, valid_token_ids)
+            group_sqrt_second_moment = sqrt_second_moment[valid_token_ids]
+            group_adam_ratio = adam_ratio[valid_token_ids]
             row_sqrt_second_moment_mean = jnp.mean(group_sqrt_second_moment, axis=-1)
             row_sqrt_second_moment_max = jnp.max(group_sqrt_second_moment, axis=-1)
             row_adam_ratio_mean = jnp.mean(group_adam_ratio, axis=-1)
@@ -1198,7 +1162,7 @@ def _per_token_loss_sum_and_count(model_state, model_graphdef, x, vocab_size):
     y = jnp.roll(x, -1, axis=1)
     logits = model(x, return_qkv=False).astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    losses = cross_entropy_losses_from_log_probs(log_probs, y)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
 
     # remove wraparound last position
     losses = losses[:, :-1]
@@ -1221,7 +1185,7 @@ def _per_batch_grad_W_U(model_state, model_graphdef, x):
         y = jnp.roll(x, -1, axis=1)
         logits = model(x, return_qkv=False).astype(jnp.float32)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
-        losses = cross_entropy_losses_from_log_probs(log_probs, y)
+        losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
         return losses[:, :-1].sum()
 
     grads = jax.grad(loss_fn)(model_state)

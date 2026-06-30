@@ -61,7 +61,7 @@ def loss_fn(model_state, model_graphdef, x, collect_qkv_stats: bool = True): # [
 
     logits = logits.astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    losses = utils.cross_entropy_losses_from_log_probs(log_probs, y)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
 
     if collect_qkv_stats:
@@ -82,7 +82,7 @@ def loss_fn_z_loss(model_state, model_graphdef, x, collect_qkv_stats: bool = Tru
         logits = model(x, return_qkv=False) # [B, T, V]
         qkv_dict = None
     log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
-    losses = utils.cross_entropy_losses_from_log_probs(log_probs, y)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
 
     z = jax.nn.logsumexp(logits[:, :-1].astype(jnp.float32), axis=-1)  
@@ -229,7 +229,7 @@ def loss_fn_with_skip(
 
     logits = logits.astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    losses = utils.cross_entropy_losses_from_log_probs(log_probs, y)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
 
     weights = _build_loss_skip_weights(
@@ -281,7 +281,7 @@ def loss_fn_z_loss_with_skip(
 
     logits_f32 = logits.astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits_f32, axis=-1)
-    losses = utils.cross_entropy_losses_from_log_probs(log_probs, y)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
 
     weights = _build_loss_skip_weights(
@@ -335,7 +335,7 @@ def loss_fn_with_soft_cap(
 
     logits = logits.astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    losses = utils.cross_entropy_losses_from_log_probs(log_probs, y)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
 
     capped_losses = _apply_tanh_soft_cap(losses, soft_cap)
@@ -378,7 +378,7 @@ def loss_fn_z_loss_with_soft_cap(
 
     logits_f32 = logits.astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits_f32, axis=-1)
-    losses = utils.cross_entropy_losses_from_log_probs(log_probs, y)
+    losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
     losses = losses[:, :-1]
 
     capped_losses = _apply_tanh_soft_cap(losses, soft_cap)
@@ -771,7 +771,7 @@ def get_logit_gaps_by_lm_head(model_state, model_graphdef, x): # [B, T]
 
     mean_gaps = jnp.mean(gaps, axis=(0, 1)) # [V]
     y = jnp.roll(x, -1, axis=1)[:, :-1]
-    target_logits = utils.gather_token_values(logits, y)
+    target_logits = jnp.take_along_axis(logits, y[..., None], axis=-1).squeeze(-1)
     target_gaps = target_logits - max_logits.squeeze(-1) # [B, T]
 
     return mean_gaps, target_gaps
@@ -794,7 +794,7 @@ def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
 
     def loss_from_logits(l):
         log_probs = jax.nn.log_softmax(l, axis=-1)
-        losses = utils.cross_entropy_losses_from_log_probs(log_probs, y)
+        losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
         losses = losses[:, :-1]
         return losses.mean()
 
@@ -821,7 +821,7 @@ def get_logit_grad_scaling_stats(model_state, model_graphdef, x): # [B, T]
 
     def loss_from_logits(l):
         log_probs = jax.nn.log_softmax(l, axis=-1)
-        losses = utils.cross_entropy_losses_from_log_probs(log_probs, y)
+        losses = -jnp.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
         return (losses * mask).sum() / denom
 
     grad_auto = jax.grad(loss_from_logits)(logits)
@@ -1595,11 +1595,6 @@ def train_and_evaluate(c: DictConfig):
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
     collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
-    eval_every_steps = getattr(c, "eval_every_steps", 100)
-    if eval_every_steps is not None:
-        eval_every_steps = int(eval_every_steps)
-        if eval_every_steps <= 0:
-            raise ValueError("eval_every_steps must be a positive integer or null to disable eval.")
     loss_skip_cfg = getattr(c.opt, "loss_skip", None)
     loss_skip_enabled = bool(getattr(loss_skip_cfg, "enabled", False))
     loss_skip_warmup_steps = int(getattr(loss_skip_cfg, "warmup_steps", 1000))
@@ -1653,8 +1648,6 @@ def train_and_evaluate(c: DictConfig):
             f"min_history={loss_rewrite_min_history}, z_hard={loss_rewrite_z_hard}, "
             f"use_log_loss={loss_rewrite_use_log_loss}"
         )
-    if eval_every_steps is None and jax.process_index() == 0:
-        print("eval disabled: eval_every_steps=null")
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
@@ -1981,12 +1974,8 @@ def train_and_evaluate(c: DictConfig):
                         collect_qkv_stats,
                         need_step_grads,
                     )
-        train_raw_loss_np = _to_host_numpy(train_raw_loss, dtype=np.float32, flatten=True)
-        train_med_loss = float(np.median(train_raw_loss_np))
-        train_lower_90th_mean_loss = float(utils.compute_lower_90th_percentile_mean(train_raw_loss_np))
-
         if loss_skip_enabled:
-            raw_np = train_raw_loss_np
+            raw_np = _to_host_numpy(train_raw_loss, dtype=np.float32, flatten=True)
             stats_np = np.log1p(np.maximum(raw_np, 0.0)) if loss_skip_use_log_loss else raw_np
             if gate_apply:
                 scale = max(1.4826 * gate_mad, loss_skip_eps)
@@ -2026,8 +2015,8 @@ def train_and_evaluate(c: DictConfig):
             train_logit_gaps, train_target_gaps = get_logit_gaps_by_lm_head(opt_state.model, model_graphdef, batch)
 
         train_loss_sum += batch_loss_to_log
-        train_med_loss_sum += train_med_loss
-        train_lower_90th_mean_loss_sum += train_lower_90th_mean_loss
+        train_med_loss_sum += jnp.median(train_raw_loss)
+        train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
         train_loss_num += 1
         should_log_interval_metrics = train_loss_num * tokens_per_opt_step >= c.log_every_tokens
 
@@ -2037,8 +2026,8 @@ def train_and_evaluate(c: DictConfig):
                 step,
                 tokens_per_opt_step,
                 batch_loss_to_log,
-                train_med_loss,
-                train_lower_90th_mean_loss,
+                jnp.median(train_raw_loss),
+                utils.compute_lower_90th_percentile_mean(train_raw_loss),
                 lr_schedule,
                 b2_schedule,
                 lm_head_metric_lr_schedule,
@@ -2109,7 +2098,7 @@ def train_and_evaluate(c: DictConfig):
             train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
         # eval and checkpointing
-        if (eval_every_steps is not None) and (step % eval_every_steps == 0):
+        if step % c.eval_every_steps == 0:
             (
                 eval_loss,
                 eval_raw_loss,
@@ -2119,16 +2108,13 @@ def train_and_evaluate(c: DictConfig):
                 mean_eval_output_logit_entropy,
             ) = eval_step(c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats)
             flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
-            flattened_eval_raw_loss_np = _to_host_numpy(flattened_eval_raw_loss, dtype=np.float32, flatten=True)
             metrics = {}
             metrics['eval_loss'] = eval_loss
             metrics['eval_output_logit_mean'] = mean_eval_output_logit
             metrics['eval_output_logit_std'] = mean_eval_output_logit_std
             metrics['eval_output_logit_entropy'] = mean_eval_output_logit_entropy
-            metrics['eval_med_loss'] = float(np.median(flattened_eval_raw_loss_np))
-            metrics['eval_lower_90th_mean_loss'] = float(
-                utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss_np)
-            )
+            metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
+            metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
             metrics['train_tokens_seen'] = (step+1) * tokens_per_opt_step
             if jax.process_index() == 0:
                 wandb.log(metrics, step)
@@ -2162,35 +2148,29 @@ def train_and_evaluate(c: DictConfig):
         sys.exit(1)
 
     # eval at end of training
-    if eval_every_steps is not None:
-        (
-            eval_loss,
-            eval_raw_loss,
-            eval_logits,
-            mean_eval_output_logit,
-            mean_eval_output_logit_std,
-            mean_eval_output_logit_entropy,
-        ) = eval_step(c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats)
-        metrics = {}
-        flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
-        flattened_eval_raw_loss_np = _to_host_numpy(flattened_eval_raw_loss, dtype=np.float32, flatten=True)
-        metrics['eval_loss'] = eval_loss
-        metrics['eval_output_logit_mean'] = mean_eval_output_logit
-        metrics['eval_output_logit_std'] = mean_eval_output_logit_std
-        metrics['eval_output_logit_entropy'] = mean_eval_output_logit_entropy
-        metrics['eval_med_loss'] = float(np.median(flattened_eval_raw_loss_np))
-        metrics['eval_lower_90th_mean_loss'] = float(
-            utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss_np)
-        )
-        if jax.process_index() == 0:
-            wandb.log(metrics)
-            if c.diagnostics.save_raw_losses:
-                diagnostics_dir = _resolve_diagnostics_dir(ckpt_dir)
-                if diagnostics_dir:
-                    utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{num_opt_steps}.npy', data=eval_raw_loss)
-
+    (
+        eval_loss,
+        eval_raw_loss,
+        eval_logits,
+        mean_eval_output_logit,
+        mean_eval_output_logit_std,
+        mean_eval_output_logit_entropy,
+    ) = eval_step(c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats)
+    metrics = {}
+    flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
+    metrics['eval_loss'] = eval_loss
+    metrics['eval_output_logit_mean'] = mean_eval_output_logit
+    metrics['eval_output_logit_std'] = mean_eval_output_logit_std
+    metrics['eval_output_logit_entropy'] = mean_eval_output_logit_entropy
+    metrics['eval_med_loss'] = jnp.median(flattened_eval_raw_loss)
+    metrics['eval_lower_90th_mean_loss'] = utils.compute_lower_90th_percentile_mean(flattened_eval_raw_loss)
     if jax.process_index() == 0:
+        wandb.log(metrics)
         wandb.finish()
+        if c.diagnostics.save_raw_losses:
+            diagnostics_dir = _resolve_diagnostics_dir(ckpt_dir)
+            if diagnostics_dir:
+                utils.save_to_numpy(save_dir=diagnostics_dir, name=f'eval_raw_losses_step_{num_opt_steps}.npy', data=eval_raw_loss)
             
     # final checkpoint
     if c.checkpoint.turn_on and not c.diagnostics.save_raw_losses:
