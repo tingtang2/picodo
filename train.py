@@ -1137,7 +1137,7 @@ def train_and_evaluate(c: DictConfig):
             )
             init_log_message = (
                 "row-oblique lm-head initialization enabled: "
-                f"scaled_target_norm={resolved_lm_head_target_rms}, "
+                f"target_rms={resolved_lm_head_target_rms}, "
                 f"learn_target_rms={learn_target_rms}, initial_target_rms={initial_target_rms}, "
                 f"initial_target_rms_source={initial_target_rms_source}, "
                 f"initial_actual_row_l2={actual_row_l2:.6g}"
@@ -1153,7 +1153,7 @@ def train_and_evaluate(c: DictConfig):
             )
             init_log_message = (
                 "column-oblique lm-head initialization enabled: "
-                f"scaled_target_norm={resolved_lm_head_target_rms}, "
+                f"target_rms={resolved_lm_head_target_rms}, "
                 f"learn_target_rms={learn_target_rms}, initial_target_rms={initial_target_rms}, "
                 f"initial_target_rms_source={initial_target_rms_source}, "
                 f"initial_actual_col_l2={actual_col_l2:.6g}"
@@ -1396,6 +1396,7 @@ def train_and_evaluate(c: DictConfig):
             if resolved_lm_head_target_rms is not None
             else utils.get_lm_head_oblique_optimizer_target_rms(c.opt)
         )
+        lm_head_direction_target_rms = utils.get_lm_head_oblique_direction_target_rms(c.opt)
         lm_head_oblique_eps = float(getattr(lm_head_optimizer_cfg, "eps", c.opt.eps))
         lm_head_oblique_tx = optax.chain(
             utils.scale_by_ema_momentum(lm_head_momentum),
@@ -1406,6 +1407,7 @@ def train_and_evaluate(c: DictConfig):
             )(
                 learning_rate=lm_head_tx_lr_schedule,
                 target_rms=lm_head_target_rms,
+                direction_target_rms=lm_head_direction_target_rms,
                 eps=lm_head_oblique_eps,
             )
         )
@@ -1426,7 +1428,8 @@ def train_and_evaluate(c: DictConfig):
                 "split lm-head optimizer enabled: "
                 f"default=adamw, lm_head={lm_head_optimizer_type}, "
                 f"lm_head_peak_lr={lm_head_peak_lr}, momentum={lm_head_momentum}, "
-                f"scaled_target_norm={lm_head_target_rms}, "
+                f"target_rms={lm_head_target_rms}, "
+                f"direction_target_rms={lm_head_direction_target_rms}, "
                 f"learn_target_rms={utils.lm_head_uses_learned_target_rms(c.opt)}, "
                 f"eps={lm_head_oblique_eps}, weight_decay=off_for_lm_head"
             )

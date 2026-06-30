@@ -209,6 +209,12 @@ def validate_row_oblique_lm_head_options(opt_cfg):
         raise ValueError(
             f"Expected opt.lm_head_optimizer.initial_target_rms to be positive, got {initial_target_rms}."
         )
+    direction_target_rms = get_lm_head_oblique_direction_target_rms(opt_cfg)
+    if direction_target_rms <= 0.0:
+        raise ValueError(
+            "Expected opt.lm_head_optimizer.direction_target_rms to be positive, "
+            f"got {direction_target_rms}."
+        )
 
     if bool(getattr(opt_cfg, "mucentering", False)):
         raise ValueError(
@@ -241,6 +247,11 @@ def validate_row_oblique_lm_head_options(opt_cfg):
 def get_lm_head_oblique_target_rms(opt_cfg) -> float:
     lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
     return float(getattr(lm_head_optimizer_cfg, "target_rms", 1.0))
+
+
+def get_lm_head_oblique_direction_target_rms(opt_cfg) -> float:
+    lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
+    return float(getattr(lm_head_optimizer_cfg, "direction_target_rms", 1.0))
 
 
 def get_row_oblique_target_rms(opt_cfg) -> float:
@@ -335,7 +346,14 @@ def project_to_column_oblique_tangent_space(update, param, target_rms: float = 1
     return update_f32 - param_f32 * (col_alignment / denom)
 
 
-def apply_row_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
+def apply_row_oblique_update(
+    update,
+    param,
+    learning_rate,
+    target_rms: float = 1.0,
+    direction_target_rms: float = 1.0,
+    eps: float = 1e-8,
+):
     param_f32 = jnp.asarray(param, dtype=jnp.float32)
     update_f32 = jnp.asarray(update, dtype=jnp.float32)
     tangent_update = project_to_row_oblique_tangent_space(
@@ -345,7 +363,7 @@ def apply_row_oblique_update(update, param, learning_rate, target_rms: float = 1
     )
     steepest_direction = row_wise_normalize(
         tangent_update,
-        target_rms=target_rms,
+        target_rms=direction_target_rms,
         eps=eps,
     )
     lr_f32 = jnp.asarray(learning_rate, dtype=jnp.float32)
@@ -357,7 +375,14 @@ def apply_row_oblique_update(update, param, learning_rate, target_rms: float = 1
     return next_param.astype(jnp.asarray(param).dtype) - jnp.asarray(param)
 
 
-def apply_column_oblique_update(update, param, learning_rate, target_rms: float = 1.0, eps: float = 1e-8):
+def apply_column_oblique_update(
+    update,
+    param,
+    learning_rate,
+    target_rms: float = 1.0,
+    direction_target_rms: float = 1.0,
+    eps: float = 1e-8,
+):
     param_f32 = jnp.asarray(param, dtype=jnp.float32)
     update_f32 = jnp.asarray(update, dtype=jnp.float32)
     tangent_update = project_to_column_oblique_tangent_space(
@@ -367,7 +392,7 @@ def apply_column_oblique_update(update, param, learning_rate, target_rms: float 
     )
     steepest_direction = column_wise_normalize(
         tangent_update,
-        target_rms=target_rms,
+        target_rms=direction_target_rms,
         eps=eps,
     )
     lr_f32 = jnp.asarray(learning_rate, dtype=jnp.float32)
@@ -427,10 +452,15 @@ def scale_by_ema_momentum(decay: float) -> optax.GradientTransformation:
 def row_oblique_steepest_descent(
     learning_rate,
     target_rms: float = 1.0,
+    direction_target_rms: float = 1.0,
     eps: float = 1e-8,
 ) -> optax.GradientTransformation:
     if target_rms <= 0.0:
         raise ValueError(f"Expected `target_rms` to be positive, got {target_rms}.")
+    if direction_target_rms <= 0.0:
+        raise ValueError(
+            f"Expected `direction_target_rms` to be positive, got {direction_target_rms}."
+        )
 
     lr_schedule = learning_rate if callable(learning_rate) else lambda _: learning_rate
 
@@ -445,6 +475,7 @@ def row_oblique_steepest_descent(
             param,
             learning_rate=lr,
             target_rms=target_rms,
+            direction_target_rms=direction_target_rms,
             eps=eps,
         )
 
@@ -466,10 +497,15 @@ def row_oblique_steepest_descent(
 def column_oblique_steepest_descent(
     learning_rate,
     target_rms: float = 1.0,
+    direction_target_rms: float = 1.0,
     eps: float = 1e-8,
 ) -> optax.GradientTransformation:
     if target_rms <= 0.0:
         raise ValueError(f"Expected `target_rms` to be positive, got {target_rms}.")
+    if direction_target_rms <= 0.0:
+        raise ValueError(
+            f"Expected `direction_target_rms` to be positive, got {direction_target_rms}."
+        )
 
     lr_schedule = learning_rate if callable(learning_rate) else lambda _: learning_rate
 
@@ -484,6 +520,7 @@ def column_oblique_steepest_descent(
             param,
             learning_rate=lr,
             target_rms=target_rms,
+            direction_target_rms=direction_target_rms,
             eps=eps,
         )
 
