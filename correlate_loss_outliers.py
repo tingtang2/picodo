@@ -63,7 +63,7 @@ def _match_activation_outliers(section: dict, example_index: int, position: int)
     for name, stats in section.items():
         if not isinstance(stats, dict):
             continue
-        indices = stats.get("representative_top_indices", [])
+        indices = stats.get("top_indices", stats.get("representative_top_indices", []))
         hit_dims = []
         for idx in indices:
             if len(idx) >= 3 and int(idx[0]) == int(example_index) and int(idx[1]) == int(position):
@@ -84,7 +84,7 @@ def _match_attention_outliers(section: dict, example_index: int, position: int):
     for name, stats in section.items():
         if not isinstance(stats, dict):
             continue
-        indices = stats.get("representative_top_indices", [])
+        indices = stats.get("top_indices", stats.get("representative_top_indices", []))
         hit_heads = []
         for idx in indices:
             if len(idx) >= 3 and int(idx[0]) == int(example_index) and int(idx[2]) == int(position):

@@ -105,6 +105,36 @@ def _cfg_get(c: DictConfig, path: str, default):
     return node
 
 
+def _normalize_int_list(values):
+    if values is None:
+        return None
+    return [int(v) for v in values]
+
+
+def _resolve_eval_batch_indices(
+    dataset_len: int,
+    split: str,
+    step_to_load: int,
+    explicit_batch_indices,
+    only_matching_train_batch: bool,
+):
+    if explicit_batch_indices is not None:
+        selected = [idx for idx in explicit_batch_indices if 0 <= int(idx) < dataset_len]
+        if not selected:
+            raise ValueError("analysis.batch_indices was provided, but none of the indices were in range.")
+        return selected
+
+    if only_matching_train_batch and split == 'train':
+        if 0 <= int(step_to_load) < dataset_len:
+            return [int(step_to_load)]
+        raise ValueError(
+            f"analysis.only_matching_train_batch=true but checkpoint step {step_to_load} "
+            f"is out of range for train dataset len={dataset_len}."
+        )
+
+    return list(range(dataset_len))
+
+
 def _decode_token(tokenizer, token_id: int):
     if tokenizer is None:
         return None
@@ -216,6 +246,8 @@ def main(c: DictConfig):
     context_window = int(_cfg_get(c, 'analysis.context_window', 32))
     top_logits_k = int(_cfg_get(c, 'analysis.top_logits_k', 10))
     tokenizer_name = str(_cfg_get(c, 'analysis.tokenizer_name', 'gpt2'))
+    batch_indices_cfg = _normalize_int_list(_cfg_get(c, 'analysis.batch_indices', None))
+    only_matching_train_batch = bool(_cfg_get(c, 'analysis.only_matching_train_batch', False))
     include_next_train_batch_analysis = bool(_cfg_get(c, 'analysis.include_next_train_batch_analysis', True))
     next_train_top_token_events = int(_cfg_get(c, 'analysis.next_train_top_token_events', top_token_events))
     save_full_logits = bool(_cfg_get(c, 'analysis.save_full_logits', False))
@@ -380,19 +412,26 @@ def main(c: DictConfig):
     else:
         split = 'valid'
         dataset = ds_valid
+    selected_batch_indices = _resolve_eval_batch_indices(
+        dataset_len=len(dataset),
+        split=split,
+        step_to_load=int(step_to_load),
+        explicit_batch_indices=batch_indices_cfg,
+        only_matching_train_batch=only_matching_train_batch,
+    )
 
     data_axis_size = int(mesh.shape['data'])
 
     print(
-        f"Running eval-only analysis on {split} split with {len(dataset)} batches "
-        f"(top_batches={top_batches}, top_token_events={top_token_events})"
+        f"Running eval-only analysis on {split} split with {len(selected_batch_indices)} selected batches "
+        f"out of {len(dataset)} total (top_batches={top_batches}, top_token_events={top_token_events})"
     )
 
     top_batch_heap = []
     top_token_heap = []
 
     t0 = time.time()
-    for batch_idx in range(len(dataset)):
+    for processed_count, batch_idx in enumerate(selected_batch_indices, start=1):
         batch = dataset[batch_idx]
         batch_mean_loss, _, token_losses = batch_loss_stats(model_state, model_graphdef, batch)
 
@@ -405,9 +444,9 @@ def main(c: DictConfig):
         for loss, ex_idx, pos in _top_token_candidates(token_losses_np, top_token_events):
             _push_topk(top_token_heap, (loss, batch_idx, ex_idx, pos), top_token_events)
 
-        if (batch_idx + 1) % 50 == 0 or (batch_idx + 1) == len(dataset):
+        if processed_count % 50 == 0 or processed_count == len(selected_batch_indices):
             elapsed = time.time() - t0
-            print(f"Processed {batch_idx + 1}/{len(dataset)} batches in {elapsed:.1f}s")
+            print(f"Processed {processed_count}/{len(selected_batch_indices)} selected batches in {elapsed:.1f}s")
 
     top_batches_sorted = sorted(top_batch_heap, key=lambda x: x[0], reverse=True)
     top_tokens_sorted = sorted(top_token_heap, key=lambda x: x[0], reverse=True)
@@ -736,7 +775,7 @@ def main(c: DictConfig):
         checkpoint_step=int(step_to_load),
         checkpoint_dir=ckpt_dir,
         split=split,
-        num_batches=int(len(dataset)),
+        num_batches=int(len(selected_batch_indices)),
         analysis=AnalysisSettingsRecord(
             top_batches=int(top_batches),
             top_token_events=int(top_token_events),
@@ -761,6 +800,8 @@ def main(c: DictConfig):
     report_path = save_dir_path / f'loss_trigger_analysis_step_{step_to_load}_{split}.json'
     with report_path.open('w') as f:
         report_payload = asdict(report)
+        report_payload['analysis']['batch_indices'] = [int(x) for x in selected_batch_indices]
+        report_payload['analysis']['only_matching_train_batch'] = bool(only_matching_train_batch)
         report_payload['analysis']['include_next_train_batch_analysis'] = bool(include_next_train_batch_analysis)
         report_payload['analysis']['next_train_top_token_events'] = int(next_train_top_token_events)
         report_payload['analysis']['next_train_step'] = int(next_train_step)

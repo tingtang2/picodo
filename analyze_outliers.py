@@ -578,9 +578,9 @@ def main(c: DictConfig):
                     "batch_loss": batch_loss_values[-1],
                 }
                 if include_activations:
-                    batch_report["activations"] = activation_summary
+                    batch_report["activations"] = layer_activation_summary
                 if include_attention:
-                    batch_report["attention"] = attention_summary
+                    batch_report["attention"] = layer_attention_summary
                 batch_reports.append(batch_report)
 
         report = {

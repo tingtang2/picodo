@@ -122,6 +122,7 @@ analysis:
   split: valid
   layer_indices: null
   batch_indices: null
+  only_matching_train_batch: false
   align_train_batches_to_checkpoints: true
   start_batch: 0
   num_batches: 4
