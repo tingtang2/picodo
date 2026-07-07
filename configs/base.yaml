@@ -30,6 +30,7 @@ model:
   activ_dtype: 'bfloat16'
   use_flash_attn: true
   use_qk_norm: true
+  rmsnorm_use_scale: false
   elementwise_attn_output_gate: false
   final_hidden_mean_centering: false
   

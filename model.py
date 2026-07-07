@@ -14,6 +14,7 @@ from omegaconf import ListConfig
 class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
         lm_head_dtype = getattr(c, "lm_head_dtype", c.activ_dtype)
+        rmsnorm_use_scale = bool(getattr(c, "rmsnorm_use_scale", False))
         self.final_hidden_mean_centering = bool(getattr(c, "final_hidden_mean_centering", False))
         self.final_hidden_mean_centering_coeff = float(getattr(c, "alpha", 1.0))
         self.lm_head_oblique_learn_target_rms = bool(getattr(c, "lm_head_oblique_learn_target_rms", False))
@@ -42,7 +43,7 @@ class TransformerDecoder(nnx.Module):
                 jnp.asarray(jnp.log(initial_target_rms), dtype=jnp.float32)
             )
         self.blocks = nnx.List(TransformerBlock(c, rngs, layer_idx=i) for i in range(c.L))
-        self.out_ln = nnx.RMSNorm(c.D, use_scale=False, dtype=lm_head_dtype, rngs=rngs)
+        self.out_ln = nnx.RMSNorm(c.D, use_scale=rmsnorm_use_scale, dtype=lm_head_dtype, rngs=rngs)
         
     def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, S]
 
@@ -119,8 +120,9 @@ def column_normalize_output_embeddings(model: TransformerDecoder, target_rms: fl
 
 class TransformerBlock(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs, layer_idx: int):
-        self.ln1 = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
-        self.ln2 = nnx.RMSNorm(c.D, use_scale=False, dtype=c.activ_dtype, rngs=rngs)
+        rmsnorm_use_scale = bool(getattr(c, "rmsnorm_use_scale", False))
+        self.ln1 = nnx.RMSNorm(c.D, use_scale=rmsnorm_use_scale, dtype=c.activ_dtype, rngs=rngs)
+        self.ln2 = nnx.RMSNorm(c.D, use_scale=rmsnorm_use_scale, dtype=c.activ_dtype, rngs=rngs)
         
         qk_config = c.use_qk_norm
         
@@ -150,6 +152,7 @@ class TransformerBlock(nnx.Module):
 class MultiHeadAttention(nnx.Module):
     """Causal attention layer."""
     def __init__(self, c: DictConfig, rngs: nnx.Rngs, use_qk_norm: bool = None):
+        rmsnorm_use_scale = bool(getattr(c, "rmsnorm_use_scale", False))
         self.qkv_proj = nnx.Einsum('BTd,SNdH->SBTNH', (3, c.N, c.D, c.H), dtype=c.activ_dtype, rngs=rngs)
         self.out_proj = nnx.Einsum('BTnh,nhD->BTD', (c.N, c.H, c.D), dtype=c.activ_dtype, rngs=rngs)
         self.elementwise_attn_output_gate = bool(getattr(c, "elementwise_attn_output_gate", False))
@@ -159,8 +162,8 @@ class MultiHeadAttention(nnx.Module):
         if use_qk_norm is None:
             use_qk_norm = c.use_qk_norm
         
-        self.query_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
-        self.key_norm = nnx.RMSNorm(c.H, use_scale=False, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
+        self.query_norm = nnx.RMSNorm(c.H, use_scale=rmsnorm_use_scale, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
+        self.key_norm = nnx.RMSNorm(c.H, use_scale=rmsnorm_use_scale, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
         if c.use_flash_attn and jax.devices()[0].platform == 'tpu' and (c.H % 128 != 0):
             warnings.warn('cannot use flash attention because `model.H` is not a multiple of 128.')
         c.use_flash_attn &= jax.devices()[0].platform == 'tpu'
