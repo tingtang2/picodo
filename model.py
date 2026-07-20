@@ -1,3 +1,4 @@
+import math
 import warnings
 import jax
 import jax.numpy as jnp
@@ -11,6 +12,26 @@ from rope import apply_rope
 from omegaconf import ListConfig
 
 
+def _symmetric_uniform(bound: float):
+    def init(key, shape, dtype=jnp.float32):
+        return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
+
+    return init
+
+
+def _megatron_init_stds(c: DictConfig) -> tuple[float, float] | None:
+    """Return the input and residual projection stds for Megatron init."""
+    if not bool(getattr(c, "megatron_init", False)):
+        return None
+
+    init_base_std = float(getattr(c, "init_base_std", 0.01))
+    if init_base_std <= 0.0:
+        raise ValueError(f"Expected `model.init_base_std` to be positive, got {init_base_std}.")
+
+    residual_std = init_base_std / math.sqrt(2.0 * c.L)
+    return init_base_std, residual_std
+
+
 class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
         lm_head_dtype = getattr(c, "lm_head_dtype", c.activ_dtype)
@@ -22,8 +43,29 @@ class TransformerDecoder(nnx.Module):
             getattr(c, "lm_head_oblique_initial_target_rms_from_random_init", False)
         )
         self.lm_head_oblique_optimizer_type = str(getattr(c, "lm_head_oblique_optimizer_type", "row_oblique")).lower()
-        self.token_embed_in = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=c.activ_dtype, rngs=rngs)
-        self.token_embed_out = nnx.Embed(num_embeddings=c.V, features=c.D, dtype=lm_head_dtype, rngs=rngs)
+        megatron_stds = _megatron_init_stds(c)
+        input_embedding_init = {} if megatron_stds is None else {
+            "embedding_init": jax.nn.initializers.normal(megatron_stds[0])
+        }
+        # Lingua's Megatron path leaves its untied LM head at PyTorch Linear's
+        # U(-1/sqrt(fan_in), 1/sqrt(fan_in)) initialization.
+        output_embedding_init = {} if megatron_stds is None else {
+            "embedding_init": _symmetric_uniform(c.D ** -0.5)
+        }
+        self.token_embed_in = nnx.Embed(
+            num_embeddings=c.V,
+            features=c.D,
+            dtype=c.activ_dtype,
+            **input_embedding_init,
+            rngs=rngs,
+        )
+        self.token_embed_out = nnx.Embed(
+            num_embeddings=c.V,
+            features=c.D,
+            dtype=lm_head_dtype,
+            **output_embedding_init,
+            rngs=rngs,
+        )
         if self.lm_head_oblique_learn_target_rms:
             if self.lm_head_oblique_initial_target_rms_from_random_init:
                 output_embedding = jnp.asarray(self.token_embed_out.embedding.value, dtype=jnp.float32)
@@ -153,11 +195,36 @@ class MultiHeadAttention(nnx.Module):
     """Causal attention layer."""
     def __init__(self, c: DictConfig, rngs: nnx.Rngs, use_qk_norm: bool = None):
         rmsnorm_use_scale = bool(getattr(c, "rmsnorm_use_scale", False))
-        self.qkv_proj = nnx.Einsum('BTd,SNdH->SBTNH', (3, c.N, c.D, c.H), dtype=c.activ_dtype, rngs=rngs)
-        self.out_proj = nnx.Einsum('BTnh,nhD->BTD', (c.N, c.H, c.D), dtype=c.activ_dtype, rngs=rngs)
+        megatron_stds = _megatron_init_stds(c)
+        qkv_init = {} if megatron_stds is None else {
+            "kernel_init": jax.nn.initializers.normal(megatron_stds[0])
+        }
+        out_init = {} if megatron_stds is None else {
+            "kernel_init": jax.nn.initializers.normal(megatron_stds[1])
+        }
+        self.qkv_proj = nnx.Einsum(
+            'BTd,SNdH->SBTNH',
+            (3, c.N, c.D, c.H),
+            dtype=c.activ_dtype,
+            **qkv_init,
+            rngs=rngs,
+        )
+        self.out_proj = nnx.Einsum(
+            'BTnh,nhD->BTD',
+            (c.N, c.H, c.D),
+            dtype=c.activ_dtype,
+            **out_init,
+            rngs=rngs,
+        )
         self.elementwise_attn_output_gate = bool(getattr(c, "elementwise_attn_output_gate", False))
         if self.elementwise_attn_output_gate:
-            self.gate_proj = nnx.Einsum('BTd,NdH->BTNH', (c.N, c.D, c.H), dtype=c.activ_dtype, rngs=rngs)
+            self.gate_proj = nnx.Einsum(
+                'BTd,NdH->BTNH',
+                (c.N, c.D, c.H),
+                dtype=c.activ_dtype,
+                **qkv_init,
+                rngs=rngs,
+            )
         
         if use_qk_norm is None:
             use_qk_norm = c.use_qk_norm
@@ -270,8 +337,29 @@ def tpu_causal_flash_attention(q, k, v):
 class MLP(nnx.Module):
     """Multilayer perceptron."""
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
-        self.up_proj = nnx.Linear(in_features=c.D, out_features=c.F, use_bias=False, dtype=c.activ_dtype, rngs=rngs)
-        self.down_proj = nnx.Linear(in_features=c.F, out_features=c.D, use_bias=False, dtype=c.activ_dtype, rngs=rngs)
+        megatron_stds = _megatron_init_stds(c)
+        up_init = {} if megatron_stds is None else {
+            "kernel_init": jax.nn.initializers.normal(megatron_stds[0])
+        }
+        down_init = {} if megatron_stds is None else {
+            "kernel_init": jax.nn.initializers.normal(megatron_stds[1])
+        }
+        self.up_proj = nnx.Linear(
+            in_features=c.D,
+            out_features=c.F,
+            use_bias=False,
+            dtype=c.activ_dtype,
+            **up_init,
+            rngs=rngs,
+        )
+        self.down_proj = nnx.Linear(
+            in_features=c.F,
+            out_features=c.D,
+            use_bias=False,
+            dtype=c.activ_dtype,
+            **down_init,
+            rngs=rngs,
+        )
         
     def __call__(self, x): # [B, T, D]
         h = jax.nn.gelu(self.up_proj(x)) # [B, T, F]

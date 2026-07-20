@@ -33,6 +33,10 @@ model:
   rmsnorm_use_scale: false
   elementwise_attn_output_gate: false
   final_hidden_mean_centering: false
+  # Match Lingua's Megatron path: N(0, 0.01) input projections and
+  # N(0, 0.01 / sqrt(2 * L)) residual output projections.
+  megatron_init: false
+  init_base_std: 0.01
   
 opt:
   batch_size: 8

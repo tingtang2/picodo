@@ -42,6 +42,10 @@ model:
   final_hidden_mean_centering: false
   alpha: 1.0
   # use_qk_norm: [0, 1, 2, 3, 4, 9, 10, 11]
+  # Match Lingua's Megatron path: N(0, 0.01) input projections and
+  # N(0, 0.01 / sqrt(2 * L)) residual output projections.
+  megatron_init: false
+  init_base_std: 0.01
   
 opt:
   batch_size: 256
