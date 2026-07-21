@@ -18,6 +18,7 @@ run_name: null
 num_tp_devices: 1 # optional tensor parallelism
 log_logit_grad_stats: false
 log_logit_grad_scaling_stats: false
+log_parameter_update_metrics: false # exact Frobenius/output effects + approximate spectral ratios on heavy logs
 
 model:
   D: null # model/embed/qkv dim

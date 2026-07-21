@@ -12,6 +12,104 @@ from rope import apply_rope
 from omegaconf import ListConfig
 
 
+_UPDATE_METRIC_EPS = 1e-30
+_SPECTRAL_POWER_ITERATIONS = 5
+
+
+def _frobenius_norm(x):
+    x = jnp.asarray(x, dtype=jnp.float32)
+    return jnp.sqrt(jnp.sum(jnp.square(x)))
+
+
+def _safe_ratio(numerator, denominator):
+    return numerator / jnp.maximum(denominator, jnp.asarray(_UPDATE_METRIC_EPS, dtype=jnp.float32))
+
+
+def _rmsnorm_operator_input(norm: nnx.RMSNorm, x):
+    """Returns the normalized activation to which RMSNorm's scale is applied."""
+    x_f32 = jnp.asarray(x, dtype=jnp.float32)
+    mean_square = jnp.mean(jnp.square(x_f32), axis=norm.reduction_axes, keepdims=True)
+    return x_f32 * jax.lax.rsqrt(mean_square + jnp.asarray(norm.epsilon, dtype=jnp.float32))
+
+
+def _apply_rmsnorm_with_capture(norm, x, captures, path):
+    y = norm(x)
+    if captures is not None and getattr(norm, "scale", None) is not None:
+        captures[path] = {
+            "input": _rmsnorm_operator_input(norm, x),
+            "raw_input": jnp.asarray(x, dtype=jnp.float32),
+            "output": jnp.asarray(y, dtype=jnp.float32),
+        }
+    return y
+
+
+def _spectral_norm_estimate(matrix, iterations: int = _SPECTRAL_POWER_ITERATIONS):
+    """Deterministic two-probe power-iteration estimate of a matrix spectral norm."""
+    matrix = jnp.asarray(matrix, dtype=jnp.float32)
+    probe_index = jnp.arange(matrix.shape[1], dtype=jnp.float32) + 1.0
+    probes = (
+        jnp.sin(probe_index * 0.734375) + jnp.cos(probe_index * 1.234375),
+        jnp.sin(probe_index * 1.6171875) - jnp.cos(probe_index * 0.4453125),
+    )
+
+    def estimate(probe):
+        vector = probe / jnp.maximum(_frobenius_norm(probe), _UPDATE_METRIC_EPS)
+
+        def power_step(_, current):
+            next_vector = matrix.T @ (matrix @ current)
+            return next_vector / jnp.maximum(_frobenius_norm(next_vector), _UPDATE_METRIC_EPS)
+
+        vector = jax.lax.fori_loop(0, iterations, power_step, vector)
+        return _frobenius_norm(matrix @ vector)
+
+    return jnp.maximum(estimate(probes[0]), estimate(probes[1]))
+
+
+def _add_matrix_update_metrics(metrics, path, old_weight, new_weight, operator_input, old_output, delta_output,
+                               old_matrix=None, new_matrix=None):
+    old_weight = jnp.asarray(old_weight, dtype=jnp.float32)
+    new_weight = jnp.asarray(new_weight, dtype=jnp.float32)
+    delta_weight = new_weight - old_weight
+    delta_weight_norm = _frobenius_norm(delta_weight)
+    prefix = f"parameter_update/{path}"
+    metrics[f"{prefix}/delta_param_fro"] = delta_weight_norm
+    metrics[f"{prefix}/delta_param_rel_fro"] = _safe_ratio(delta_weight_norm, _frobenius_norm(old_weight))
+    metrics[f"{prefix}/input_fro"] = _frobenius_norm(operator_input)
+    delta_output_norm = _frobenius_norm(delta_output)
+    metrics[f"{prefix}/delta_output_fro"] = delta_output_norm
+    metrics[f"{prefix}/delta_output_rel_fro"] = _safe_ratio(delta_output_norm, _frobenius_norm(old_output))
+
+    old_matrix = old_weight if old_matrix is None else jnp.asarray(old_matrix, dtype=jnp.float32)
+    new_matrix = new_weight if new_matrix is None else jnp.asarray(new_matrix, dtype=jnp.float32)
+    delta_matrix = new_matrix - old_matrix
+    metrics[f"{prefix}/delta_param_rel_spectral_estimate"] = _safe_ratio(
+        _spectral_norm_estimate(delta_matrix),
+        _spectral_norm_estimate(old_matrix),
+    )
+
+
+def _add_scale_update_metrics(metrics, path, old_scale, new_scale, capture):
+    old_scale = jnp.asarray(old_scale, dtype=jnp.float32)
+    new_scale = jnp.asarray(new_scale, dtype=jnp.float32)
+    delta_scale = new_scale - old_scale
+    operator_input = jnp.asarray(capture["input"], dtype=jnp.float32)
+    delta_output = operator_input * delta_scale
+    prefix = f"parameter_update/{path}"
+    delta_scale_norm = _frobenius_norm(delta_scale)
+    metrics[f"{prefix}/delta_param_fro"] = delta_scale_norm
+    metrics[f"{prefix}/delta_param_rel_fro"] = _safe_ratio(delta_scale_norm, _frobenius_norm(old_scale))
+    metrics[f"{prefix}/input_fro"] = _frobenius_norm(operator_input)
+    metrics[f"{prefix}/raw_input_fro"] = _frobenius_norm(capture["raw_input"])
+    delta_output_norm = _frobenius_norm(delta_output)
+    metrics[f"{prefix}/delta_output_fro"] = delta_output_norm
+    metrics[f"{prefix}/delta_output_rel_fro"] = _safe_ratio(delta_output_norm, _frobenius_norm(capture["output"]))
+    # A learned elementwise scale is a diagonal linear operator.
+    metrics[f"{prefix}/delta_param_rel_spectral"] = _safe_ratio(
+        jnp.max(jnp.abs(delta_scale)),
+        jnp.max(jnp.abs(old_scale)),
+    )
+
+
 def _symmetric_uniform(bound: float):
     def init(key, shape, dtype=jnp.float32):
         return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
@@ -87,31 +185,68 @@ class TransformerDecoder(nnx.Module):
         self.blocks = nnx.List(TransformerBlock(c, rngs, layer_idx=i) for i in range(c.L))
         self.out_ln = nnx.RMSNorm(c.D, use_scale=rmsnorm_use_scale, dtype=lm_head_dtype, rngs=rngs)
         
-    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, S]
-
+    def __call__(
+        self,
+        x,
+        attention_mask: jax.Array | None = None,
+        return_qkv: bool = False,
+        return_update_inputs: bool = False,
+    ): # [B, S]
         qkv_outputs = {}
+        update_inputs = {} if return_update_inputs else None
         # token embedding
         h = self.token_embed_in(x) # [B, T, D]
+        if update_inputs is not None:
+            update_inputs["token_embed_in.embedding"] = {
+                "input": x,
+                "output": jnp.asarray(h, dtype=jnp.float32),
+            }
 
         # transformer blocks
         for i, block in enumerate(self.blocks):
             if return_qkv:
-                h, qkv = block(h, attention_mask=attention_mask, return_qkv=True)
+                h, qkv = block(
+                    h,
+                    attention_mask=attention_mask,
+                    return_qkv=True,
+                    update_inputs=update_inputs,
+                    metric_prefix=f"blocks.{i}",
+                )
                 qkv_outputs[i] = qkv
             else:
-                h = block(h, attention_mask=attention_mask)
+                h = block(
+                    h,
+                    attention_mask=attention_mask,
+                    update_inputs=update_inputs,
+                    metric_prefix=f"blocks.{i}",
+                )
 
         # project back to vocabulary
-        h = self.out_ln(h)
+        h = _apply_rmsnorm_with_capture(self.out_ln, h, update_inputs, "out_ln.scale")
         if self.final_hidden_mean_centering:
             h = h - self.final_hidden_mean_centering_coeff * jnp.mean(h, axis=-1, keepdims=True)
         if self.lm_head_oblique_learn_target_rms:
+            unscaled_h = h
             target_rms = jnp.exp(jnp.asarray(self.lm_head_oblique_target_rms_log.value, dtype=h.dtype))
             h = h * target_rms
+            if update_inputs is not None:
+                update_inputs["lm_head_oblique_target_rms_log"] = {
+                    "input": jnp.asarray(unscaled_h, dtype=jnp.float32),
+                    "output": jnp.asarray(h, dtype=jnp.float32),
+                }
         logits = self.token_embed_out.attend(h) # [B, T, V]
+        if update_inputs is not None:
+            update_inputs["token_embed_out.embedding"] = {
+                "input": jnp.asarray(h, dtype=jnp.float32),
+                "output": jnp.asarray(logits, dtype=jnp.float32),
+            }
 
+        if return_qkv and return_update_inputs:
+            return logits, qkv_outputs, update_inputs
         if return_qkv:
             return logits, qkv_outputs
+        if return_update_inputs:
+            return logits, update_inputs
 
         return logits
 
@@ -176,14 +311,34 @@ class TransformerBlock(nnx.Module):
         self.attn = MultiHeadAttention(c, rngs, use_qk_norm=use_qk_norm)
         self.mlp = MLP(c, rngs)
         
-    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, T, D]
+    def __call__(
+        self,
+        x,
+        attention_mask: jax.Array | None = None,
+        return_qkv: bool = False,
+        update_inputs=None,
+        metric_prefix: str = "",
+    ): # [B, T, D]
+        ln1_out = _apply_rmsnorm_with_capture(self.ln1, x, update_inputs, f"{metric_prefix}.ln1.scale")
         if return_qkv:
-            attn_out, qkv = self.attn(self.ln1(x), attention_mask=attention_mask, return_qkv=True)
+            attn_out, qkv = self.attn(
+                ln1_out,
+                attention_mask=attention_mask,
+                return_qkv=True,
+                update_inputs=update_inputs,
+                metric_prefix=f"{metric_prefix}.attn",
+            )
             x = x + attn_out
         else:
-            x = x + self.attn(self.ln1(x), attention_mask=attention_mask)
+            x = x + self.attn(
+                ln1_out,
+                attention_mask=attention_mask,
+                update_inputs=update_inputs,
+                metric_prefix=f"{metric_prefix}.attn",
+            )
         
-        x = x + self.mlp(self.ln2(x)) # MLP block
+        ln2_out = _apply_rmsnorm_with_capture(self.ln2, x, update_inputs, f"{metric_prefix}.ln2.scale")
+        x = x + self.mlp(ln2_out, update_inputs=update_inputs, metric_prefix=f"{metric_prefix}.mlp")
 
         if return_qkv:
             return x, qkv
@@ -238,18 +393,46 @@ class MultiHeadAttention(nnx.Module):
         self.attention = partial(tpu_causal_flash_attention) if c.use_flash_attn else partial(jax.nn.dot_product_attention, is_causal=False)
         self.use_flash_attn = c.use_flash_attn
 
-    def __call__(self, x, attention_mask: jax.Array | None = None, return_qkv: bool = False): # [B, T, D]
+    def __call__(
+        self,
+        x,
+        attention_mask: jax.Array | None = None,
+        return_qkv: bool = False,
+        update_inputs=None,
+        metric_prefix: str = "",
+    ): # [B, T, D]
         B, T, D = x.shape
 
         # input projection
-        q, k, v = self.qkv_proj(x) # [B, T, N, H]
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv # [B, T, N, H]
+        if update_inputs is not None:
+            update_inputs[f"{metric_prefix}.qkv_proj.kernel"] = {
+                "input": jnp.asarray(x, dtype=jnp.float32),
+                "output": jnp.asarray(qkv, dtype=jnp.float32),
+            }
         gate_score = self.gate_proj(x) if self.elementwise_attn_output_gate else None
+        if update_inputs is not None and gate_score is not None:
+            update_inputs[f"{metric_prefix}.gate_proj.kernel"] = {
+                "input": jnp.asarray(x, dtype=jnp.float32),
+                "output": jnp.asarray(gate_score, dtype=jnp.float32),
+            }
         if return_qkv:
             raw_qkv = (q, k, v)
 
         # qk-norm
-        q = self.query_norm(q)
-        k = self.key_norm(k)
+        if isinstance(self.query_norm, nnx.RMSNorm):
+            q = _apply_rmsnorm_with_capture(
+                self.query_norm, q, update_inputs, f"{metric_prefix}.query_norm.scale"
+            )
+        else:
+            q = self.query_norm(q)
+        if isinstance(self.key_norm, nnx.RMSNorm):
+            k = _apply_rmsnorm_with_capture(
+                self.key_norm, k, update_inputs, f"{metric_prefix}.key_norm.scale"
+            )
+        else:
+            k = self.key_norm(k)
 
         # position embedding
         position = jnp.arange(T)
@@ -285,7 +468,13 @@ class MultiHeadAttention(nnx.Module):
             out = out * jax.nn.sigmoid(gate_score)
 
         # output projection followed by contraction back to original dims
-        out = self.out_proj(out) # [B, T, D]
+        out_proj_input = out
+        out = self.out_proj(out_proj_input) # [B, T, D]
+        if update_inputs is not None:
+            update_inputs[f"{metric_prefix}.out_proj.kernel"] = {
+                "input": jnp.asarray(out_proj_input, dtype=jnp.float32),
+                "output": jnp.asarray(out, dtype=jnp.float32),
+            }
         if return_qkv:
             return out, raw_qkv
         return out
@@ -361,9 +550,201 @@ class MLP(nnx.Module):
             rngs=rngs,
         )
         
-    def __call__(self, x): # [B, T, D]
-        h = jax.nn.gelu(self.up_proj(x)) # [B, T, F]
-        return self.down_proj(h) # [B, T, D]
+    def __call__(self, x, update_inputs=None, metric_prefix: str = ""): # [B, T, D]
+        up_output = self.up_proj(x)
+        if update_inputs is not None:
+            update_inputs[f"{metric_prefix}.up_proj.kernel"] = {
+                "input": jnp.asarray(x, dtype=jnp.float32),
+                "output": jnp.asarray(up_output, dtype=jnp.float32),
+            }
+        h = jax.nn.gelu(up_output) # [B, T, F]
+        output = self.down_proj(h) # [B, T, D]
+        if update_inputs is not None:
+            update_inputs[f"{metric_prefix}.down_proj.kernel"] = {
+                "input": jnp.asarray(h, dtype=jnp.float32),
+                "output": jnp.asarray(output, dtype=jnp.float32),
+            }
+        return output
+
+
+def compute_parameter_update_metrics(old_model: TransformerDecoder, new_model: TransformerDecoder, captures):
+    """Computes per-operator update metrics while holding captured inputs fixed."""
+    metrics = {}
+
+    old_embedding = old_model.token_embed_in.embedding.value
+    new_embedding = new_model.token_embed_in.embedding.value
+    capture = captures["token_embed_in.embedding"]
+    delta_embedding = jnp.asarray(new_embedding, dtype=jnp.float32) - jnp.asarray(old_embedding, dtype=jnp.float32)
+    token_ids = capture["input"]
+    # Each lookup input is conceptually one-hot, so its Frobenius norm is sqrt(number of tokens).
+    _add_matrix_update_metrics(
+        metrics,
+        "token_embed_in.embedding",
+        old_embedding,
+        new_embedding,
+        jnp.ones(token_ids.shape, dtype=jnp.float32),
+        capture["output"],
+        jnp.take(delta_embedding, token_ids, axis=0),
+    )
+
+    for i, (old_block, new_block) in enumerate(zip(old_model.blocks, new_model.blocks)):
+        block_prefix = f"blocks.{i}"
+
+        for norm_name in ("ln1", "ln2"):
+            old_norm = getattr(old_block, norm_name)
+            new_norm = getattr(new_block, norm_name)
+            if getattr(old_norm, "scale", None) is not None:
+                path = f"{block_prefix}.{norm_name}.scale"
+                _add_scale_update_metrics(
+                    metrics, path, old_norm.scale.value, new_norm.scale.value, captures[path]
+                )
+
+        old_attn = old_block.attn
+        new_attn = new_block.attn
+        attn_prefix = f"{block_prefix}.attn"
+
+        path = f"{attn_prefix}.qkv_proj.kernel"
+        capture = captures[path]
+        old_weight = old_attn.qkv_proj.kernel.value
+        new_weight = new_attn.qkv_proj.kernel.value
+        delta_weight = jnp.asarray(new_weight, dtype=jnp.float32) - jnp.asarray(old_weight, dtype=jnp.float32)
+        old_matrix = jnp.transpose(jnp.asarray(old_weight, dtype=jnp.float32), (2, 0, 1, 3)).reshape(
+            old_weight.shape[2], -1
+        )
+        new_matrix = jnp.transpose(jnp.asarray(new_weight, dtype=jnp.float32), (2, 0, 1, 3)).reshape(
+            new_weight.shape[2], -1
+        )
+        _add_matrix_update_metrics(
+            metrics,
+            path,
+            old_weight,
+            new_weight,
+            capture["input"],
+            capture["output"],
+            jnp.einsum("BTd,SNdH->SBTNH", capture["input"], delta_weight),
+            old_matrix,
+            new_matrix,
+        )
+
+        if old_attn.elementwise_attn_output_gate:
+            path = f"{attn_prefix}.gate_proj.kernel"
+            capture = captures[path]
+            old_weight = old_attn.gate_proj.kernel.value
+            new_weight = new_attn.gate_proj.kernel.value
+            delta_weight = jnp.asarray(new_weight, dtype=jnp.float32) - jnp.asarray(old_weight, dtype=jnp.float32)
+            old_matrix = jnp.transpose(jnp.asarray(old_weight, dtype=jnp.float32), (1, 0, 2)).reshape(
+                old_weight.shape[1], -1
+            )
+            new_matrix = jnp.transpose(jnp.asarray(new_weight, dtype=jnp.float32), (1, 0, 2)).reshape(
+                new_weight.shape[1], -1
+            )
+            _add_matrix_update_metrics(
+                metrics,
+                path,
+                old_weight,
+                new_weight,
+                capture["input"],
+                capture["output"],
+                jnp.einsum("BTd,NdH->BTNH", capture["input"], delta_weight),
+                old_matrix,
+                new_matrix,
+            )
+
+        for norm_name in ("query_norm", "key_norm"):
+            old_norm = getattr(old_attn, norm_name)
+            new_norm = getattr(new_attn, norm_name)
+            if isinstance(old_norm, nnx.RMSNorm) and getattr(old_norm, "scale", None) is not None:
+                path = f"{attn_prefix}.{norm_name}.scale"
+                _add_scale_update_metrics(
+                    metrics, path, old_norm.scale.value, new_norm.scale.value, captures[path]
+                )
+
+        path = f"{attn_prefix}.out_proj.kernel"
+        capture = captures[path]
+        old_weight = old_attn.out_proj.kernel.value
+        new_weight = new_attn.out_proj.kernel.value
+        delta_weight = jnp.asarray(new_weight, dtype=jnp.float32) - jnp.asarray(old_weight, dtype=jnp.float32)
+        _add_matrix_update_metrics(
+            metrics,
+            path,
+            old_weight,
+            new_weight,
+            capture["input"],
+            capture["output"],
+            jnp.einsum("BTnh,nhD->BTD", capture["input"], delta_weight),
+            jnp.asarray(old_weight, dtype=jnp.float32).reshape(-1, old_weight.shape[-1]),
+            jnp.asarray(new_weight, dtype=jnp.float32).reshape(-1, new_weight.shape[-1]),
+        )
+
+        for projection_name in ("up_proj", "down_proj"):
+            old_projection = getattr(old_block.mlp, projection_name)
+            new_projection = getattr(new_block.mlp, projection_name)
+            path = f"{block_prefix}.mlp.{projection_name}.kernel"
+            capture = captures[path]
+            old_weight = old_projection.kernel.value
+            new_weight = new_projection.kernel.value
+            delta_weight = jnp.asarray(new_weight, dtype=jnp.float32) - jnp.asarray(old_weight, dtype=jnp.float32)
+            _add_matrix_update_metrics(
+                metrics,
+                path,
+                old_weight,
+                new_weight,
+                capture["input"],
+                capture["output"],
+                jnp.asarray(capture["input"], dtype=jnp.float32) @ delta_weight,
+            )
+
+    if getattr(old_model.out_ln, "scale", None) is not None:
+        path = "out_ln.scale"
+        _add_scale_update_metrics(
+            metrics,
+            path,
+            old_model.out_ln.scale.value,
+            new_model.out_ln.scale.value,
+            captures[path],
+        )
+
+    if old_model.lm_head_oblique_learn_target_rms:
+        path = "lm_head_oblique_target_rms_log"
+        capture = captures[path]
+        old_log_scale = jnp.asarray(old_model.lm_head_oblique_target_rms_log.value, dtype=jnp.float32)
+        new_log_scale = jnp.asarray(new_model.lm_head_oblique_target_rms_log.value, dtype=jnp.float32)
+        old_scale = jnp.exp(old_log_scale)
+        new_scale = jnp.exp(new_log_scale)
+        delta_param = new_log_scale - old_log_scale
+        delta_output = jnp.asarray(capture["input"], dtype=jnp.float32) * (new_scale - old_scale)
+        prefix = f"parameter_update/{path}"
+        metrics[f"{prefix}/delta_param_fro"] = _frobenius_norm(delta_param)
+        metrics[f"{prefix}/delta_param_rel_fro"] = _safe_ratio(
+            _frobenius_norm(delta_param), _frobenius_norm(old_log_scale)
+        )
+        metrics[f"{prefix}/input_fro"] = _frobenius_norm(capture["input"])
+        metrics[f"{prefix}/delta_output_fro"] = _frobenius_norm(delta_output)
+        metrics[f"{prefix}/delta_output_rel_fro"] = _safe_ratio(
+            _frobenius_norm(delta_output), _frobenius_norm(capture["output"])
+        )
+        metrics[f"{prefix}/delta_param_rel_spectral"] = _safe_ratio(
+            jnp.abs(new_scale - old_scale), jnp.abs(old_scale)
+        )
+
+    path = "token_embed_out.embedding"
+    capture = captures[path]
+    old_embedding = old_model.token_embed_out.embedding.value
+    new_embedding = new_model.token_embed_out.embedding.value
+    delta_embedding = jnp.asarray(new_embedding, dtype=jnp.float32) - jnp.asarray(old_embedding, dtype=jnp.float32)
+    _add_matrix_update_metrics(
+        metrics,
+        path,
+        old_embedding,
+        new_embedding,
+        capture["input"],
+        capture["output"],
+        jnp.asarray(capture["input"], dtype=jnp.float32) @ delta_embedding.T,
+        jnp.asarray(old_embedding, dtype=jnp.float32).T,
+        jnp.asarray(new_embedding, dtype=jnp.float32).T,
+    )
+
+    return jax.tree.map(jax.lax.stop_gradient, metrics)
 
 
 def create_sharded_model(c: DictConfig, key):

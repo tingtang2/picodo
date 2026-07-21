@@ -699,7 +699,7 @@ def main(c: DictConfig):
             snapshot_state = jax.tree_util.tree_map(np.asarray, jax.device_get(opt_state))
             last_opt_states.append(snapshot_state)
 
-        opt_state, objective_loss, (train_raw_loss, _), _grads = _run_current_train_step(
+        opt_state, objective_loss, (train_raw_loss, _), _grads, _update_metrics = _run_current_train_step(
             c,
             opt_state,
             opt_graphdef,
