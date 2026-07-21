@@ -413,17 +413,12 @@ def _prepare_parameter_update_metrics(model_state, model_graphdef, batch, collec
     # Clone the variable containers so the in-place NNX optimizer update does not
     # overwrite the pre-update values referenced by the diagnostics graph.
     old_model = nnx.clone(nnx.merge(model_graphdef, model_state))
-    logits, captures = old_model(batch, return_update_inputs=True)
-    logits = logits[:, :-1].astype(jnp.float32)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    probs = jnp.exp(log_probs)
-    logit_metrics = {
-        'train_output_logit_mean': jnp.mean(logits),
-        'train_output_logit_norm': utils.get_l2_norm(logits),
-        'train_output_logit_std': jnp.std(logits),
-        'train_output_logit_entropy': -jnp.mean(jnp.sum(probs * log_probs, axis=-1)),
-    }
-    return old_model, captures, logit_metrics
+    _, captures = old_model(
+        batch,
+        return_update_inputs=True,
+        skip_output_logits=True,
+    )
+    return old_model, captures, {}
 
 
 def _finish_parameter_update_metrics(metric_context, new_model):
@@ -432,6 +427,25 @@ def _finish_parameter_update_metrics(metric_context, new_model):
     old_model, captures, metrics = metric_context
     metrics.update(model_lib.compute_parameter_update_metrics(old_model, new_model, captures))
     return metrics
+
+
+@jax.jit
+def _copy_model_state_for_metrics(model_state):
+    """Makes non-aliased parameter buffers that survive donation of the optimizer state."""
+    return jax.tree.map(lambda x: jnp.array(x, copy=True), model_state)
+
+
+@partial(jax.jit, static_argnames=('model_graphdef',))
+def get_parameter_update_metrics(old_model_state, new_model_state, model_graphdef, batch):
+    """Runs update diagnostics separately from the loss/backward executable."""
+    old_model = nnx.merge(model_graphdef, old_model_state)
+    new_model = nnx.merge(model_graphdef, new_model_state)
+    _, captures = old_model(
+        batch,
+        return_update_inputs=True,
+        skip_output_logits=True,
+    )
+    return model_lib.compute_parameter_update_metrics(old_model, new_model, captures)
 
 
 @partial(
@@ -1807,14 +1821,18 @@ def train_and_evaluate(c: DictConfig):
         will_log_heavy_metrics = log_metrics_per_step_full or (
             (train_loss_num + 1) * tokens_per_opt_step >= c.log_every_tokens
         )
-        collect_step_parameter_update_metrics = log_parameter_update_metrics and will_log_heavy_metrics
+        should_collect_parameter_update_metrics = log_parameter_update_metrics and will_log_heavy_metrics
+        # Keep the training executable on its ordinary, low-memory compilation path.
+        collect_step_parameter_update_metrics = False
+        pre_update_model_state = None
+        parameter_update_batch = batch
         parameter_update_metrics = {}
         need_step_grads = False
         pre_output_logit_mean = None
         pre_output_logit_norm = None
         pre_output_logit_std = None
         pre_output_logit_entropy = None
-        if will_log_heavy_metrics and not collect_step_parameter_update_metrics:
+        if will_log_heavy_metrics:
             (
                 pre_output_logit_mean,
                 pre_output_logit_norm,
@@ -1876,6 +1894,10 @@ def train_and_evaluate(c: DictConfig):
                     f"cutoff={z_hard_cutoff:.6f}"
                 )
                 loss_rewrite_cutoff_logged = True
+        # Copy only the parameters, immediately before the donated training step.
+        if should_collect_parameter_update_metrics:
+            pre_update_model_state = _copy_model_state_for_metrics(opt_state.model)
+
         # training step
         if loss_skip_enabled:
             if c.opt.use_z_loss:
@@ -2037,6 +2059,7 @@ def train_and_evaluate(c: DictConfig):
             replacement_token = jnp.asarray(loss_rewrite_replacement_token_id, dtype=batch.dtype)
             rewritten_inputs = jnp.where(rewrite_hard_mask, replacement_token, batch[:, :-1])
             rewritten_batch = batch.at[:, :-1].set(rewritten_inputs)
+            parameter_update_batch = rewritten_batch
 
             if c.opt.use_z_loss:
                 if mucentering:
@@ -2138,6 +2161,13 @@ def train_and_evaluate(c: DictConfig):
                         need_step_grads,
                         collect_step_parameter_update_metrics,
                     )
+        if should_collect_parameter_update_metrics:
+            parameter_update_metrics = get_parameter_update_metrics(
+                pre_update_model_state,
+                opt_state.model,
+                model_graphdef,
+                parameter_update_batch,
+            )
         if loss_skip_enabled:
             raw_np = _to_host_numpy(train_raw_loss, dtype=np.float32, flatten=True)
             stats_np = np.log1p(np.maximum(raw_np, 0.0)) if loss_skip_use_log_loss else raw_np
