@@ -179,7 +179,7 @@ def main(c: DictConfig):
     # We don't need the real optimizer, just the structure
     num_opt_steps = len(ds_train)
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
-    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
+    lr_schedule = utils.build_learning_rate_schedule(c.opt, c.opt.peak_lr, warmup_steps, num_opt_steps)
     wd_mask = utils.build_weight_decay_mask(model, c.opt.exclude_input_embedding_weight_decay)
     tx = optax.inject_hyperparams(optax.adamw)(
         lr_schedule,

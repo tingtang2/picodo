@@ -131,7 +131,7 @@ def main(c: DictConfig):
     num_opt_steps = len(ds_train)
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
-    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
+    lr_schedule = utils.build_learning_rate_schedule(c.opt, c.opt.peak_lr, warmup_steps, num_opt_steps)
     wd_mask = utils.build_weight_decay_mask(base_model, c.opt.exclude_input_embedding_weight_decay)
     tx = optax.inject_hyperparams(optax.adamw)(
         lr_schedule,
@@ -186,7 +186,9 @@ def main(c: DictConfig):
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
     # We define the global schedule but wrap it to shift the input 'count' by 'step_to_load'
-    global_lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
+    global_lr_schedule = utils.build_learning_rate_schedule(
+        c.opt, c.opt.peak_lr, warmup_steps, num_opt_steps
+    )
     
     def shifted_lr_schedule(count):
         # The optimizer starts counting at 0, so we add the checkpoint step to get the absolute step

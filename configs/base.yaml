@@ -44,6 +44,9 @@ opt:
   batch_size: 8
   peak_lr: 0.002
   warmup_frac: 0.05
+  lr_schedule:
+    exponent: 1.0 # exponent applied to the cosine decay curve
+    end_value: 0.0 # absolute learning rate at the end of training
   b1: 0.9
   b2: 0.999
   b2_cosine_anneal:

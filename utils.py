@@ -129,6 +129,29 @@ def get_lm_head_peak_lr(opt_cfg) -> float:
     return float(getattr(lm_head_optimizer_cfg, "peak_lr", opt_cfg.peak_lr))
 
 
+def build_learning_rate_schedule(opt_cfg, peak_value, warmup_steps, decay_steps):
+    """Builds the configured warmup + cosine learning-rate schedule.
+
+    getattr defaults retain compatibility with configs saved before the
+    ``opt.lr_schedule`` block was introduced.
+    """
+    schedule_cfg = getattr(opt_cfg, "lr_schedule", None)
+    exponent = float(getattr(schedule_cfg, "exponent", 1.0))
+    end_value = float(getattr(schedule_cfg, "end_value", 0.0))
+    if exponent <= 0.0:
+        raise ValueError(f"Expected opt.lr_schedule.exponent to be positive, got {exponent}.")
+    if end_value < 0.0:
+        raise ValueError(f"Expected opt.lr_schedule.end_value to be non-negative, got {end_value}.")
+    return optax.schedules.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=peak_value,
+        warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
+        end_value=end_value,
+        exponent=exponent,
+    )
+
+
 def lm_head_uses_learned_target_rms(opt_cfg) -> bool:
     lm_head_optimizer_cfg = getattr(opt_cfg, "lm_head_optimizer", None)
     return bool(getattr(lm_head_optimizer_cfg, "learn_target_rms", False))

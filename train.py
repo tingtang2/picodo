@@ -1474,16 +1474,13 @@ def train_and_evaluate(c: DictConfig):
     num_opt_steps = len(ds_train)
     warmup_steps = int(c.opt.warmup_frac * num_opt_steps)
     tokens_per_opt_step = c.opt.batch_size * c.model.T
-    lr_schedule = optax.schedules.warmup_cosine_decay_schedule(0, c.opt.peak_lr, warmup_steps, num_opt_steps)
+    lr_schedule = utils.build_learning_rate_schedule(c.opt, c.opt.peak_lr, warmup_steps, num_opt_steps)
     lm_head_peak_lr = utils.get_lm_head_peak_lr(c.opt)
     lm_head_tx_lr_schedule = lr_schedule
     lm_head_metric_lr_schedule = None
     if not math.isclose(lm_head_peak_lr, float(c.opt.peak_lr)):
-        lm_head_tx_lr_schedule = optax.schedules.warmup_cosine_decay_schedule(
-            0,
-            lm_head_peak_lr,
-            warmup_steps,
-            num_opt_steps,
+        lm_head_tx_lr_schedule = utils.build_learning_rate_schedule(
+            c.opt, lm_head_peak_lr, warmup_steps, num_opt_steps
         )
         lm_head_metric_lr_schedule = lm_head_tx_lr_schedule
         if jax.process_index() == 0:
