@@ -217,6 +217,7 @@ class TransformerDecoder(nnx.Module):
         return_qkv: bool = False,
         return_update_inputs: bool = False,
         skip_output_logits: bool = False,
+        return_final_norm_input: bool = False,
     ): # [B, S]
         qkv_outputs = {}
         update_inputs = {} if return_update_inputs else None
@@ -246,6 +247,14 @@ class TransformerDecoder(nnx.Module):
                     update_inputs=update_inputs,
                     metric_prefix=f"blocks.{i}",
                 )
+
+        if return_final_norm_input:
+            if return_qkv or return_update_inputs or skip_output_logits:
+                raise ValueError(
+                    "return_final_norm_input cannot be combined with return_qkv, "
+                    "return_update_inputs, or skip_output_logits."
+                )
+            return h
 
         # project back to vocabulary
         h = _apply_rmsnorm_with_capture(self.out_ln, h, update_inputs, "out_ln.scale")

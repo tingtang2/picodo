@@ -448,6 +448,156 @@ def get_parameter_update_metrics(old_model_state, new_model_state, model_graphde
     return model_lib.compute_parameter_update_metrics(old_model, new_model, captures)
 
 
+# Large enough to keep the LM-head GEMMs efficient, while capping the temporary
+# float32 logits buffer at roughly 400 MiB for a 50k-token vocabulary.
+_FINAL_NORM_GRAD_TOKEN_CHUNK_SIZE = 2048
+
+
+@partial(
+    jax.jit,
+    static_argnames=('model_graphdef', 'use_z_loss', 'objective_mode'),
+)
+def get_final_norm_activation_grad_metrics(
+    model_state,
+    model_graphdef,
+    batch,
+    use_z_loss: bool = False,
+    objective_mode: str = 'standard',
+    skip_center=0.0,
+    skip_mad=1.0,
+    skip_z_soft=5.0,
+    skip_z_hard=8.0,
+    skip_abs_hard=float('inf'),
+    skip_soft_weight=1.0,
+    skip_eps=1e-6,
+    skip_apply_gate=False,
+    skip_use_log_loss=False,
+    loss_cap=30.0,
+    loss_cap_apply=False,
+):
+    """Measures loss gradients on both sides of the final RMSNorm.
+
+    The transformer backbone is only run forward. The vocabulary projection and
+    loss are evaluated in token chunks so this diagnostic never materializes a
+    [batch, sequence, vocabulary] logits tensor.
+    """
+    if objective_mode not in ('standard', 'skip', 'soft_cap'):
+        raise ValueError(f"Unsupported final-norm gradient objective: {objective_mode}")
+
+    model = nnx.merge(model_graphdef, model_state)
+    norm_input = model(batch, return_final_norm_input=True)
+    norm_output, norm_pullback = jax.vjp(model.out_ln, norm_input)
+
+    def tail_loss_and_stats(final_norm_output):
+        h = final_norm_output
+        if model.final_hidden_mean_centering:
+            h = h - model.final_hidden_mean_centering_coeff * jnp.mean(h, axis=-1, keepdims=True)
+        if model.lm_head_oblique_learn_target_rms:
+            target_rms = jnp.exp(jnp.asarray(model.lm_head_oblique_target_rms_log.value, dtype=h.dtype))
+            h = h * target_rms
+
+        # The last token in each sequence has no next-token target.
+        flat_h = h[:, :-1, :].reshape(-1, h.shape[-1])
+        flat_targets = batch[:, 1:].reshape(-1)
+        num_tokens = flat_h.shape[0]
+        chunk_size = _FINAL_NORM_GRAD_TOKEN_CHUNK_SIZE
+        padding = (-num_tokens) % chunk_size
+        flat_h = jnp.pad(flat_h, ((0, padding), (0, 0)))
+        flat_targets = jnp.pad(flat_targets, ((0, padding),))
+        valid = jnp.arange(flat_h.shape[0]) < num_tokens
+        hidden_chunks = flat_h.reshape(-1, chunk_size, flat_h.shape[-1])
+        target_chunks = flat_targets.reshape(-1, chunk_size)
+        valid_chunks = valid.reshape(-1, chunk_size)
+
+        def chunk_statistics(chunk):
+            hidden, targets, valid_mask = chunk
+            logits = model.token_embed_out.attend(hidden).astype(jnp.float32)
+            log_probs = jax.nn.log_softmax(logits, axis=-1)
+            losses = -jnp.take_along_axis(log_probs, targets[:, None], axis=-1).squeeze(-1)
+            mask = valid_mask.astype(jnp.float32)
+
+            if objective_mode == 'skip':
+                weights = _build_loss_skip_weights(
+                    losses,
+                    skip_center,
+                    skip_mad,
+                    skip_z_soft,
+                    skip_z_hard,
+                    skip_abs_hard,
+                    skip_soft_weight,
+                    skip_eps,
+                    skip_apply_gate,
+                    skip_use_log_loss,
+                ) * mask
+                ce_numerator = jnp.sum(losses * weights)
+                ce_denominator = jnp.sum(weights)
+            elif objective_mode == 'soft_cap':
+                capped_losses = _apply_tanh_soft_cap(losses, loss_cap)
+                apply_cap = jnp.asarray(loss_cap_apply, dtype=losses.dtype)
+                objective_losses = apply_cap * capped_losses + (1.0 - apply_cap) * losses
+                ce_numerator = jnp.sum(objective_losses * mask)
+                ce_denominator = jnp.sum(mask)
+            else:
+                ce_numerator = jnp.sum(losses * mask)
+                ce_denominator = jnp.sum(mask)
+
+            log_z = jax.nn.logsumexp(logits, axis=-1)
+            probabilities = jnp.exp(log_probs)
+            entropy = -jnp.sum(probabilities * log_probs, axis=-1)
+            logit_mask = mask[:, None]
+            return (
+                ce_numerator,
+                ce_denominator,
+                jnp.sum(jnp.square(log_z) * mask),
+                jnp.sum(logits * logit_mask),
+                jnp.sum(jnp.square(logits) * logit_mask),
+                jnp.sum(entropy * mask),
+                jnp.sum(mask),
+            )
+
+        chunk_totals = jax.lax.map(
+            # Rematerialize one chunk during the reverse pass instead of saving
+            # every chunk's logits/softmax residuals for the whole sequence.
+            jax.checkpoint(chunk_statistics),
+            (hidden_chunks, target_chunks, valid_chunks),
+        )
+        totals = tuple(jnp.sum(value, axis=0) for value in chunk_totals)
+        ce_numerator, ce_denominator, z_squared_sum, logit_sum, logit_squared_sum, entropy_sum, token_count = totals
+        loss = ce_numerator / jnp.maximum(ce_denominator, 1.0)
+        if use_z_loss:
+            loss = loss + 1e-4 * z_squared_sum / jnp.maximum(token_count, 1.0)
+
+        logit_count = token_count * model.token_embed_out.num_embeddings
+        logit_mean = logit_sum / jnp.maximum(logit_count, 1.0)
+        logit_mean_square = logit_squared_sum / jnp.maximum(logit_count, 1.0)
+        logit_std = jnp.sqrt(jnp.maximum(logit_mean_square - jnp.square(logit_mean), 0.0))
+        stats = (
+            logit_mean,
+            jnp.sqrt(jnp.maximum(logit_squared_sum, 0.0)),
+            logit_std,
+            entropy_sum / jnp.maximum(token_count, 1.0),
+        )
+        return loss, stats
+
+    (_, output_stats), grad_output = jax.value_and_grad(tail_loss_and_stats, has_aux=True)(norm_output)
+    grad_input = norm_pullback(grad_output)[0]
+
+    grad_input_f32 = jnp.asarray(grad_input, dtype=jnp.float32)
+    grad_output_f32 = jnp.asarray(grad_output, dtype=jnp.float32)
+    grad_input_fro = jnp.sqrt(jnp.sum(jnp.square(grad_input_f32)))
+    grad_output_fro = jnp.sqrt(jnp.sum(jnp.square(grad_output_f32)))
+    metrics = {
+        'activation_grad/out_ln/input_fro': grad_input_fro,
+        'activation_grad/out_ln/output_fro': grad_output_fro,
+        'activation_grad/out_ln/input_rms': jnp.sqrt(jnp.mean(jnp.square(grad_input_f32))),
+        'activation_grad/out_ln/output_rms': jnp.sqrt(jnp.mean(jnp.square(grad_output_f32))),
+        'activation_grad/out_ln/input_to_output_fro_ratio': (
+            grad_input_fro / jnp.maximum(grad_output_fro, 1e-30)
+        ),
+    }
+    return output_stats, metrics
+
+
 @partial(
     jax.jit,
     static_argnames=(
@@ -1752,8 +1902,13 @@ def train_and_evaluate(c: DictConfig):
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
     log_parameter_update_metrics = bool(getattr(c, "log_parameter_update_metrics", False))
+    log_final_norm_activation_grad_metrics = bool(
+        getattr(c, "log_final_norm_activation_grad_metrics", False)
+    )
     if log_parameter_update_metrics and jax.process_index() == 0:
         print("parameter update metrics enabled on heavy logging steps")
+    if log_final_norm_activation_grad_metrics and jax.process_index() == 0:
+        print("final norm activation gradient metrics enabled on heavy logging steps")
     collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
     loss_skip_cfg = getattr(c.opt, "loss_skip", None)
     loss_skip_enabled = bool(getattr(loss_skip_cfg, "enabled", False))
@@ -1822,17 +1977,22 @@ def train_and_evaluate(c: DictConfig):
             (train_loss_num + 1) * tokens_per_opt_step >= c.log_every_tokens
         )
         should_collect_parameter_update_metrics = log_parameter_update_metrics and will_log_heavy_metrics
+        should_collect_final_norm_activation_grads = (
+            log_final_norm_activation_grad_metrics and will_log_heavy_metrics
+        )
         # Keep the training executable on its ordinary, low-memory compilation path.
         collect_step_parameter_update_metrics = False
         pre_update_model_state = None
         parameter_update_batch = batch
         parameter_update_metrics = {}
-        need_step_grads = False
+        # Parameter gradients already exist inside the optimizer step. Return them
+        # only when a heavy log will consume them.
+        need_step_grads = will_log_heavy_metrics
         pre_output_logit_mean = None
         pre_output_logit_norm = None
         pre_output_logit_std = None
         pre_output_logit_entropy = None
-        if will_log_heavy_metrics:
+        if will_log_heavy_metrics and not should_collect_final_norm_activation_grads:
             (
                 pre_output_logit_mean,
                 pre_output_logit_norm,
@@ -1850,6 +2010,7 @@ def train_and_evaluate(c: DictConfig):
         gate_center = 0.0
         gate_mad = 1.0
         gate_abs_hard = float("inf")
+        cap_apply = False
         rewrite_gate_apply = False
         rewrite_gate_center = 0.0
         rewrite_gate_mad = 1.0
@@ -1895,7 +2056,7 @@ def train_and_evaluate(c: DictConfig):
                 )
                 loss_rewrite_cutoff_logged = True
         # Copy only the parameters, immediately before the donated training step.
-        if should_collect_parameter_update_metrics:
+        if should_collect_parameter_update_metrics or should_collect_final_norm_activation_grads:
             pre_update_model_state = _copy_model_state_for_metrics(opt_state.model)
 
         # training step
@@ -2168,6 +2329,33 @@ def train_and_evaluate(c: DictConfig):
                 model_graphdef,
                 parameter_update_batch,
             )
+        if should_collect_final_norm_activation_grads:
+            objective_mode = 'skip' if loss_skip_enabled else 'soft_cap' if loss_cap_enabled else 'standard'
+            output_stats, activation_grad_metrics = get_final_norm_activation_grad_metrics(
+                pre_update_model_state,
+                model_graphdef,
+                parameter_update_batch,
+                bool(c.opt.use_z_loss),
+                objective_mode,
+                gate_center,
+                gate_mad,
+                loss_skip_z_soft,
+                loss_skip_z_hard,
+                gate_abs_hard,
+                loss_skip_soft_weight,
+                loss_skip_eps,
+                gate_apply,
+                loss_skip_use_log_loss,
+                loss_cap_soft_cap,
+                cap_apply,
+            )
+            (
+                pre_output_logit_mean,
+                pre_output_logit_norm,
+                pre_output_logit_std,
+                pre_output_logit_entropy,
+            ) = output_stats
+            parameter_update_metrics.update(activation_grad_metrics)
         if loss_skip_enabled:
             raw_np = _to_host_numpy(train_raw_loss, dtype=np.float32, flatten=True)
             stats_np = np.log1p(np.maximum(raw_np, 0.0)) if loss_skip_use_log_loss else raw_np
