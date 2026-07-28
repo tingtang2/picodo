@@ -1982,9 +1982,7 @@ def train_and_evaluate(c: DictConfig):
         pre_update_model_state = None
         parameter_update_batch = batch
         parameter_update_metrics = {}
-        # Parameter gradients already exist inside the optimizer step. Return them
-        # only when a heavy log will consume them.
-        need_step_grads = will_log_heavy_metrics
+        need_step_grads = False
         pre_output_logit_mean = None
         pre_output_logit_norm = None
         pre_output_logit_std = None
