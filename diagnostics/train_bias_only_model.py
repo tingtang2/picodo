@@ -141,6 +141,7 @@ def main(c: DictConfig):
         weight_decay=c.opt.weight_decay,
         mask=wd_mask,
     )
+    tx, _ = utils.maybe_partition_out_ln_scale_sgd(base_model, c.opt, tx, lr_schedule)
     
     clip_by_global_norm = c.opt.clip_by_global_norm
     if clip_by_global_norm:

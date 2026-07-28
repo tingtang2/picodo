@@ -101,6 +101,67 @@ def build_lm_head_oblique_target_rms_mask(model: nnx.Module):
     )
 
 
+def build_out_ln_scale_mask(model: nnx.Module):
+    """Returns a parameter mask selecting only the final RMSNorm scale."""
+    _, params = nnx.split(model, nnx.Param)
+    found = False
+
+    def mask_leaf(path, _):
+        nonlocal found
+        key = jax.tree_util.keystr(path, simple=True, separator='/')
+        selected = key == 'out_ln/scale'
+        found |= selected
+        return selected
+
+    mask = jax.tree_util.tree_map_with_path(
+        mask_leaf,
+        params,
+        is_leaf=lambda x: isinstance(x, nnx.Param),
+    )
+    if not found:
+        raise ValueError(
+            "opt.out_ln_scale_sgd.enabled=true requires model.rmsnorm_use_scale=true "
+            "so that out_ln.scale exists."
+        )
+    return mask
+
+
+def maybe_partition_out_ln_scale_sgd(model, opt_cfg, base_optimizer_tx, learning_rate):
+    """Routes out_ln.scale to momentum SGD and all other params to base_optimizer_tx."""
+    sgd_cfg = getattr(opt_cfg, 'out_ln_scale_sgd', None)
+    if not bool(getattr(sgd_cfg, 'enabled', False)):
+        return base_optimizer_tx, None
+
+    momentum = float(getattr(sgd_cfg, 'momentum', 0.9))
+    nesterov = bool(getattr(sgd_cfg, 'nesterov', False))
+    if not 0.0 <= momentum < 1.0:
+        raise ValueError(f"Expected opt.out_ln_scale_sgd.momentum in [0, 1), got {momentum}.")
+
+    out_ln_scale_mask = build_out_ln_scale_mask(model)
+    parameter_labels = jax.tree_util.tree_map(
+        lambda selected: 'out_ln_scale_sgd' if selected else 'base',
+        out_ln_scale_mask,
+    )
+    out_ln_scale_tx = optax.inject_hyperparams(optax.sgd)(
+        learning_rate=learning_rate,
+        momentum=momentum,
+        nesterov=nesterov,
+    )
+    partitioned_tx = optax.partition(
+        {
+            'base': base_optimizer_tx,
+            'out_ln_scale_sgd': out_ln_scale_tx,
+        },
+        parameter_labels,
+    )
+    log_message = (
+        "final RMSNorm scale optimizer enabled: "
+        f"out_ln.scale=sgd(momentum={momentum}, nesterov={nesterov}), "
+        "learning_rate=global_schedule, weight_decay=off"
+    )
+    return partitioned_tx, log_message
+
+
 def normalize_lm_head_centering_mode(raw_value, field_name: str) -> str:
     if isinstance(raw_value, bool):
         if raw_value:

@@ -114,6 +114,7 @@ def main(c: DictConfig):
         weight_decay=c.opt.weight_decay,
         mask=wd_mask,
     )
+    tx, _ = utils.maybe_partition_out_ln_scale_sgd(model, c.opt, tx, lr_schedule)
     if c.opt.clip_by_global_norm:
         tx = optax.chain(optax.clip_by_global_norm(c.opt.clip_by_global_norm), tx)
     optimizer = nnx.ModelAndOptimizer(model, tx)

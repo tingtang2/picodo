@@ -52,6 +52,10 @@ opt:
   b2_cosine_anneal:
     enabled: false
     final_b2: 0.999
+  out_ln_scale_sgd:
+    enabled: false # if true, optimize only out_ln.scale with momentum SGD instead of AdamW
+    momentum: 0.9
+    nesterov: false
   weight_decay: 0.02
   exclude_input_embedding_weight_decay: false
   lm_head_optimizer:
