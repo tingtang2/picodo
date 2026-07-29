@@ -995,6 +995,27 @@ def _find_moment_state(opt_state):
     return visit(opt_state)
 
 
+def _find_moment_states(opt_state):
+    """Returns every Adam moment state, including states inside masked chains."""
+    states = []
+
+    def visit(tree):
+        if isinstance(tree, Mapping):
+            if "mu" in tree and "nu" in tree:
+                states.append(tree)
+                return
+            for value in tree.values():
+                visit(value)
+        elif hasattr(tree, "mu") and hasattr(tree, "nu"):
+            states.append(tree)
+        elif isinstance(tree, (list, tuple)):
+            for value in tree:
+                visit(value)
+
+    visit(opt_state)
+    return states
+
+
 def _get_state_component(state, key):
     if isinstance(state, Mapping):
         return state[key]
@@ -1063,6 +1084,72 @@ def _get_first_nested_state_item(tree, candidate_paths):
         except (AttributeError, KeyError, TypeError):
             continue
     raise KeyError(f"Could not resolve any of the candidate paths: {candidate_paths}")
+
+
+def _get_adam_nu_and_count(opt_state, path, expected_ndim):
+    candidate_paths = (path, ("model", *path))
+    for moment_state in _find_moment_states(opt_state):
+        try:
+            nu = _state_leaf_to_array(
+                _get_first_nested_state_item(
+                    _get_state_component(moment_state, "nu"),
+                    candidate_paths,
+                )
+            )
+            count = _state_leaf_to_array(
+                _get_state_component(moment_state, "count")
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        # Masked optimizer states contain placeholders at excluded paths.
+        if nu.ndim == expected_ndim:
+            return nu, count
+    return None
+
+
+def get_effective_learning_rate_metrics(
+    opt_state,
+    learning_rate,
+    lm_head_learning_rate,
+    beta2,
+    eps,
+):
+    """Effective-LR percentiles from Adam's bias-corrected second moment."""
+    metrics = {}
+    beta2 = jnp.asarray(beta2, dtype=jnp.float32)
+    eps = jnp.asarray(eps, dtype=jnp.float32)
+
+    def bias_correct(nu, count):
+        count = jnp.asarray(count, dtype=jnp.float32)
+        correction = 1.0 - jnp.power(beta2, count)
+        return nu / correction
+
+    out_ln_state = _get_adam_nu_and_count(
+        opt_state, ("out_ln", "scale"), expected_ndim=1
+    )
+    if out_ln_state is not None:
+        nu, count = out_ln_state
+        v_hat = bias_correct(nu, count)
+        eff_lr = jnp.asarray(learning_rate, dtype=jnp.float32) / (
+            jnp.sqrt(jnp.maximum(v_hat, 0.0)) + eps
+        )
+        metrics["eff_lr/out_ln_scale/p01"] = jnp.percentile(eff_lr, 1)
+        metrics["eff_lr/out_ln_scale/p50"] = jnp.percentile(eff_lr, 50)
+
+    lm_head_state = _get_adam_nu_and_count(
+        opt_state, ("token_embed_out", "embedding"), expected_ndim=2
+    )
+    if lm_head_state is not None:
+        nu, count = lm_head_state
+        v_hat = bias_correct(nu, count)
+        v_row = jnp.mean(v_hat, axis=-1)
+        eff_lr_row = jnp.asarray(lm_head_learning_rate, dtype=jnp.float32) / (
+            jnp.sqrt(jnp.maximum(v_row, 0.0)) + eps
+        )
+        metrics["eff_lr/lm_head/p01"] = jnp.percentile(eff_lr_row, 1)
+        metrics["eff_lr/lm_head/p50"] = jnp.percentile(eff_lr_row, 50)
+
+    return metrics
 
 
 def _sanitize_metric_name(name: str) -> str:

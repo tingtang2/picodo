@@ -4,12 +4,14 @@ defaults:
   - override hydra/job_logging: disabled
 
 seed: 0
+use_single_vm_among_multiple: false
 ds_path: null
 tokens_params_ratio: 20 # chinchilla scaling
 num_tokens_train: null
 log_every_tokens: 1_000_000
 log_metrics_per_step: True
 log_metrics_per_step_full: false
+log_effective_lr_every_steps: 100
 log_output_embedding_group_metrics: true
 eval_every_steps: 100
 num_tokens_valid: 20_000_000

@@ -1371,8 +1371,9 @@ def _should_checkpoint(c, step):
 
 
 def train_and_evaluate(c: DictConfig):
-    # init distributed env if using multiple vms
-    jax.distributed.initialize()
+    if not c.use_single_vm_among_multiple:
+        # init distributed env if using multiple vms
+        jax.distributed.initialize()
     
     # get model and dataset rng seed
     key = jax.random.key(c.seed)
@@ -1892,6 +1893,9 @@ def train_and_evaluate(c: DictConfig):
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
     log_metrics_per_step = bool(getattr(c, "log_metrics_per_step", False))
     log_metrics_per_step_full = bool(getattr(c, "log_metrics_per_step_full", False))
+    log_effective_lr_every_steps = int(getattr(c, "log_effective_lr_every_steps", 100))
+    if log_effective_lr_every_steps <= 0:
+        raise ValueError("log_effective_lr_every_steps must be positive.")
     use_async_metric_writer = log_metrics_per_step and jax.process_count() == 1
     metric_writer = _AsyncMetricWriter() if use_async_metric_writer else None
     output_embedding_metric_groups = _prepare_output_embedding_metric_groups(c)
@@ -2402,6 +2406,15 @@ def train_and_evaluate(c: DictConfig):
         train_lower_90th_mean_loss_sum += utils.compute_lower_90th_percentile_mean(train_raw_loss)
         train_loss_num += 1
         should_log_interval_metrics = train_loss_num * tokens_per_opt_step >= c.log_every_tokens
+        effective_lr_metrics = {}
+        if step % log_effective_lr_every_steps == 0:
+            effective_lr_metrics = utils.get_effective_learning_rate_metrics(
+                opt_state,
+                learning_rate=lr_schedule(step),
+                lm_head_learning_rate=lm_head_tx_lr_schedule(step),
+                beta2=b2_schedule(step) if b2_schedule is not None else c.opt.b2,
+                eps=c.opt.eps,
+            )
 
         # logging
         if log_metrics_per_step:
@@ -2416,6 +2429,7 @@ def train_and_evaluate(c: DictConfig):
                 lm_head_metric_lr_schedule,
                 loss_skip_stats,
             )
+            metrics.update(effective_lr_metrics)
             if log_metrics_per_step_full:
                 metrics.update(_build_heavy_train_metrics(
                     pre_output_logit_mean,
@@ -2436,6 +2450,8 @@ def train_and_evaluate(c: DictConfig):
                 metric_writer.enqueue(step, metrics, pbar)
             else:
                 _log_metrics_if_primary(metrics, step, pbar)
+        elif effective_lr_metrics:
+            _log_metrics_if_primary(effective_lr_metrics, step, pbar)
         if should_log_interval_metrics:
             if log_metrics_per_step:
                 if not log_metrics_per_step_full:
