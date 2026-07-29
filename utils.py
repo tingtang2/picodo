@@ -101,15 +101,26 @@ def build_lm_head_oblique_target_rms_mask(model: nnx.Module):
     )
 
 
-def build_out_ln_scale_mask(model: nnx.Module):
-    """Returns a parameter mask selecting only the final RMSNorm scale."""
+def _is_rmsnorm_scale_path(key: str) -> bool:
+    if key == 'out_ln/scale':
+        return True
+    parts = key.split('/')
+    if len(parts) == 4 and parts[0] == 'blocks' and parts[1].isdigit():
+        return parts[2] in {'ln1', 'ln2'} and parts[3] == 'scale'
+    if len(parts) == 5 and parts[0] == 'blocks' and parts[1].isdigit() and parts[2] == 'attn':
+        return parts[3] in {'query_norm', 'key_norm'} and parts[4] == 'scale'
+    return False
+
+
+def build_rmsnorm_scale_mask(model: nnx.Module, all_rmsnorm_scales: bool):
+    """Selects either out_ln.scale or every RMSNorm scale parameter."""
     _, params = nnx.split(model, nnx.Param)
     found = False
 
     def mask_leaf(path, _):
         nonlocal found
         key = jax.tree_util.keystr(path, simple=True, separator='/')
-        selected = key == 'out_ln/scale'
+        selected = _is_rmsnorm_scale_path(key) if all_rmsnorm_scales else key == 'out_ln/scale'
         found |= selected
         return selected
 
@@ -119,30 +130,42 @@ def build_out_ln_scale_mask(model: nnx.Module):
         is_leaf=lambda x: isinstance(x, nnx.Param),
     )
     if not found:
+        config_name = 'all_rmsnorm_scales_sgd' if all_rmsnorm_scales else 'out_ln_scale_sgd'
         raise ValueError(
-            "opt.out_ln_scale_sgd.enabled=true requires model.rmsnorm_use_scale=true "
-            "so that out_ln.scale exists."
+            f"opt.{config_name}.enabled=true requires model.rmsnorm_use_scale=true "
+            "so that RMSNorm scale parameters exist."
         )
     return mask
 
 
-def maybe_partition_out_ln_scale_sgd(model, opt_cfg, base_optimizer_tx, learning_rate):
-    """Routes out_ln.scale to momentum SGD and all other params to base_optimizer_tx."""
-    sgd_cfg = getattr(opt_cfg, 'out_ln_scale_sgd', None)
-    if not bool(getattr(sgd_cfg, 'enabled', False)):
+def maybe_partition_rmsnorm_scale_sgd(model, opt_cfg, base_optimizer_tx, learning_rate):
+    """Optionally routes selected RMSNorm scales to momentum SGD."""
+    out_ln_cfg = getattr(opt_cfg, 'out_ln_scale_sgd', None)
+    all_scales_cfg = getattr(opt_cfg, 'all_rmsnorm_scales_sgd', None)
+    out_ln_enabled = bool(getattr(out_ln_cfg, 'enabled', False))
+    all_scales_enabled = bool(getattr(all_scales_cfg, 'enabled', False))
+    if out_ln_enabled and all_scales_enabled:
+        raise ValueError(
+            "opt.out_ln_scale_sgd.enabled and opt.all_rmsnorm_scales_sgd.enabled "
+            "cannot both be true."
+        )
+    if not (out_ln_enabled or all_scales_enabled):
         return base_optimizer_tx, None
 
+    all_rmsnorm_scales = all_scales_enabled
+    sgd_cfg = all_scales_cfg if all_rmsnorm_scales else out_ln_cfg
+    config_name = 'all_rmsnorm_scales_sgd' if all_rmsnorm_scales else 'out_ln_scale_sgd'
     momentum = float(getattr(sgd_cfg, 'momentum', 0.9))
     nesterov = bool(getattr(sgd_cfg, 'nesterov', False))
     if not 0.0 <= momentum < 1.0:
-        raise ValueError(f"Expected opt.out_ln_scale_sgd.momentum in [0, 1), got {momentum}.")
+        raise ValueError(f"Expected opt.{config_name}.momentum in [0, 1), got {momentum}.")
 
-    out_ln_scale_mask = build_out_ln_scale_mask(model)
+    rmsnorm_scale_mask = build_rmsnorm_scale_mask(model, all_rmsnorm_scales)
     parameter_labels = jax.tree_util.tree_map(
-        lambda selected: 'out_ln_scale_sgd' if selected else 'base',
-        out_ln_scale_mask,
+        lambda selected: 'rmsnorm_scale_sgd' if selected else 'base',
+        rmsnorm_scale_mask,
     )
-    out_ln_scale_tx = optax.inject_hyperparams(optax.sgd)(
+    rmsnorm_scale_tx = optax.inject_hyperparams(optax.sgd)(
         learning_rate=learning_rate,
         momentum=momentum,
         nesterov=nesterov,
@@ -150,13 +173,14 @@ def maybe_partition_out_ln_scale_sgd(model, opt_cfg, base_optimizer_tx, learning
     partitioned_tx = optax.partition(
         {
             'base': base_optimizer_tx,
-            'out_ln_scale_sgd': out_ln_scale_tx,
+            'rmsnorm_scale_sgd': rmsnorm_scale_tx,
         },
         parameter_labels,
     )
+    selected_parameters = 'all RMSNorm scales' if all_rmsnorm_scales else 'out_ln.scale'
     log_message = (
-        "final RMSNorm scale optimizer enabled: "
-        f"out_ln.scale=sgd(momentum={momentum}, nesterov={nesterov}), "
+        "RMSNorm scale optimizer enabled: "
+        f"{selected_parameters}=sgd(momentum={momentum}, nesterov={nesterov}), "
         "learning_rate=global_schedule, weight_decay=off"
     )
     return partitioned_tx, log_message

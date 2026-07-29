@@ -56,6 +56,10 @@ opt:
     enabled: false # if true, optimize only out_ln.scale with momentum SGD instead of AdamW
     momentum: 0.9
     nesterov: false
+  all_rmsnorm_scales_sgd:
+    enabled: false # if true, optimize every RMSNorm scale with momentum SGD instead of AdamW
+    momentum: 0.9
+    nesterov: false
   weight_decay: 0.02
   exclude_input_embedding_weight_decay: false
   lm_head_optimizer:

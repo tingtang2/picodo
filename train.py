@@ -1741,11 +1741,11 @@ def train_and_evaluate(c: DictConfig):
             f"got {lm_head_optimizer_type!r}."
         )
 
-    base_optimizer_tx, out_ln_scale_optimizer_log = utils.maybe_partition_out_ln_scale_sgd(
+    base_optimizer_tx, rmsnorm_scale_optimizer_log = utils.maybe_partition_rmsnorm_scale_sgd(
         model, c.opt, base_optimizer_tx, lr_schedule
     )
-    if out_ln_scale_optimizer_log is not None and jax.process_index() == 0:
-        print(out_ln_scale_optimizer_log)
+    if rmsnorm_scale_optimizer_log is not None and jax.process_index() == 0:
+        print(rmsnorm_scale_optimizer_log)
 
     tx_chain = [*pre_transforms, base_optimizer_tx, *post_transforms]
     tx = tx_chain[0] if len(tx_chain) == 1 else optax.chain(*tx_chain)
