@@ -1135,6 +1135,7 @@ def get_effective_learning_rate_metrics(
         )
         metrics["eff_lr/out_ln_scale/p01"] = jnp.percentile(eff_lr, 1)
         metrics["eff_lr/out_ln_scale/p50"] = jnp.percentile(eff_lr, 50)
+        metrics["eff_lr/out_ln_scale/p99"] = jnp.percentile(eff_lr, 99)
 
     lm_head_state = _get_adam_nu_and_count(
         opt_state, ("token_embed_out", "embedding"), expected_ndim=2
@@ -1148,6 +1149,7 @@ def get_effective_learning_rate_metrics(
         )
         metrics["eff_lr/lm_head/p01"] = jnp.percentile(eff_lr_row, 1)
         metrics["eff_lr/lm_head/p50"] = jnp.percentile(eff_lr_row, 50)
+        metrics["eff_lr/lm_head/p90"] = jnp.percentile(eff_lr_row, 90)
 
     return metrics
 
