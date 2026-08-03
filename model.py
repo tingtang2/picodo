@@ -25,6 +25,41 @@ def _safe_ratio(numerator, denominator):
     return numerator / jnp.maximum(denominator, jnp.asarray(_UPDATE_METRIC_EPS, dtype=jnp.float32))
 
 
+@jax.custom_vjp
+def _lm_head_dot_with_fp32_input_grad(query, embedding):
+    """Mixed-precision LM-head dot with an FP32 input-gradient matmul."""
+    return jnp.dot(query, embedding.T)
+
+
+def _lm_head_dot_with_fp32_input_grad_fwd(query, embedding):
+    logits = jnp.dot(query, embedding.T)
+    return logits, (query, embedding)
+
+
+def _lm_head_dot_with_fp32_input_grad_bwd(residuals, grad_logits):
+    query, embedding = residuals
+
+    # This is the only intentionally promoted part of the LM-head backward
+    # pass. With a vocabulary-sharded head, any reduction of these partial
+    # input gradients is consequently also FP32.
+    grad_query = jnp.dot(
+        grad_logits.astype(jnp.float32),
+        embedding.astype(jnp.float32),
+    )
+
+    # Preserve the ordinary mixed-precision weight-gradient computation.
+    flat_grad_logits = grad_logits.reshape((-1, grad_logits.shape[-1]))
+    flat_query = query.reshape((-1, query.shape[-1]))
+    grad_embedding = jnp.dot(flat_grad_logits.T, flat_query)
+    return grad_query, grad_embedding
+
+
+_lm_head_dot_with_fp32_input_grad.defvjp(
+    _lm_head_dot_with_fp32_input_grad_fwd,
+    _lm_head_dot_with_fp32_input_grad_bwd,
+)
+
+
 def _rmsnorm_operator_input(norm: nnx.RMSNorm, x):
     """Returns the normalized activation to which RMSNorm's scale is applied."""
     x_f32 = jnp.asarray(x, dtype=jnp.float32)
@@ -158,6 +193,7 @@ def _megatron_init_stds(c: DictConfig) -> tuple[float, float] | None:
 class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
         lm_head_dtype = getattr(c, "lm_head_dtype", c.activ_dtype)
+        self.lm_head_input_grad_fp32 = bool(getattr(c, "lm_head_input_grad_fp32", False))
         rmsnorm_use_scale = bool(getattr(c, "rmsnorm_use_scale", False))
         self.final_hidden_mean_centering = bool(getattr(c, "final_hidden_mean_centering", False))
         self.final_hidden_mean_centering_coeff = float(getattr(c, "alpha", 1.0))
@@ -279,7 +315,14 @@ class TransformerDecoder(nnx.Module):
                 return h, qkv_outputs, update_inputs
             return h, update_inputs
 
-        logits = self.token_embed_out.attend(h) # [B, T, V]
+        if self.lm_head_input_grad_fp32:
+            query, embedding = self.token_embed_out.promote_dtype(
+                (h, self.token_embed_out.embedding.value),
+                dtype=self.token_embed_out.dtype,
+            )
+            logits = _lm_head_dot_with_fp32_input_grad(query, embedding)
+        else:
+            logits = self.token_embed_out.attend(h)
         if update_inputs is not None:
             update_inputs["token_embed_out.embedding"]["output_fro"] = _frobenius_norm(logits)
 
