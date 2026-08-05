@@ -77,6 +77,7 @@ def load_ds(key, mesh, ds_path, seq_len, batch_size, n_tokens_valid, n_tokens_tr
     ds_path = os.path.expanduser(ds_path)
     tokens = np.memmap(ds_path, dtype=np.uint16, mode='r')
     n_tokens_dataset = len(tokens)
+    print(f'number of tokens in dataset: {n_tokens_dataset}')
 
     # if n_tokens_train is None, use full dataset
     if n_tokens_train is not None: assert n_tokens_train + n_tokens_valid <= n_tokens_dataset
