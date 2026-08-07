@@ -1510,12 +1510,46 @@ def train_and_evaluate(c: DictConfig):
                 f"start_b2={c.opt.b2}, final_b2={final_b2}, warmup_steps=0"
             )
     wd_mask = utils.build_weight_decay_mask(model, c.opt.exclude_input_embedding_weight_decay)
-    adamw_tx = optax.inject_hyperparams(optax.adamw)(
+    adamc_cfg = getattr(c.opt, "adamc", None)
+    adamc_enabled = bool(getattr(adamc_cfg, "enabled", False))
+    adamc_normalized_linear_mask = None
+    if adamc_enabled:
+        if float(c.opt.peak_lr) <= 0.0:
+            raise ValueError("opt.adamc.enabled=true requires opt.peak_lr to be positive.")
+        adamc_normalized_linear_mask = utils.build_adamc_normalized_linear_mask(model)
+        if jax.process_index() == 0:
+            print(
+                "AdamC enabled: transformer linear weight decay is scaled by lr / peak_lr; "
+                "LM head and other parameters retain regular AdamW decay"
+            )
+
+    def build_adam_tx(learning_rate, peak_learning_rate, b1, weight_decay, mask=None):
+        if not adamc_enabled:
+            return optax.inject_hyperparams(optax.adamw)(
+                learning_rate,
+                b1,
+                b2_hparam,
+                eps=c.opt.eps,
+                weight_decay=weight_decay,
+                mask=mask,
+            )
+        return optax.inject_hyperparams(utils.adamc)(
+            learning_rate=learning_rate,
+            peak_learning_rate=peak_learning_rate,
+            b1=b1,
+            b2=b2_hparam,
+            eps=c.opt.eps,
+            weight_decay=weight_decay,
+            mask=mask,
+            normalized_linear_mask=adamc_normalized_linear_mask,
+        )
+
+    base_adam_name = "adamc" if adamc_enabled else "adamw"
+    adamw_tx = build_adam_tx(
         lr_schedule,
+        c.opt.peak_lr,
         c.opt.b1,
-        b2_hparam,
-        eps=c.opt.eps,
-        weight_decay=c.opt.weight_decay,
+        c.opt.weight_decay,
         mask=wd_mask,
     )
 
@@ -1553,20 +1587,18 @@ def train_and_evaluate(c: DictConfig):
                     output_embedding_mask,
                 )
 
-            lm_head_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            lm_head_adamw_tx = build_adam_tx(
                 lm_head_tx_lr_schedule,
+                lm_head_peak_lr,
                 c.opt.b1,
-                b2_hparam,
-                eps=c.opt.eps,
-                weight_decay=c.opt.weight_decay,
+                c.opt.weight_decay,
                 mask=lm_head_wd_mask,
             )
-            rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+            rest_adamw_tx = build_adam_tx(
                 lr_schedule,
+                c.opt.peak_lr,
                 c.opt.b1,
-                b2_hparam,
-                eps=c.opt.eps,
-                weight_decay=c.opt.weight_decay,
+                c.opt.weight_decay,
                 mask=rest_wd_mask,
             )
             base_optimizer_tx = optax.chain(
@@ -1576,7 +1608,7 @@ def train_and_evaluate(c: DictConfig):
             if jax.process_index() == 0:
                 print(
                     "split lm-head optimizer enabled: "
-                    "default=adamw, lm_head=adamw, "
+                    f"default={base_adam_name}, lm_head=adamw, "
                     f"lm_head_peak_lr={lm_head_peak_lr}; "
                     "all other hparams shared"
                 )
@@ -1601,12 +1633,11 @@ def train_and_evaluate(c: DictConfig):
             momentum=float(getattr(lm_head_optimizer_cfg, "momentum", 0.9)),
             nesterov=bool(getattr(lm_head_optimizer_cfg, "nesterov", False)),
         )
-        rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+        rest_adamw_tx = build_adam_tx(
             lr_schedule,
+            c.opt.peak_lr,
             c.opt.b1,
-            b2_hparam,
-            eps=c.opt.eps,
-            weight_decay=c.opt.weight_decay,
+            c.opt.weight_decay,
             mask=rest_wd_mask,
         )
         base_optimizer_tx = optax.chain(
@@ -1616,7 +1647,7 @@ def train_and_evaluate(c: DictConfig):
         if jax.process_index() == 0:
             print(
                 "split lm-head optimizer enabled: "
-                "default=adamw, lm_head=sgd_momentum, "
+                f"default={base_adam_name}, lm_head=sgd_momentum, "
                 f"lm_head_peak_lr={lm_head_peak_lr}, "
                 f"momentum={float(getattr(lm_head_optimizer_cfg, 'momentum', 0.9))}, "
                 f"nesterov={bool(getattr(lm_head_optimizer_cfg, 'nesterov', False))}"
@@ -1639,19 +1670,17 @@ def train_and_evaluate(c: DictConfig):
 
         lm_head_b1 = float(getattr(lm_head_optimizer_cfg, "b1", c.opt.b1))
 
-        lm_head_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+        lm_head_adamw_tx = build_adam_tx(
             lm_head_tx_lr_schedule,
+            lm_head_peak_lr,
             lm_head_b1,
-            b2_hparam,
-            eps=c.opt.eps,
-            weight_decay=c.opt.weight_decay,
+            c.opt.weight_decay,
         )
-        rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+        rest_adamw_tx = build_adam_tx(
             lr_schedule,
+            c.opt.peak_lr,
             c.opt.b1,
-            b2_hparam,
-            eps=c.opt.eps,
-            weight_decay=c.opt.weight_decay,
+            c.opt.weight_decay,
             mask=rest_wd_mask,
         )
         base_optimizer_tx = optax.chain(
@@ -1661,7 +1690,7 @@ def train_and_evaluate(c: DictConfig):
         if jax.process_index() == 0:
             print(
                 "split lm-head optimizer enabled: "
-                f"default=adamw(b1={c.opt.b1}), "
+                f"default={base_adam_name}(b1={c.opt.b1}), "
                 f"lm_head=adamw(b1={lm_head_b1}, peak_lr={lm_head_peak_lr}); "
                 "all other hparams (b2, eps, weight_decay) shared"
             )
@@ -1704,20 +1733,18 @@ def train_and_evaluate(c: DictConfig):
                 eps=lm_head_oblique_eps,
             )
         )
-        rest_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+        rest_adamw_tx = build_adam_tx(
             lr_schedule,
+            c.opt.peak_lr,
             c.opt.b1,
-            b2_hparam,
-            eps=c.opt.eps,
-            weight_decay=c.opt.weight_decay,
+            c.opt.weight_decay,
             mask=rest_wd_mask,
         )
-        lm_head_target_rms_adamw_tx = optax.inject_hyperparams(optax.adamw)(
+        lm_head_target_rms_adamw_tx = build_adam_tx(
             lm_head_tx_lr_schedule,
+            lm_head_peak_lr,
             c.opt.b1,
-            b2_hparam,
-            eps=c.opt.eps,
-            weight_decay=0.0,
+            0.0,
         )
         base_optimizer_tx = optax.chain(
             optax.masked(rest_adamw_tx, non_lm_head_mask),
@@ -1727,7 +1754,7 @@ def train_and_evaluate(c: DictConfig):
         if jax.process_index() == 0:
             print(
                 "split lm-head optimizer enabled: "
-                f"default=adamw, lm_head={lm_head_optimizer_type}, "
+                f"default={base_adam_name}, lm_head={lm_head_optimizer_type}, "
                 f"lm_head_peak_lr={lm_head_peak_lr}, momentum={lm_head_momentum}, "
                 f"target_rms={lm_head_target_rms}, "
                 f"direction_target_rms={lm_head_direction_target_rms}, "

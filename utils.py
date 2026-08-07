@@ -70,6 +70,77 @@ def build_weight_decay_mask(model: nnx.Module, exclude_input_embedding: bool):
     )
 
 
+def _is_adamc_normalized_linear_path(key: str) -> bool:
+    """The transformer-linear mask used for the paper's LLM experiments."""
+    parts = key.split('/')
+    if len(parts) != 5 or parts[0] != 'blocks' or not parts[1].isdigit():
+        return False
+    if parts[2] == 'attn':
+        return parts[3] in {'qkv_proj', 'gate_proj', 'out_proj'} and parts[4] == 'kernel'
+    if parts[2] == 'mlp':
+        return parts[3] in {'up_proj', 'down_proj'} and parts[4] == 'kernel'
+    return False
+
+
+def build_adamc_normalized_linear_mask(model: nnx.Module):
+    """Select every transformer linear weight, excluding the LM output head."""
+    _, params = nnx.split(model, nnx.Param)
+    return jax.tree_util.tree_map_with_path(
+        lambda path, _: _is_adamc_normalized_linear_path(
+            jax.tree_util.keystr(path, simple=True, separator='/')
+        ),
+        params,
+        is_leaf=lambda x: isinstance(x, nnx.Param),
+    )
+
+
+def adamc(
+    learning_rate,
+    peak_learning_rate,
+    b1=0.9,
+    b2=0.999,
+    eps=1e-8,
+    weight_decay=1e-4,
+    mask=None,
+    normalized_linear_mask=None,
+):
+    """AdamW with LR-corrected decay on normalized transformer linears.
+
+    For selected parameters, the decay coefficient inside AdamW is
+    ``weight_decay * learning_rate / peak_learning_rate``. Since Optax then
+    scales the complete update by ``learning_rate``, the resulting decay step
+    is ``learning_rate**2 / peak_learning_rate * weight_decay * param``.
+    """
+    if normalized_linear_mask is None:
+        raise ValueError("adamc requires normalized_linear_mask.")
+
+    if mask is None:
+        corrected_decay_mask = normalized_linear_mask
+        regular_decay_mask = jax.tree_util.tree_map(
+            lambda corrected: not corrected,
+            normalized_linear_mask,
+        )
+    else:
+        corrected_decay_mask = jax.tree_util.tree_map(
+            lambda use_decay, corrected: bool(use_decay and corrected),
+            mask,
+            normalized_linear_mask,
+        )
+        regular_decay_mask = jax.tree_util.tree_map(
+            lambda use_decay, corrected: bool(use_decay and not corrected),
+            mask,
+            normalized_linear_mask,
+        )
+
+    corrected_weight_decay = weight_decay * learning_rate / peak_learning_rate
+    return optax.chain(
+        optax.scale_by_adam(b1=b1, b2=b2, eps=eps),
+        optax.add_decayed_weights(weight_decay, regular_decay_mask),
+        optax.add_decayed_weights(corrected_weight_decay, corrected_decay_mask),
+        optax.scale_by_learning_rate(learning_rate),
+    )
+
+
 def build_output_embedding_mask(model: nnx.Module):
     _, params = nnx.split(model, nnx.Param)
 

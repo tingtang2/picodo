@@ -73,6 +73,8 @@ opt:
     momentum: 0.9
     nesterov: false
   weight_decay: 1e-4
+  adamc:
+    enabled: false # LR-correct weight decay on transformer linear layers; LM head remains regular AdamW
   exclude_input_embedding_weight_decay: false
   lm_head_optimizer:
     type: adamw # one of: adamw, sgd_momentum, adamw_b1, row_oblique, column_oblique
