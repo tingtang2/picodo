@@ -471,12 +471,22 @@ class MultiHeadAttention(nnx.Module):
         
         self.query_norm = nnx.RMSNorm(c.H, use_scale=rmsnorm_use_scale, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
         self.key_norm = nnx.RMSNorm(c.H, use_scale=rmsnorm_use_scale, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
-        if c.use_flash_attn and jax.devices()[0].platform == 'tpu' and (c.H % 128 != 0):
+        platform = jax.devices()[0].platform
+        if c.use_flash_attn and platform == 'tpu' and (c.H % 128 != 0):
             warnings.warn('cannot use flash attention because `model.H` is not a multiple of 128.')
-        c.use_flash_attn &= jax.devices()[0].platform == 'tpu'
-        c.use_flash_attn &= (c.H % 128 == 0)
-        self.attention = partial(tpu_causal_flash_attention) if c.use_flash_attn else partial(jax.nn.dot_product_attention, is_causal=False)
-        self.use_flash_attn = c.use_flash_attn
+        self.use_tpu_flash_attn = bool(c.use_flash_attn and platform == 'tpu' and (c.H % 128 == 0))
+        # cuDNN's causal attention is the fused/FlashAttention-style path for
+        # supported CUDA shapes. It cannot consume the arbitrary padding mask
+        # handled by the general fallback below.
+        self.use_gpu_cudnn_attn = bool(c.use_flash_attn and platform == 'gpu')
+        self.attention = (
+            partial(tpu_causal_flash_attention)
+            if self.use_tpu_flash_attn
+            else partial(jax.nn.dot_product_attention, is_causal=True, implementation='cudnn')
+            if self.use_gpu_cudnn_attn
+            else partial(jax.nn.dot_product_attention, is_causal=False)
+        )
+        self.fallback_attention = partial(jax.nn.dot_product_attention, is_causal=False)
 
     def __call__(
         self,
@@ -525,7 +535,7 @@ class MultiHeadAttention(nnx.Module):
         k = apply_rope(k, position[None])
 
         # attention
-        if self.use_flash_attn:
+        if self.use_tpu_flash_attn or (self.use_gpu_cudnn_attn and attention_mask is None):
             out = self.attention(q, k, v) # [B, T, N, H]
         else:
              # 1. Create causal mask (allows attending to past)
@@ -547,7 +557,7 @@ class MultiHeadAttention(nnx.Module):
                 combined_mask = causal_mask
             
             # The mask will be broadcast by dot_product_attention to [B, N, T, T]
-            out = self.attention(q, k, v, mask=combined_mask) # [B, T, N, H]
+            out = self.fallback_attention(q, k, v, mask=combined_mask) # [B, T, N, H]
 
         if self.elementwise_attn_output_gate:
             out = out * jax.nn.sigmoid(gate_score)
