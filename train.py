@@ -1074,6 +1074,36 @@ def get_mean_and_norm_output_logit(model_state, model_graphdef, x): # [B, T]
     entropy = -jnp.mean(jnp.sum(probs * log_probs, axis=-1))
     return logits.mean(), utils.get_l2_norm(logits), logits.std(), entropy
 
+
+@partial(jax.jit, static_argnames=('model_graphdef'))
+def get_head_scale_metrics(model_state, model_graphdef, x):
+    """Measures the relative activation and parameter scales around the LM head."""
+    model = nnx.merge(model_graphdef, model_state)
+    raw_final_norm_input = model(x, return_final_norm_input=True)
+    lm_head_input = model.out_ln(raw_final_norm_input)
+    if model.final_hidden_mean_centering:
+        lm_head_input = lm_head_input - (
+            model.final_hidden_mean_centering_coeff * jnp.mean(lm_head_input, axis=-1, keepdims=True)
+        )
+    if model.lm_head_oblique_learn_target_rms:
+        target_rms = jnp.exp(
+            jnp.asarray(model.lm_head_oblique_target_rms_log.value, dtype=lm_head_input.dtype)
+        )
+        lm_head_input = lm_head_input * target_rms
+
+    input_norm = utils.get_l2_norm(lm_head_input.astype(jnp.float32))
+    raw_input_norm = utils.get_l2_norm(raw_final_norm_input.astype(jnp.float32))
+    output_embedding_norm = utils.get_l2_norm(
+        model.token_embed_out.embedding.value.astype(jnp.float32)
+    )
+    final_norm_scale_norm = utils.get_l2_norm(model.out_ln.scale.value.astype(jnp.float32))
+    eps = jnp.asarray(1e-30, dtype=jnp.float32)
+    return {
+        'head_scale/input_ratio': input_norm / jnp.maximum(raw_input_norm, eps),
+        'head_scale/weight_product': output_embedding_norm * final_norm_scale_norm,
+        'head_scale/weight_ratio': output_embedding_norm / jnp.maximum(final_norm_scale_norm, eps),
+    }
+
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logit_grad_sum_stats(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
@@ -1222,6 +1252,7 @@ def _build_heavy_train_metrics(
     output_embedding_metric_groups=(),
     adam_eps: float = 1e-8,
     parameter_update_metrics=None,
+    head_scale_metrics=None,
 ):
     metrics = {}
     if output_logit_mean is not None:
@@ -1246,6 +1277,8 @@ def _build_heavy_train_metrics(
         metrics.update(loss_skip_stats)
     if parameter_update_metrics:
         metrics.update(parameter_update_metrics)
+    if head_scale_metrics:
+        metrics.update(head_scale_metrics)
     return metrics
 
 
@@ -1272,6 +1305,7 @@ def _build_train_metrics(
     output_embedding_metric_groups=(),
     adam_eps: float = 1e-8,
     parameter_update_metrics=None,
+    head_scale_metrics=None,
 ):
     metrics = _build_lightweight_train_metrics(
         step,
@@ -1299,6 +1333,7 @@ def _build_train_metrics(
         output_embedding_metric_groups=output_embedding_metric_groups,
         adam_eps=adam_eps,
         parameter_update_metrics=parameter_update_metrics,
+        head_scale_metrics=head_scale_metrics,
     ))
     return metrics
 
@@ -1920,9 +1955,9 @@ def train_and_evaluate(c: DictConfig):
     train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
     log_metrics_per_step = bool(getattr(c, "log_metrics_per_step", False))
     log_metrics_per_step_full = bool(getattr(c, "log_metrics_per_step_full", False))
-    log_effective_lr_every_steps = int(getattr(c, "log_effective_lr_every_steps", 100))
-    if log_effective_lr_every_steps <= 0:
-        raise ValueError("log_effective_lr_every_steps must be positive.")
+    log_effective_lr_every_steps = int(getattr(c, "log_effective_lr_every_steps", -1))
+    if log_effective_lr_every_steps == 0 or log_effective_lr_every_steps < -1:
+        raise ValueError("log_effective_lr_every_steps must be -1 (disabled) or positive.")
     use_async_metric_writer = log_metrics_per_step and jax.process_count() == 1
     metric_writer = _AsyncMetricWriter() if use_async_metric_writer else None
     output_embedding_metric_groups = _prepare_output_embedding_metric_groups(c)
@@ -1936,9 +1971,14 @@ def train_and_evaluate(c: DictConfig):
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
     log_parameter_update_metrics = bool(getattr(c, "log_parameter_update_metrics", False))
+    log_head_scale_metrics = bool(getattr(c, "log_head_scale_metrics", False))
     log_final_norm_activation_grad_metrics = bool(
         getattr(c, "log_final_norm_activation_grad_metrics", False)
     )
+    if log_head_scale_metrics and not bool(getattr(c.model, "rmsnorm_use_scale", False)):
+        raise ValueError("log_head_scale_metrics requires model.rmsnorm_use_scale=true.")
+    if log_head_scale_metrics and jax.process_index() == 0:
+        print("head scale metrics enabled on heavy logging steps")
     if log_parameter_update_metrics and jax.process_index() == 0:
         print("parameter update metrics enabled on heavy logging steps")
     if log_final_norm_activation_grad_metrics and jax.process_index() == 0:
@@ -2011,6 +2051,7 @@ def train_and_evaluate(c: DictConfig):
             (train_loss_num + 1) * tokens_per_opt_step >= c.log_every_tokens
         )
         should_collect_parameter_update_metrics = log_parameter_update_metrics and will_log_heavy_metrics
+        should_collect_head_scale_metrics = log_head_scale_metrics and will_log_heavy_metrics
         should_collect_final_norm_activation_grads = (
             log_final_norm_activation_grad_metrics and will_log_heavy_metrics
         )
@@ -2019,6 +2060,7 @@ def train_and_evaluate(c: DictConfig):
         pre_update_model_state = None
         parameter_update_batch = batch
         parameter_update_metrics = {}
+        head_scale_metrics = {}
         need_step_grads = False
         pre_output_logit_mean = None
         pre_output_logit_norm = None
@@ -2388,6 +2430,8 @@ def train_and_evaluate(c: DictConfig):
                 pre_output_logit_entropy,
             ) = output_stats
             parameter_update_metrics.update(activation_grad_metrics)
+        if should_collect_head_scale_metrics:
+            head_scale_metrics = get_head_scale_metrics(opt_state.model, model_graphdef, batch)
         if loss_skip_enabled:
             raw_np = _to_host_numpy(train_raw_loss, dtype=np.float32, flatten=True)
             stats_np = np.log1p(np.maximum(raw_np, 0.0)) if loss_skip_use_log_loss else raw_np
@@ -2434,7 +2478,7 @@ def train_and_evaluate(c: DictConfig):
         train_loss_num += 1
         should_log_interval_metrics = train_loss_num * tokens_per_opt_step >= c.log_every_tokens
         effective_lr_metrics = {}
-        if step % log_effective_lr_every_steps == 0:
+        if log_effective_lr_every_steps > 0 and step % log_effective_lr_every_steps == 0:
             effective_lr_metrics = utils.get_effective_learning_rate_metrics(
                 opt_state,
                 learning_rate=lr_schedule(step),
@@ -2472,6 +2516,7 @@ def train_and_evaluate(c: DictConfig):
                     output_embedding_metric_groups=output_embedding_metric_groups,
                     adam_eps=c.opt.eps,
                     parameter_update_metrics=parameter_update_metrics,
+                    head_scale_metrics=head_scale_metrics,
                 ))
             if metric_writer is not None:
                 metric_writer.enqueue(step, metrics, pbar)
@@ -2496,6 +2541,7 @@ def train_and_evaluate(c: DictConfig):
                         output_embedding_metric_groups=output_embedding_metric_groups,
                         adam_eps=c.opt.eps,
                         parameter_update_metrics=parameter_update_metrics,
+                        head_scale_metrics=head_scale_metrics,
                     )
                     _log_metrics_if_primary(metrics, step, pbar)
             else:
@@ -2522,6 +2568,7 @@ def train_and_evaluate(c: DictConfig):
                     output_embedding_metric_groups=output_embedding_metric_groups,
                     adam_eps=c.opt.eps,
                     parameter_update_metrics=parameter_update_metrics,
+                    head_scale_metrics=head_scale_metrics,
                 )
                 _log_metrics_if_primary(metrics, step, pbar)
             train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
