@@ -111,3 +111,10 @@ opt:
     z_hard: 8.0
     eps: 1e-6
     use_log_loss: false
+
+profiling:
+  enabled: false
+  start_step: 5
+  num_steps: 10
+  log_dir: ""
+  create_perfetto_trace: true

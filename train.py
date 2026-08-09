@@ -1490,6 +1490,38 @@ def train_and_evaluate(c: DictConfig):
                 f"per_device_batch={c.opt.batch_size // jax.device_count()}"
             )
 
+    profiling_cfg = getattr(c, 'profiling', None)
+    profiling_enabled = bool(getattr(profiling_cfg, 'enabled', False))
+    profiling_start_step = int(getattr(profiling_cfg, 'start_step', 5))
+    profiling_num_steps = int(getattr(profiling_cfg, 'num_steps', 10))
+    profiling_log_dir = str(getattr(profiling_cfg, 'log_dir', '') or '')
+    profiling_create_perfetto_trace = bool(
+        getattr(profiling_cfg, 'create_perfetto_trace', True)
+    )
+    if profiling_enabled:
+        if jax.process_count() != 1:
+            raise ValueError(
+                'JAX profiling is currently supported only for a single-host run; '
+                'each host would otherwise try to write a trace to the same directory.'
+            )
+        if profiling_start_step < 0 or profiling_num_steps <= 0:
+            raise ValueError(
+                'profiling.start_step must be non-negative and profiling.num_steps '
+                'must be positive.'
+            )
+        if not profiling_log_dir:
+            profiling_log_dir = os.environ.get('PICODO_PROFILE_LOG_DIR', '')
+        if not profiling_log_dir:
+            profiling_log_dir = os.path.abspath('jax-profile')
+        profiling_log_dir = os.path.abspath(profiling_log_dir)
+        os.makedirs(profiling_log_dir, exist_ok=True)
+        print(
+            'JAX profiling enabled: '
+            f'steps=[{profiling_start_step}, '
+            f'{profiling_start_step + profiling_num_steps}), '
+            f'log_dir={profiling_log_dir}'
+        )
+
     # model
     print('initializing model...')
     utils.sync_lm_head_oblique_model_config(c)
@@ -2110,11 +2142,19 @@ def train_and_evaluate(c: DictConfig):
 
     if c.diagnostics.end_step:
         num_opt_steps = c.diagnostics.end_step
+
+    if profiling_enabled and profiling_start_step + profiling_num_steps > num_opt_steps:
+        raise ValueError(
+            'The profiling window must fit within diagnostics.end_step/num_opt_steps; '
+            f'window ends at step {profiling_start_step + profiling_num_steps}, '
+            f'but training stops at {num_opt_steps}.'
+        )
     
     mucentering = bool(getattr(c.opt, "mucentering", False))
 
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
+    profiler_active = False
     for step in pbar:
         batch = ds_train[step]
         batch = _maybe_shard_multihost_batch(batch, mesh, multihost_batch_sharding)
@@ -2203,6 +2243,17 @@ def train_and_evaluate(c: DictConfig):
         # Copy only the parameters, immediately before the donated training step.
         if should_collect_parameter_update_metrics or should_collect_final_norm_activation_grads:
             pre_update_model_state = _copy_model_state_for_metrics(opt_state.model)
+
+        # Profile only warmed-up optimizer steps, excluding setup/compilation and
+        # expensive optional diagnostics. The trace remains useful for both the
+        # GPU execution timeline and Python-side input/logging overhead.
+        if profiling_enabled and step == profiling_start_step:
+            jax.profiler.start_trace(
+                profiling_log_dir,
+                create_perfetto_trace=profiling_create_perfetto_trace,
+            )
+            profiler_active = True
+            print(f'Started JAX profiler trace at training step {step}.')
 
         # training step
         if loss_skip_enabled:
@@ -2467,6 +2518,13 @@ def train_and_evaluate(c: DictConfig):
                         need_step_grads,
                         collect_step_parameter_update_metrics,
                     )
+        if profiler_active and step + 1 == profiling_start_step + profiling_num_steps:
+            # Dispatches are asynchronous on GPU. Wait for the final profiled
+            # step before exporting, otherwise its kernels may be omitted.
+            batch_loss.block_until_ready()
+            jax.profiler.stop_trace()
+            profiler_active = False
+            print(f'Saved JAX profiler trace to {profiling_log_dir}.')
         if should_collect_parameter_update_metrics:
             parameter_update_metrics = get_parameter_update_metrics(
                 pre_update_model_state,
@@ -2645,7 +2703,7 @@ def train_and_evaluate(c: DictConfig):
             train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
         
         # eval and checkpointing
-        if step % c.eval_every_steps == 0:
+        if c.eval_every_steps > 0 and step > 0 and step % c.eval_every_steps == 0:
             (
                 eval_loss,
                 eval_raw_loss,
@@ -2695,12 +2753,16 @@ def train_and_evaluate(c: DictConfig):
 
     if metric_writer is not None:
         metric_writer.flush(pbar)
+    if profiler_active:
+        # This path is only expected if training was interrupted during the
+        # requested window; preserve the partial trace rather than losing it.
+        jax.profiler.stop_trace()
     
     if num_opt_steps != len(ds_train):
         print('exiting early')
         wandb.finish()
         ckpt_mngr.close()
-        sys.exit(1)
+        return
 
     # eval at end of training
     (
