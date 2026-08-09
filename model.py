@@ -848,6 +848,7 @@ def compute_parameter_update_metrics(old_model: TransformerDecoder, new_model: T
 
 def create_sharded_model(c: DictConfig, key):
     seed = int(jax.random.randint(key, [1], 0, 1_000_000)[0])
+    data_param_sharding = bool(getattr(c, 'data_param_sharding', True))
 
     @nnx.jit
     def initialize_sharded_model():
@@ -856,6 +857,12 @@ def create_sharded_model(c: DictConfig, key):
         state = nnx.state(model) # the model's state, a pure pytree
 
         def add_sharding(path, v):
+            # GPT2M easily fits replicated on a GB200.  Keeping this alternate
+            # layout makes it possible to benchmark conventional data parallel
+            # training against the existing data-axis parameter sharding.
+            if not data_param_sharding:
+                return jax.lax.with_sharding_constraint(v, P())
+
             key = jax.tree_util.keystr(path, simple=True, separator='/')
             pspec = None
             if key == 'token_embed_in/embedding': pspec = P('data', 'model')

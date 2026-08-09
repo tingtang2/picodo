@@ -35,6 +35,7 @@ model:
   V: null # vocab size -> must match dataset tokenizer!
   activ_dtype: 'bfloat16'
   lm_head_input_grad_fp32: false # compute only the LM-head input-gradient matmul in FP32
+  data_param_sharding: true # shard parameters over data (FSDP-like); false = replicated-parameter DP
   use_flash_attn: true
   use_qk_norm: true
   rmsnorm_use_scale: false
