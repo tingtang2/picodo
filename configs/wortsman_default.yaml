@@ -5,6 +5,7 @@ defaults:
 
 seed: 0
 use_single_vm_among_multiple: false
+multihost_batch_sharding: false # assemble host-local NumPy batches into global JAX arrays
 ds_path: null
 tokens_params_ratio: 20 # chinchilla scaling
 num_tokens_train: null

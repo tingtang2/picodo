@@ -9,6 +9,7 @@ import wandb
 from functools import partial
 from flax import nnx
 from jax.experimental import multihost_utils
+from jax.sharding import NamedSharding, PartitionSpec as P
 from tqdm.auto import tqdm
 from omegaconf.dictconfig import DictConfig
 import data, utils
@@ -19,6 +20,52 @@ from etils import epath
 from orbax.checkpoint._src.path import gcs_utils, step as step_lib
 import os
 import sys
+
+
+def _maybe_shard_multihost_batch(batch, mesh, enabled: bool):
+    """Turns a per-host batch slice into a global, data-sharded JAX array.
+
+    The lazy dataset deliberately returns NumPy arrays.  In a multi-controller
+    run, handing that full global batch to every controller leaves placement
+    ambiguous and can replicate large intermediates.  With this opt-in path,
+    each host supplies its distinct contiguous batch slice and JAX assembles a
+    single global array whose leading dimension is sharded over the data mesh.
+    """
+    if not enabled or jax.process_count() == 1:
+        return batch
+
+    batch = np.asarray(batch)
+    if batch.ndim < 1:
+        raise ValueError(f"Expected a batched array, got shape {batch.shape}.")
+    if batch.shape[0] % jax.process_count() != 0:
+        raise ValueError(
+            "Global batch size must divide evenly across JAX processes when "
+            f"multihost_batch_sharding=true; got batch={batch.shape[0]} and "
+            f"processes={jax.process_count()}."
+        )
+
+    local_batch_size = batch.shape[0] // jax.process_count()
+    start = jax.process_index() * local_batch_size
+    local_batch = batch[start:start + local_batch_size]
+    sharding = NamedSharding(mesh, P('data', *([None] * (batch.ndim - 1))))
+    global_batch = jax.make_array_from_process_local_data(
+        sharding, local_batch, global_shape=batch.shape
+    )
+
+    if global_batch.shape != batch.shape:
+        raise ValueError(
+            f"Multihost batch assembly changed shape from {batch.shape} to "
+            f"{global_batch.shape}."
+        )
+    if not getattr(_maybe_shard_multihost_batch, '_layout_logged', False):
+        local_shapes = [tuple(shard.data.shape) for shard in global_batch.addressable_shards]
+        print(
+            "multihost batch placement: "
+            f"process={jax.process_index()}, global_shape={global_batch.shape}, "
+            f"addressable_shard_shapes={local_shapes}"
+        )
+        _maybe_shard_multihost_batch._layout_logged = True
+    return global_batch
 
 class _StandardNameFormatHNS(step_lib._StandardNameFormat):
     """Fixes GCS HNS listing when step_prefix is None."""
@@ -1166,7 +1213,15 @@ def get_logit_grad_scaling_stats(model_state, model_graphdef, x): # [B, T]
     }
 
 
-def eval_step(c, model_state, model_graphdef, dataset, collect_qkv_stats: bool = True):
+def eval_step(
+    c,
+    model_state,
+    model_graphdef,
+    dataset,
+    collect_qkv_stats: bool = True,
+    mesh=None,
+    multihost_batch_sharding: bool = False,
+):
     loss_sum = jnp.zeros([], dtype=jnp.float32)
     raw_losses = []
     total_logits = []
@@ -1177,6 +1232,7 @@ def eval_step(c, model_state, model_graphdef, dataset, collect_qkv_stats: bool =
     
     for i in range(len(dataset)):
         batch = dataset[i]
+        batch = _maybe_shard_multihost_batch(batch, mesh, multihost_batch_sharding)
         if c.opt.use_z_loss:
             batch_loss, (raw_loss, _) = loss_fn_z_loss(
                 model_state, model_graphdef, batch, collect_qkv_stats
@@ -1419,6 +1475,20 @@ def train_and_evaluate(c: DictConfig):
     mesh = jax.make_mesh((num_fsdp_devices, c.num_tp_devices), ('data', 'model'))
     jax.set_mesh(mesh)
     print('sharding mesh:', ', '.join(f'{k}={v}' for k, v in mesh.shape.items()))
+    multihost_batch_sharding = bool(getattr(c, 'multihost_batch_sharding', False))
+    if multihost_batch_sharding and jax.process_count() > 1:
+        local_batch_size = c.opt.batch_size // jax.process_count()
+        if c.opt.batch_size % jax.process_count() != 0:
+            raise ValueError(
+                "opt.batch_size must divide evenly across JAX processes when "
+                "multihost_batch_sharding=true."
+            )
+        if jax.process_index() == 0:
+            print(
+                "multihost batch sharding enabled: "
+                f"global_batch={c.opt.batch_size}, per_host_batch={local_batch_size}, "
+                f"per_device_batch={c.opt.batch_size // jax.device_count()}"
+            )
 
     # model
     print('initializing model...')
@@ -2047,6 +2117,7 @@ def train_and_evaluate(c: DictConfig):
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     for step in pbar:
         batch = ds_train[step]
+        batch = _maybe_shard_multihost_batch(batch, mesh, multihost_batch_sharding)
         will_log_heavy_metrics = log_metrics_per_step_full or (
             (train_loss_num + 1) * tokens_per_opt_step >= c.log_every_tokens
         )
@@ -2582,7 +2653,15 @@ def train_and_evaluate(c: DictConfig):
                 mean_eval_output_logit,
                 mean_eval_output_logit_std,
                 mean_eval_output_logit_entropy,
-            ) = eval_step(c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats)
+            ) = eval_step(
+                c,
+                opt_state.model,
+                model_graphdef,
+                ds_valid,
+                collect_qkv_stats,
+                mesh,
+                multihost_batch_sharding,
+            )
             flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
             metrics = {}
             metrics['eval_loss'] = eval_loss
@@ -2631,7 +2710,15 @@ def train_and_evaluate(c: DictConfig):
         mean_eval_output_logit,
         mean_eval_output_logit_std,
         mean_eval_output_logit_entropy,
-    ) = eval_step(c, opt_state.model, model_graphdef, ds_valid, collect_qkv_stats)
+    ) = eval_step(
+        c,
+        opt_state.model,
+        model_graphdef,
+        ds_valid,
+        collect_qkv_stats,
+        mesh,
+        multihost_batch_sharding,
+    )
     metrics = {}
     flattened_eval_raw_loss = jnp.concatenate(eval_raw_loss, axis=0)
     metrics['eval_loss'] = eval_loss
