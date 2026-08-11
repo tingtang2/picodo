@@ -1138,6 +1138,34 @@ def get_mean_and_norm_output_logit(model_state, model_graphdef, x): # [B, T]
 
 
 @partial(jax.jit, static_argnames=('model_graphdef'))
+def get_output_logit_and_final_norm_channel_metrics(model_state, model_graphdef, x):
+    model = nnx.merge(model_graphdef, model_state)
+    logits, final_norm_input = model(x, return_final_norm_input_with_logits=True)
+    logits = logits[:, :-1].astype(jnp.float32)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    probs = jnp.exp(log_probs)
+    entropy = -jnp.mean(jnp.sum(probs * log_probs, axis=-1))
+    output_stats = (logits.mean(), utils.get_l2_norm(logits), logits.std(), entropy)
+
+    h_hat = model_lib._rmsnorm_operator_input(model.out_ln, final_norm_input)
+    channel_energy = jnp.sum(jnp.square(h_hat), axis=tuple(range(h_hat.ndim - 1)))
+    total_energy = jnp.maximum(jnp.sum(channel_energy), jnp.asarray(1e-30, dtype=jnp.float32))
+    top_k = min(10, channel_energy.shape[0])
+    top_activation_energy = jnp.sum(jax.lax.top_k(channel_energy, top_k)[0])
+
+    gamma_abs = jnp.abs(jnp.asarray(model.out_ln.scale.value, dtype=jnp.float32))
+    top_gamma_indices = jax.lax.top_k(gamma_abs, top_k)[1]
+    top_gamma_energy = jnp.sum(jnp.take(channel_energy, top_gamma_indices))
+    metrics = {
+        'final_norm/gamma_abs_max': jnp.max(gamma_abs),
+        'final_norm/gamma_abs_median': jnp.median(gamma_abs),
+        'final_norm/top_activation_energy_frac': top_activation_energy / total_energy,
+        'final_norm/top_gamma_energy_frac': top_gamma_energy / total_energy,
+    }
+    return output_stats, metrics
+
+
+@partial(jax.jit, static_argnames=('model_graphdef'))
 def get_head_scale_metrics(model_state, model_graphdef, x):
     """Measures the relative activation and parameter scales around the LM head."""
     model = nnx.merge(model_graphdef, model_state)
@@ -1330,6 +1358,7 @@ def _build_heavy_train_metrics(
     adam_eps: float = 1e-8,
     parameter_update_metrics=None,
     head_scale_metrics=None,
+    final_norm_channel_metrics=None,
 ):
     metrics = {}
     if output_logit_mean is not None:
@@ -1356,6 +1385,8 @@ def _build_heavy_train_metrics(
         metrics.update(parameter_update_metrics)
     if head_scale_metrics:
         metrics.update(head_scale_metrics)
+    if final_norm_channel_metrics:
+        metrics.update(final_norm_channel_metrics)
     return metrics
 
 
@@ -1383,6 +1414,7 @@ def _build_train_metrics(
     adam_eps: float = 1e-8,
     parameter_update_metrics=None,
     head_scale_metrics=None,
+    final_norm_channel_metrics=None,
 ):
     metrics = _build_lightweight_train_metrics(
         step,
@@ -1411,6 +1443,7 @@ def _build_train_metrics(
         adam_eps=adam_eps,
         parameter_update_metrics=parameter_update_metrics,
         head_scale_metrics=head_scale_metrics,
+        final_norm_channel_metrics=final_norm_channel_metrics,
     ))
     return metrics
 
@@ -2106,6 +2139,7 @@ def train_and_evaluate(c: DictConfig):
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
     log_parameter_update_metrics = bool(getattr(c, "log_parameter_update_metrics", False))
     log_head_scale_metrics = bool(getattr(c, "log_head_scale_metrics", False))
+    log_final_norm_channel_metrics = bool(getattr(c, "log_final_norm_channel_metrics", False))
     log_final_norm_activation_grad_metrics = bool(
         getattr(c, "log_final_norm_activation_grad_metrics", False)
     )
@@ -2113,6 +2147,10 @@ def train_and_evaluate(c: DictConfig):
         raise ValueError("log_head_scale_metrics requires model.rmsnorm_use_scale=true.")
     if log_head_scale_metrics and jax.process_index() == 0:
         print("head scale metrics enabled on heavy logging steps")
+    if log_final_norm_channel_metrics and not bool(getattr(c.model, "rmsnorm_use_scale", False)):
+        raise ValueError("log_final_norm_channel_metrics requires model.rmsnorm_use_scale=true.")
+    if log_final_norm_channel_metrics and jax.process_index() == 0:
+        print("final norm channel metrics enabled on heavy logging steps")
     if log_parameter_update_metrics and jax.process_index() == 0:
         print("parameter update metrics enabled on heavy logging steps")
     if log_final_norm_activation_grad_metrics and jax.process_index() == 0:
@@ -2214,7 +2252,18 @@ def train_and_evaluate(c: DictConfig):
         pre_output_logit_norm = None
         pre_output_logit_std = None
         pre_output_logit_entropy = None
-        if will_log_heavy_metrics and not should_collect_final_norm_activation_grads:
+        final_norm_channel_metrics = {}
+        if will_log_heavy_metrics and log_final_norm_channel_metrics:
+            output_stats, final_norm_channel_metrics = get_output_logit_and_final_norm_channel_metrics(
+                opt_state.model, model_graphdef, batch
+            )
+            (
+                pre_output_logit_mean,
+                pre_output_logit_norm,
+                pre_output_logit_std,
+                pre_output_logit_entropy,
+            ) = output_stats
+        elif will_log_heavy_metrics and not should_collect_final_norm_activation_grads:
             (
                 pre_output_logit_mean,
                 pre_output_logit_norm,
@@ -2683,6 +2732,7 @@ def train_and_evaluate(c: DictConfig):
                     adam_eps=c.opt.eps,
                     parameter_update_metrics=parameter_update_metrics,
                     head_scale_metrics=head_scale_metrics,
+                    final_norm_channel_metrics=final_norm_channel_metrics,
                 ))
             if metric_writer is not None:
                 metric_writer.enqueue(step, metrics, pbar)
@@ -2708,6 +2758,7 @@ def train_and_evaluate(c: DictConfig):
                         adam_eps=c.opt.eps,
                         parameter_update_metrics=parameter_update_metrics,
                         head_scale_metrics=head_scale_metrics,
+                        final_norm_channel_metrics=final_norm_channel_metrics,
                     )
                     _log_metrics_if_primary(metrics, step, pbar)
             else:
@@ -2735,6 +2786,7 @@ def train_and_evaluate(c: DictConfig):
                     adam_eps=c.opt.eps,
                     parameter_update_metrics=parameter_update_metrics,
                     head_scale_metrics=head_scale_metrics,
+                    final_norm_channel_metrics=final_norm_channel_metrics,
                 )
                 _log_metrics_if_primary(metrics, step, pbar)
             train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0

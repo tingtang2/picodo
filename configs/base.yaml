@@ -23,6 +23,7 @@ log_logit_grad_stats: false
 log_logit_grad_scaling_stats: false
 log_parameter_update_metrics: false # exact Frobenius/output effects + approximate spectral ratios on heavy logs
 log_head_scale_metrics: false # final-norm/LM-head activation and weight scale relationships on heavy logs
+log_final_norm_channel_metrics: false # gamma magnitude and normalized channel-energy concentration on heavy logs
 log_final_norm_activation_grad_metrics: false # dL/dx norms immediately before/after out_ln on heavy logs
 
 model:
