@@ -1137,8 +1137,21 @@ def get_mean_and_norm_output_logit(model_state, model_graphdef, x): # [B, T]
     return logits.mean(), utils.get_l2_norm(logits), logits.std(), entropy
 
 
-@partial(jax.jit, static_argnames=('model_graphdef'))
-def get_output_logit_and_final_norm_channel_metrics(model_state, model_graphdef, x):
+@partial(
+    jax.jit,
+    static_argnames=(
+        'model_graphdef',
+        'collect_final_norm_channel_metrics',
+        'collect_high_confidence_error_metrics',
+    ),
+)
+def get_output_logit_and_optional_metrics(
+    model_state,
+    model_graphdef,
+    x,
+    collect_final_norm_channel_metrics: bool,
+    collect_high_confidence_error_metrics: bool,
+):
     model = nnx.merge(model_graphdef, model_state)
     logits, final_norm_input = model(x, return_final_norm_input_with_logits=True)
     logits = logits[:, :-1].astype(jnp.float32)
@@ -1147,21 +1160,72 @@ def get_output_logit_and_final_norm_channel_metrics(model_state, model_graphdef,
     entropy = -jnp.mean(jnp.sum(probs * log_probs, axis=-1))
     output_stats = (logits.mean(), utils.get_l2_norm(logits), logits.std(), entropy)
 
-    h_hat = model_lib._rmsnorm_operator_input(model.out_ln, final_norm_input)
-    channel_energy = jnp.sum(jnp.square(h_hat), axis=tuple(range(h_hat.ndim - 1)))
-    total_energy = jnp.maximum(jnp.sum(channel_energy), jnp.asarray(1e-30, dtype=jnp.float32))
-    top_k = min(10, channel_energy.shape[0])
-    top_activation_energy = jnp.sum(jax.lax.top_k(channel_energy, top_k)[0])
-
     gamma_abs = jnp.abs(jnp.asarray(model.out_ln.scale.value, dtype=jnp.float32))
+    top_k = min(10, gamma_abs.shape[0])
     top_gamma_indices = jax.lax.top_k(gamma_abs, top_k)[1]
-    top_gamma_energy = jnp.sum(jnp.take(channel_energy, top_gamma_indices))
-    metrics = {
-        'final_norm/gamma_abs_max': jnp.max(gamma_abs),
-        'final_norm/gamma_abs_median': jnp.median(gamma_abs),
-        'final_norm/top_activation_energy_frac': top_activation_energy / total_energy,
-        'final_norm/top_gamma_energy_frac': top_gamma_energy / total_energy,
-    }
+    metrics = {}
+    if collect_final_norm_channel_metrics:
+        h_hat = model_lib._rmsnorm_operator_input(model.out_ln, final_norm_input)
+        channel_energy = jnp.sum(jnp.square(h_hat), axis=tuple(range(h_hat.ndim - 1)))
+        total_energy = jnp.maximum(jnp.sum(channel_energy), jnp.asarray(1e-30, dtype=jnp.float32))
+        top_activation_energy = jnp.sum(jax.lax.top_k(channel_energy, top_k)[0])
+        top_gamma_energy = jnp.sum(jnp.take(channel_energy, top_gamma_indices))
+        metrics.update({
+            'final_norm/gamma_abs_max': jnp.max(gamma_abs),
+            'final_norm/gamma_abs_median': jnp.median(gamma_abs),
+            'final_norm/top_activation_energy_frac': top_activation_energy / total_energy,
+            'final_norm/top_gamma_energy_frac': top_gamma_energy / total_energy,
+        })
+
+    if collect_high_confidence_error_metrics:
+        predictions = jnp.argmax(logits, axis=-1)
+        confidence = jnp.take_along_axis(probs, predictions[..., None], axis=-1)[..., 0]
+        targets = x[:, 1:]
+        high_confidence_errors = (predictions != targets) & (confidence > 0.9)
+        error_mask = high_confidence_errors.astype(jnp.float32)
+        error_count = jnp.sum(error_mask)
+
+        lm_head_input = model.out_ln(final_norm_input)
+        if model.final_hidden_mean_centering:
+            lm_head_input = lm_head_input - (
+                model.final_hidden_mean_centering_coeff
+                * jnp.mean(lm_head_input, axis=-1, keepdims=True)
+            )
+        if model.lm_head_oblique_learn_target_rms:
+            target_rms = jnp.exp(
+                jnp.asarray(model.lm_head_oblique_target_rms_log.value, dtype=lm_head_input.dtype)
+            )
+            lm_head_input = lm_head_input * target_rms
+        lm_head_input = lm_head_input[:, :-1].astype(jnp.float32)
+
+        embedding = jnp.asarray(model.token_embed_out.embedding.value, dtype=jnp.float32)
+        predicted_weights = jnp.take(embedding, predictions, axis=0)
+        target_weights = jnp.take(embedding, targets, axis=0)
+        channel_contributions = lm_head_input * (predicted_weights - target_weights)
+        top_gamma_contributions = jnp.take(channel_contributions, top_gamma_indices, axis=-1)
+
+        positive_contributions = jnp.maximum(channel_contributions, 0.0)
+        positive_support = jnp.sum(positive_contributions, axis=-1)
+        top_gamma_positive_support = jnp.sum(jnp.maximum(top_gamma_contributions, 0.0), axis=-1)
+        eps = jnp.asarray(1e-30, dtype=jnp.float32)
+        positive_share = top_gamma_positive_support / jnp.maximum(positive_support, eps)
+
+        predicted_logits = jnp.take_along_axis(logits, predictions[..., None], axis=-1)[..., 0]
+        target_logits = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+        positive_logit_gap = jnp.maximum(predicted_logits - target_logits, eps)
+        net_share = jnp.sum(top_gamma_contributions, axis=-1) / positive_logit_gap
+        conditional_denominator = jnp.maximum(error_count, 1.0)
+        metrics.update({
+            'high_conf_error/rate': jnp.mean(error_mask),
+            'high_conf_error/top_gamma_positive_share': (
+                jnp.sum(jnp.where(high_confidence_errors, positive_share, 0.0))
+                / conditional_denominator
+            ),
+            'high_conf_error/top_gamma_net_share': (
+                jnp.sum(jnp.where(high_confidence_errors, net_share, 0.0))
+                / conditional_denominator
+            ),
+        })
     return output_stats, metrics
 
 
@@ -1359,6 +1423,7 @@ def _build_heavy_train_metrics(
     parameter_update_metrics=None,
     head_scale_metrics=None,
     final_norm_channel_metrics=None,
+    high_confidence_error_metrics=None,
 ):
     metrics = {}
     if output_logit_mean is not None:
@@ -1387,6 +1452,8 @@ def _build_heavy_train_metrics(
         metrics.update(head_scale_metrics)
     if final_norm_channel_metrics:
         metrics.update(final_norm_channel_metrics)
+    if high_confidence_error_metrics:
+        metrics.update(high_confidence_error_metrics)
     return metrics
 
 
@@ -1415,6 +1482,7 @@ def _build_train_metrics(
     parameter_update_metrics=None,
     head_scale_metrics=None,
     final_norm_channel_metrics=None,
+    high_confidence_error_metrics=None,
 ):
     metrics = _build_lightweight_train_metrics(
         step,
@@ -1444,6 +1512,7 @@ def _build_train_metrics(
         parameter_update_metrics=parameter_update_metrics,
         head_scale_metrics=head_scale_metrics,
         final_norm_channel_metrics=final_norm_channel_metrics,
+        high_confidence_error_metrics=high_confidence_error_metrics,
     ))
     return metrics
 
@@ -2140,6 +2209,7 @@ def train_and_evaluate(c: DictConfig):
     log_parameter_update_metrics = bool(getattr(c, "log_parameter_update_metrics", False))
     log_head_scale_metrics = bool(getattr(c, "log_head_scale_metrics", False))
     log_final_norm_channel_metrics = bool(getattr(c, "log_final_norm_channel_metrics", False))
+    log_high_confidence_error_metrics = bool(getattr(c, "log_high_confidence_error_metrics", False))
     log_final_norm_activation_grad_metrics = bool(
         getattr(c, "log_final_norm_activation_grad_metrics", False)
     )
@@ -2151,6 +2221,10 @@ def train_and_evaluate(c: DictConfig):
         raise ValueError("log_final_norm_channel_metrics requires model.rmsnorm_use_scale=true.")
     if log_final_norm_channel_metrics and jax.process_index() == 0:
         print("final norm channel metrics enabled on heavy logging steps")
+    if log_high_confidence_error_metrics and not bool(getattr(c.model, "rmsnorm_use_scale", False)):
+        raise ValueError("log_high_confidence_error_metrics requires model.rmsnorm_use_scale=true.")
+    if log_high_confidence_error_metrics and jax.process_index() == 0:
+        print("high-confidence error metrics enabled on heavy logging steps")
     if log_parameter_update_metrics and jax.process_index() == 0:
         print("parameter update metrics enabled on heavy logging steps")
     if log_final_norm_activation_grad_metrics and jax.process_index() == 0:
@@ -2253,10 +2327,25 @@ def train_and_evaluate(c: DictConfig):
         pre_output_logit_std = None
         pre_output_logit_entropy = None
         final_norm_channel_metrics = {}
-        if will_log_heavy_metrics and log_final_norm_channel_metrics:
-            output_stats, final_norm_channel_metrics = get_output_logit_and_final_norm_channel_metrics(
-                opt_state.model, model_graphdef, batch
+        high_confidence_error_metrics = {}
+        if will_log_heavy_metrics and (
+            log_final_norm_channel_metrics or log_high_confidence_error_metrics
+        ):
+            output_stats, optional_metrics = get_output_logit_and_optional_metrics(
+                opt_state.model,
+                model_graphdef,
+                batch,
+                log_final_norm_channel_metrics,
+                log_high_confidence_error_metrics,
             )
+            if log_final_norm_channel_metrics:
+                final_norm_channel_metrics = {
+                    name: value for name, value in optional_metrics.items() if name.startswith('final_norm/')
+                }
+            if log_high_confidence_error_metrics:
+                high_confidence_error_metrics = {
+                    name: value for name, value in optional_metrics.items() if name.startswith('high_conf_error/')
+                }
             (
                 pre_output_logit_mean,
                 pre_output_logit_norm,
@@ -2733,6 +2822,7 @@ def train_and_evaluate(c: DictConfig):
                     parameter_update_metrics=parameter_update_metrics,
                     head_scale_metrics=head_scale_metrics,
                     final_norm_channel_metrics=final_norm_channel_metrics,
+                    high_confidence_error_metrics=high_confidence_error_metrics,
                 ))
             if metric_writer is not None:
                 metric_writer.enqueue(step, metrics, pbar)
@@ -2759,6 +2849,7 @@ def train_and_evaluate(c: DictConfig):
                         parameter_update_metrics=parameter_update_metrics,
                         head_scale_metrics=head_scale_metrics,
                         final_norm_channel_metrics=final_norm_channel_metrics,
+                        high_confidence_error_metrics=high_confidence_error_metrics,
                     )
                     _log_metrics_if_primary(metrics, step, pbar)
             else:
@@ -2787,6 +2878,7 @@ def train_and_evaluate(c: DictConfig):
                     parameter_update_metrics=parameter_update_metrics,
                     head_scale_metrics=head_scale_metrics,
                     final_norm_channel_metrics=final_norm_channel_metrics,
+                    high_confidence_error_metrics=high_confidence_error_metrics,
                 )
                 _log_metrics_if_primary(metrics, step, pbar)
             train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
