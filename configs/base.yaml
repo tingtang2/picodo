@@ -41,6 +41,7 @@ model:
   use_flash_attn: true
   use_qk_norm: true
   rmsnorm_use_scale: false
+  out_ln_use_scale: null # null inherits rmsnorm_use_scale; false disables scale only on final out_ln
   elementwise_attn_output_gate: false
   final_hidden_mean_centering: false
   # Match Lingua's Megatron path: N(0, 0.01) input projections and

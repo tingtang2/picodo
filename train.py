@@ -2213,16 +2213,17 @@ def train_and_evaluate(c: DictConfig):
     log_final_norm_activation_grad_metrics = bool(
         getattr(c, "log_final_norm_activation_grad_metrics", False)
     )
-    if log_head_scale_metrics and not bool(getattr(c.model, "rmsnorm_use_scale", False)):
-        raise ValueError("log_head_scale_metrics requires model.rmsnorm_use_scale=true.")
+    out_ln_use_scale = model_lib.resolve_out_ln_use_scale(c.model)
+    if log_head_scale_metrics and not out_ln_use_scale:
+        raise ValueError("log_head_scale_metrics requires the final out_ln scale to be enabled.")
     if log_head_scale_metrics and jax.process_index() == 0:
         print("head scale metrics enabled on heavy logging steps")
-    if log_final_norm_channel_metrics and not bool(getattr(c.model, "rmsnorm_use_scale", False)):
-        raise ValueError("log_final_norm_channel_metrics requires model.rmsnorm_use_scale=true.")
+    if log_final_norm_channel_metrics and not out_ln_use_scale:
+        raise ValueError("log_final_norm_channel_metrics requires the final out_ln scale to be enabled.")
     if log_final_norm_channel_metrics and jax.process_index() == 0:
         print("final norm channel metrics enabled on heavy logging steps")
-    if log_high_confidence_error_metrics and not bool(getattr(c.model, "rmsnorm_use_scale", False)):
-        raise ValueError("log_high_confidence_error_metrics requires model.rmsnorm_use_scale=true.")
+    if log_high_confidence_error_metrics and not out_ln_use_scale:
+        raise ValueError("log_high_confidence_error_metrics requires the final out_ln scale to be enabled.")
     if log_high_confidence_error_metrics and jax.process_index() == 0:
         print("high-confidence error metrics enabled on heavy logging steps")
     if log_parameter_update_metrics and jax.process_index() == 0:

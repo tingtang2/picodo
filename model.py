@@ -190,11 +190,18 @@ def _megatron_init_stds(c: DictConfig) -> tuple[float, float] | None:
     return init_base_std, residual_std
 
 
+def resolve_out_ln_use_scale(c: DictConfig) -> bool:
+    """Resolves the final RMSNorm scale override, defaulting to the global setting."""
+    out_ln_use_scale = getattr(c, "out_ln_use_scale", None)
+    if out_ln_use_scale is None:
+        out_ln_use_scale = getattr(c, "rmsnorm_use_scale", False)
+    return bool(out_ln_use_scale)
+
+
 class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
         lm_head_dtype = getattr(c, "lm_head_dtype", c.activ_dtype)
         self.lm_head_input_grad_fp32 = bool(getattr(c, "lm_head_input_grad_fp32", False))
-        rmsnorm_use_scale = bool(getattr(c, "rmsnorm_use_scale", False))
         self.final_hidden_mean_centering = bool(getattr(c, "final_hidden_mean_centering", False))
         self.final_hidden_mean_centering_coeff = float(getattr(c, "alpha", 1.0))
         self.lm_head_oblique_learn_target_rms = bool(getattr(c, "lm_head_oblique_learn_target_rms", False))
@@ -244,7 +251,12 @@ class TransformerDecoder(nnx.Module):
                 jnp.asarray(jnp.log(initial_target_rms), dtype=jnp.float32)
             )
         self.blocks = nnx.List(TransformerBlock(c, rngs, layer_idx=i) for i in range(c.L))
-        self.out_ln = nnx.RMSNorm(c.D, use_scale=rmsnorm_use_scale, dtype=lm_head_dtype, rngs=rngs)
+        self.out_ln = nnx.RMSNorm(
+            c.D,
+            use_scale=resolve_out_ln_use_scale(c),
+            dtype=lm_head_dtype,
+            rngs=rngs,
+        )
         
     def __call__(
         self,
