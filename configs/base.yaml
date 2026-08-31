@@ -42,6 +42,7 @@ model:
   use_flash_attn: true
   use_qk_norm: true
   rmsnorm_use_scale: false
+  qk_norm_disable_scale: false # remove scale parameters only from query/key RMSNorms
   out_ln_use_scale: null # null inherits rmsnorm_use_scale; false disables scale only on final out_ln
   elementwise_attn_output_gate: false
   final_hidden_mean_centering: false

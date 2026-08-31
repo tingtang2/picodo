@@ -486,6 +486,9 @@ class MultiHeadAttention(nnx.Module):
     """Causal attention layer."""
     def __init__(self, c: DictConfig, rngs: nnx.Rngs, use_qk_norm: bool = None):
         rmsnorm_use_scale = bool(getattr(c, "rmsnorm_use_scale", False))
+        qk_norm_use_scale = rmsnorm_use_scale and not bool(
+            getattr(c, "qk_norm_disable_scale", False)
+        )
         megatron_stds = _megatron_init_stds(c)
         qkv_init = {} if megatron_stds is None else {
             "kernel_init": jax.nn.initializers.normal(megatron_stds[0])
@@ -520,8 +523,8 @@ class MultiHeadAttention(nnx.Module):
         if use_qk_norm is None:
             use_qk_norm = c.use_qk_norm
         
-        self.query_norm = nnx.RMSNorm(c.H, use_scale=rmsnorm_use_scale, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
-        self.key_norm = nnx.RMSNorm(c.H, use_scale=rmsnorm_use_scale, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
+        self.query_norm = nnx.RMSNorm(c.H, use_scale=qk_norm_use_scale, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
+        self.key_norm = nnx.RMSNorm(c.H, use_scale=qk_norm_use_scale, dtype=c.activ_dtype, rngs=rngs) if use_qk_norm else nnx.identity
         platform = jax.devices()[0].platform
         if c.use_flash_attn and platform == 'tpu' and (c.H % 128 != 0):
             warnings.warn('cannot use flash attention because `model.H` is not a multiple of 128.')
