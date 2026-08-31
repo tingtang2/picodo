@@ -25,18 +25,18 @@ def _safe_ratio(numerator, denominator):
     return numerator / jnp.maximum(denominator, jnp.asarray(_UPDATE_METRIC_EPS, dtype=jnp.float32))
 
 
-@jax.custom_vjp
-def _lm_head_dot_with_fp32_input_grad(query, embedding):
+@partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _lm_head_dot_with_fp32_input_grad(query, embedding, precision):
     """Mixed-precision LM-head dot with an FP32 input-gradient matmul."""
-    return jnp.dot(query, embedding.T)
+    return jnp.dot(query, embedding.T, precision=precision)
 
 
-def _lm_head_dot_with_fp32_input_grad_fwd(query, embedding):
-    logits = jnp.dot(query, embedding.T)
+def _lm_head_dot_with_fp32_input_grad_fwd(query, embedding, precision):
+    logits = jnp.dot(query, embedding.T, precision=precision)
     return logits, (query, embedding)
 
 
-def _lm_head_dot_with_fp32_input_grad_bwd(residuals, grad_logits):
+def _lm_head_dot_with_fp32_input_grad_bwd(precision, residuals, grad_logits):
     query, embedding = residuals
 
     # This is the only intentionally promoted part of the LM-head backward
@@ -45,12 +45,13 @@ def _lm_head_dot_with_fp32_input_grad_bwd(residuals, grad_logits):
     grad_query = jnp.dot(
         grad_logits.astype(jnp.float32),
         embedding.astype(jnp.float32),
+        precision=precision,
     )
 
     # Preserve the ordinary mixed-precision weight-gradient computation.
     flat_grad_logits = grad_logits.reshape((-1, grad_logits.shape[-1]))
     flat_query = query.reshape((-1, query.shape[-1]))
-    grad_embedding = jnp.dot(flat_grad_logits.T, flat_query)
+    grad_embedding = jnp.dot(flat_grad_logits.T, flat_query, precision=precision)
     return grad_query, grad_embedding
 
 
@@ -201,6 +202,10 @@ def resolve_out_ln_use_scale(c: DictConfig) -> bool:
 class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
         lm_head_dtype = getattr(c, "lm_head_dtype", c.activ_dtype)
+        self.lm_head_is_fp32 = jnp.dtype(lm_head_dtype) == jnp.dtype(jnp.float32)
+        self.lm_head_matmul_precision = (
+            jax.lax.Precision.HIGHEST if self.lm_head_is_fp32 else None
+        )
         self.lm_head_input_grad_fp32 = bool(getattr(c, "lm_head_input_grad_fp32", False))
         self.final_hidden_mean_centering = bool(getattr(c, "final_hidden_mean_centering", False))
         self.final_hidden_mean_centering_coeff = float(getattr(c, "alpha", 1.0))
@@ -340,7 +345,21 @@ class TransformerDecoder(nnx.Module):
                 (h, self.token_embed_out.embedding.value),
                 dtype=self.token_embed_out.dtype,
             )
-            logits = _lm_head_dot_with_fp32_input_grad(query, embedding)
+            logits = _lm_head_dot_with_fp32_input_grad(
+                query,
+                embedding,
+                self.lm_head_matmul_precision,
+            )
+        elif self.lm_head_is_fp32:
+            query, embedding = self.token_embed_out.promote_dtype(
+                (h, self.token_embed_out.embedding.value),
+                dtype=self.token_embed_out.dtype,
+            )
+            logits = jnp.dot(
+                query,
+                embedding.T,
+                precision=self.lm_head_matmul_precision,
+            )
         else:
             logits = self.token_embed_out.attend(h)
         if update_inputs is not None:
