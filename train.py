@@ -1106,6 +1106,19 @@ def train_step_z_loss_with_soft_cap_centered(
     update_metrics = _finish_parameter_update_metrics(metric_context, optimizer.model)
     return opt_state, loss, aux, grads, update_metrics
 
+
+@partial(
+    jax.jit,
+    static_argnames=('opt_graphdef',),
+    donate_argnames=('opt_state',),
+)
+def amplify_lm_head_mean(opt_state, opt_graphdef, coefficient):
+    """Applies the scheduled post-update LM-head mean amplification."""
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    model_lib.amplify_output_embedding_mean(optimizer.model, coefficient)
+    return nnx.state(optimizer)
+
+
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
@@ -2345,12 +2358,49 @@ def train_and_evaluate(c: DictConfig):
             f'but training stops at {num_opt_steps}.'
         )
     
-    mucentering = bool(getattr(c.opt, "mucentering", False))
+    mucentering_configured = bool(getattr(c.opt, "mucentering", False))
+    mean_amplification_cfg = getattr(c.opt, "lm_head_mean_amplification", None)
+    mean_amplification_enabled = bool(
+        getattr(mean_amplification_cfg, "enabled", False)
+    )
+    mean_amplification_start_step = int(
+        getattr(mean_amplification_cfg, "start_step", 0)
+    )
+    mean_amplification_coefficient = float(
+        getattr(mean_amplification_cfg, "coefficient", 1.0)
+    )
+    if mean_amplification_enabled:
+        if mean_amplification_start_step < 0:
+            raise ValueError(
+                "opt.lm_head_mean_amplification.start_step must be non-negative."
+            )
+        if (
+            not math.isfinite(mean_amplification_coefficient)
+            or mean_amplification_coefficient <= 0.0
+        ):
+            raise ValueError(
+                "opt.lm_head_mean_amplification.coefficient must be finite and positive."
+            )
+        if jax.process_index() == 0:
+            centering_transition = (
+                "; mu centering will stop at that step" if mucentering_configured else ""
+            )
+            print(
+                "LM-head mean amplification enabled: "
+                f"start_step={mean_amplification_start_step}, "
+                f"coefficient={mean_amplification_coefficient}, "
+                f"per-step mean multiplier={1.0 + mean_amplification_coefficient}"
+                f"{centering_transition}"
+            )
 
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
     profiler_active = False
     for step in pbar:
+        mean_amplification_active = (
+            mean_amplification_enabled and step >= mean_amplification_start_step
+        )
+        mucentering = mucentering_configured and not mean_amplification_active
         batch = ds_train[step]
         batch = _maybe_shard_multihost_batch(
             batch,
@@ -2749,6 +2799,12 @@ def train_and_evaluate(c: DictConfig):
                         need_step_grads,
                         collect_step_parameter_update_metrics,
                     )
+        if mean_amplification_active:
+            opt_state = amplify_lm_head_mean(
+                opt_state,
+                opt_graphdef,
+                mean_amplification_coefficient,
+            )
         if profiler_active and step + 1 == profiling_start_step + profiling_num_steps:
             # Dispatches are asynchronous on GPU. Wait for the final profiled
             # step before exporting, otherwise its kernels may be omitted.

@@ -364,6 +364,16 @@ def center_output_embeddings(model: TransformerDecoder):
     model.token_embed_out.embedding.value = embeddings - mean
 
 
+def amplify_output_embedding_mean(model: TransformerDecoder, coefficient):
+    """Adds a scaled vocabulary mean to every LM-head embedding row."""
+    embeddings = model.token_embed_out.embedding.value
+    mean = jnp.mean(embeddings.astype(jnp.float32), axis=0, keepdims=True)
+    scaled_mean = (jnp.asarray(coefficient, dtype=jnp.float32) * mean).astype(
+        embeddings.dtype
+    )
+    model.token_embed_out.embedding.value = embeddings + scaled_mean
+
+
 def get_average_output_embedding_row_rms(model: TransformerDecoder):
     embeddings = jnp.asarray(model.token_embed_out.embedding.value, dtype=jnp.float32)
     row_rms = jnp.sqrt(jnp.mean(jnp.square(embeddings), axis=1))
