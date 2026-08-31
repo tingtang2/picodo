@@ -21,6 +21,7 @@ run_name: null
 num_tp_devices: 1 # optional tensor parallelism
 log_logit_grad_stats: false
 log_logit_grad_scaling_stats: false
+log_lm_head_diagnostic_metrics: false # mean output embedding, normalized max logit, and CE probability residual
 log_parameter_update_metrics: false # exact Frobenius/output effects + approximate spectral ratios on heavy logs
 log_head_scale_metrics: false # final-norm/LM-head activation and weight scale relationships on heavy logs
 log_final_norm_channel_metrics: false # gamma magnitude and normalized channel-energy concentration on heavy logs

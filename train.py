@@ -1137,6 +1137,46 @@ def get_mean_and_norm_output_logit(model_state, model_graphdef, x): # [B, T]
     return logits.mean(), utils.get_l2_norm(logits), logits.std(), entropy
 
 
+@partial(jax.jit, static_argnames=('model_graphdef',))
+def get_lm_head_diagnostic_metrics(model_state, model_graphdef, x): # [B, T]
+    """Measures opt-in LM-head diagnostics without modifying the train step."""
+    model = nnx.merge(model_graphdef, model_state)
+    logits = model(x)[:, :-1].astype(jnp.float32) # [B, T-1, V]
+    targets = x[:, 1:]
+
+    def mean_cross_entropy(logits_arg):
+        log_probs = jax.nn.log_softmax(logits_arg, axis=-1)
+        losses = -jnp.take_along_axis(
+            log_probs, targets[..., None], axis=-1
+        ).squeeze(-1)
+        return losses.mean()
+
+    # Autodiff returns (p - y) / num_tokens because the loss is a mean. Undo
+    # only that reduction so this diagnostic measures the LM-head residual.
+    grad_logits = jax.grad(mean_cross_entropy)(logits)
+    num_tokens = logits.shape[0] * logits.shape[1]
+    residual_sum = jnp.sum(grad_logits, axis=-1) * jnp.asarray(
+        num_tokens, dtype=grad_logits.dtype
+    )
+
+    per_token_logit_std = jnp.std(logits, axis=-1)
+    max_logit_over_std = jnp.max(logits, axis=-1) / jnp.maximum(
+        per_token_logit_std,
+        jnp.asarray(1e-30, dtype=logits.dtype),
+    )
+    output_embedding = jnp.asarray(
+        model.token_embed_out.embedding.value, dtype=jnp.float32
+    )
+
+    return {
+        'lm_head/mean_output_embedding_l2_norm': jnp.linalg.norm(
+            jnp.mean(output_embedding, axis=0)
+        ),
+        'lm_head/max_logit_over_logit_std_mean': jnp.mean(max_logit_over_std),
+        'lm_head/probability_target_residual_sum_mean': jnp.mean(residual_sum),
+    }
+
+
 @partial(
     jax.jit,
     static_argnames=(
@@ -1424,6 +1464,7 @@ def _build_heavy_train_metrics(
     head_scale_metrics=None,
     final_norm_channel_metrics=None,
     high_confidence_error_metrics=None,
+    lm_head_diagnostic_metrics=None,
 ):
     metrics = {}
     if output_logit_mean is not None:
@@ -1454,6 +1495,8 @@ def _build_heavy_train_metrics(
         metrics.update(final_norm_channel_metrics)
     if high_confidence_error_metrics:
         metrics.update(high_confidence_error_metrics)
+    if lm_head_diagnostic_metrics:
+        metrics.update(lm_head_diagnostic_metrics)
     return metrics
 
 
@@ -1483,6 +1526,7 @@ def _build_train_metrics(
     head_scale_metrics=None,
     final_norm_channel_metrics=None,
     high_confidence_error_metrics=None,
+    lm_head_diagnostic_metrics=None,
 ):
     metrics = _build_lightweight_train_metrics(
         step,
@@ -1513,6 +1557,7 @@ def _build_train_metrics(
         head_scale_metrics=head_scale_metrics,
         final_norm_channel_metrics=final_norm_channel_metrics,
         high_confidence_error_metrics=high_confidence_error_metrics,
+        lm_head_diagnostic_metrics=lm_head_diagnostic_metrics,
     ))
     return metrics
 
@@ -2206,6 +2251,9 @@ def train_and_evaluate(c: DictConfig):
         print(f"output embedding group metrics enabled: {group_summary}")
     log_logit_grad_stats = bool(getattr(c, "log_logit_grad_stats", False))
     log_logit_grad_scaling_stats = bool(getattr(c, "log_logit_grad_scaling_stats", False))
+    log_lm_head_diagnostic_metrics = bool(
+        getattr(c, "log_lm_head_diagnostic_metrics", False)
+    )
     log_parameter_update_metrics = bool(getattr(c, "log_parameter_update_metrics", False))
     log_head_scale_metrics = bool(getattr(c, "log_head_scale_metrics", False))
     log_final_norm_channel_metrics = bool(getattr(c, "log_final_norm_channel_metrics", False))
@@ -2230,6 +2278,8 @@ def train_and_evaluate(c: DictConfig):
         print("parameter update metrics enabled on heavy logging steps")
     if log_final_norm_activation_grad_metrics and jax.process_index() == 0:
         print("final norm activation gradient metrics enabled on heavy logging steps")
+    if log_lm_head_diagnostic_metrics and jax.process_index() == 0:
+        print("LM-head diagnostic metrics enabled on heavy logging steps")
     collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
     loss_skip_cfg = getattr(c.opt, "loss_skip", None)
     loss_skip_enabled = bool(getattr(loss_skip_cfg, "enabled", False))
@@ -2329,6 +2379,7 @@ def train_and_evaluate(c: DictConfig):
         pre_output_logit_entropy = None
         final_norm_channel_metrics = {}
         high_confidence_error_metrics = {}
+        lm_head_diagnostic_metrics = {}
         if will_log_heavy_metrics and (
             log_final_norm_channel_metrics or log_high_confidence_error_metrics
         ):
@@ -2366,6 +2417,10 @@ def train_and_evaluate(c: DictConfig):
             logit_grad_stats = get_logit_grad_sum_stats(opt_state.model, model_graphdef, batch)
         if log_logit_grad_scaling_stats:
             logit_grad_scaling_stats = get_logit_grad_scaling_stats(opt_state.model, model_graphdef, batch)
+        if log_lm_head_diagnostic_metrics and will_log_heavy_metrics:
+            lm_head_diagnostic_metrics = get_lm_head_diagnostic_metrics(
+                opt_state.model, model_graphdef, batch
+            )
         loss_skip_stats = None
         gate_apply = False
         gate_center = 0.0
@@ -2824,6 +2879,7 @@ def train_and_evaluate(c: DictConfig):
                     head_scale_metrics=head_scale_metrics,
                     final_norm_channel_metrics=final_norm_channel_metrics,
                     high_confidence_error_metrics=high_confidence_error_metrics,
+                    lm_head_diagnostic_metrics=lm_head_diagnostic_metrics,
                 ))
             if metric_writer is not None:
                 metric_writer.enqueue(step, metrics, pbar)
@@ -2851,6 +2907,7 @@ def train_and_evaluate(c: DictConfig):
                         head_scale_metrics=head_scale_metrics,
                         final_norm_channel_metrics=final_norm_channel_metrics,
                         high_confidence_error_metrics=high_confidence_error_metrics,
+                        lm_head_diagnostic_metrics=lm_head_diagnostic_metrics,
                     )
                     _log_metrics_if_primary(metrics, step, pbar)
             else:
@@ -2880,6 +2937,7 @@ def train_and_evaluate(c: DictConfig):
                     head_scale_metrics=head_scale_metrics,
                     final_norm_channel_metrics=final_norm_channel_metrics,
                     high_confidence_error_metrics=high_confidence_error_metrics,
+                    lm_head_diagnostic_metrics=lm_head_diagnostic_metrics,
                 )
                 _log_metrics_if_primary(metrics, step, pbar)
             train_loss_sum, train_med_loss_sum, train_lower_90th_mean_loss_sum, train_loss_num = jnp.zeros([]), jnp.zeros([]), jnp.zeros([]), 0
