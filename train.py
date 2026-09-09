@@ -1149,6 +1149,25 @@ def restore_lm_head_parameters(opt_state, opt_graphdef, frozen_parameters):
     return nnx.state(optimizer)
 
 
+@partial(jax.jit, static_argnames=('model_graphdef',))
+def snapshot_out_ln_scale(model_state, model_graphdef):
+    """Copies the final output RMSNorm scale parameter."""
+    model = nnx.merge(model_graphdef, model_state)
+    return jnp.array(model.out_ln.scale.value, copy=True)
+
+
+@partial(
+    jax.jit,
+    static_argnames=('opt_graphdef',),
+    donate_argnames=('opt_state',),
+)
+def restore_out_ln_scale(opt_state, opt_graphdef, frozen_scale):
+    """Restores a frozen final output RMSNorm scale after an optimizer step."""
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    optimizer.model.out_ln.scale.value = frozen_scale
+    return nnx.state(optimizer)
+
+
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
@@ -2402,6 +2421,13 @@ def train_and_evaluate(c: DictConfig):
     lm_head_freeze_cfg = getattr(c.opt, "lm_head_freeze", None)
     lm_head_freeze_enabled = bool(getattr(lm_head_freeze_cfg, "enabled", False))
     lm_head_freeze_start_step = int(getattr(lm_head_freeze_cfg, "start_step", 0))
+    out_ln_scale_freeze_cfg = getattr(c.opt, "out_ln_scale_freeze", None)
+    out_ln_scale_freeze_enabled = bool(
+        getattr(out_ln_scale_freeze_cfg, "enabled", False)
+    )
+    out_ln_scale_freeze_start_step = int(
+        getattr(out_ln_scale_freeze_cfg, "start_step", 0)
+    )
     if mean_amplification_enabled:
         if mean_amplification_start_step < 0:
             raise ValueError(
@@ -2433,6 +2459,18 @@ def train_and_evaluate(c: DictConfig):
                 "LM head freeze enabled: "
                 f"updates are suppressed starting at step {lm_head_freeze_start_step}"
             )
+    if out_ln_scale_freeze_enabled:
+        if not out_ln_use_scale:
+            raise ValueError(
+                "opt.out_ln_scale_freeze.enabled requires the final out_ln scale to be enabled."
+            )
+        if out_ln_scale_freeze_start_step < 0:
+            raise ValueError("opt.out_ln_scale_freeze.start_step must be non-negative.")
+        if jax.process_index() == 0:
+            print(
+                "Final out_ln scale freeze enabled: "
+                f"updates are suppressed starting at step {out_ln_scale_freeze_start_step}"
+            )
 
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
@@ -2443,6 +2481,9 @@ def train_and_evaluate(c: DictConfig):
         )
         lm_head_freeze_active = (
             lm_head_freeze_enabled and step >= lm_head_freeze_start_step
+        )
+        out_ln_scale_freeze_active = (
+            out_ln_scale_freeze_enabled and step >= out_ln_scale_freeze_start_step
         )
         mucentering = mucentering_configured and not mean_amplification_active
         batch = ds_train[step]
@@ -2571,6 +2612,12 @@ def train_and_evaluate(c: DictConfig):
         frozen_lm_head_parameters = None
         if lm_head_freeze_active:
             frozen_lm_head_parameters = snapshot_lm_head_parameters(
+                opt_state.model,
+                model_graphdef,
+            )
+        frozen_out_ln_scale = None
+        if out_ln_scale_freeze_active:
+            frozen_out_ln_scale = snapshot_out_ln_scale(
                 opt_state.model,
                 model_graphdef,
             )
@@ -2860,6 +2907,12 @@ def train_and_evaluate(c: DictConfig):
                 opt_state,
                 opt_graphdef,
                 frozen_lm_head_parameters,
+            )
+        if out_ln_scale_freeze_active:
+            opt_state = restore_out_ln_scale(
+                opt_state,
+                opt_graphdef,
+                frozen_out_ln_scale,
             )
         if profiler_active and step + 1 == profiling_start_step + profiling_num_steps:
             # Dispatches are asynchronous on GPU. Wait for the final profiled

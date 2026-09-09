@@ -106,6 +106,9 @@ opt:
   lm_head_freeze:
     enabled: false
     start_step: 0 # first zero-based optimizer step whose LM-head update is suppressed
+  out_ln_scale_freeze:
+    enabled: false
+    start_step: 0 # first zero-based optimizer step whose final out_ln scale update is suppressed
   lm_head_adaptive_tuc:
     enabled: false
     lambda_scale: 0.05
