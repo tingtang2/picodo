@@ -1119,6 +1119,36 @@ def amplify_lm_head_mean(opt_state, opt_graphdef, coefficient):
     return nnx.state(optimizer)
 
 
+@partial(jax.jit, static_argnames=('model_graphdef',))
+def snapshot_lm_head_parameters(model_state, model_graphdef):
+    """Copies the trainable parameters that determine the LM-head output."""
+    model = nnx.merge(model_graphdef, model_state)
+    parameters = {
+        'embedding': jnp.array(model.token_embed_out.embedding.value, copy=True),
+    }
+    if model.lm_head_oblique_learn_target_rms:
+        parameters['oblique_target_rms_log'] = jnp.array(
+            model.lm_head_oblique_target_rms_log.value, copy=True
+        )
+    return parameters
+
+
+@partial(
+    jax.jit,
+    static_argnames=('opt_graphdef',),
+    donate_argnames=('opt_state',),
+)
+def restore_lm_head_parameters(opt_state, opt_graphdef, frozen_parameters):
+    """Restores a frozen LM head after the optimizer and post-update hooks."""
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    optimizer.model.token_embed_out.embedding.value = frozen_parameters['embedding']
+    if 'oblique_target_rms_log' in frozen_parameters:
+        optimizer.model.lm_head_oblique_target_rms_log.value = frozen_parameters[
+            'oblique_target_rms_log'
+        ]
+    return nnx.state(optimizer)
+
+
 @partial(jax.jit, static_argnames=('model_graphdef'))
 def get_logits_by_lm_head(model_state, model_graphdef, x): # [B, T]
     model = nnx.merge(model_graphdef, model_state)
@@ -2369,6 +2399,9 @@ def train_and_evaluate(c: DictConfig):
     mean_amplification_coefficient = float(
         getattr(mean_amplification_cfg, "coefficient", 1.0)
     )
+    lm_head_freeze_cfg = getattr(c.opt, "lm_head_freeze", None)
+    lm_head_freeze_enabled = bool(getattr(lm_head_freeze_cfg, "enabled", False))
+    lm_head_freeze_start_step = int(getattr(lm_head_freeze_cfg, "start_step", 0))
     if mean_amplification_enabled:
         if mean_amplification_start_step < 0:
             raise ValueError(
@@ -2392,6 +2425,14 @@ def train_and_evaluate(c: DictConfig):
                 f"per-step mean multiplier={1.0 + mean_amplification_coefficient}"
                 f"{centering_transition}"
             )
+    if lm_head_freeze_enabled:
+        if lm_head_freeze_start_step < 0:
+            raise ValueError("opt.lm_head_freeze.start_step must be non-negative.")
+        if jax.process_index() == 0:
+            print(
+                "LM head freeze enabled: "
+                f"updates are suppressed starting at step {lm_head_freeze_start_step}"
+            )
 
     pbar = range(start_step, num_opt_steps)
     if jax.process_index() == 0: pbar = tqdm(pbar, initial=start_step, total=num_opt_steps)
@@ -2399,6 +2440,9 @@ def train_and_evaluate(c: DictConfig):
     for step in pbar:
         mean_amplification_active = (
             mean_amplification_enabled and step >= mean_amplification_start_step
+        )
+        lm_head_freeze_active = (
+            lm_head_freeze_enabled and step >= lm_head_freeze_start_step
         )
         mucentering = mucentering_configured and not mean_amplification_active
         batch = ds_train[step]
@@ -2524,6 +2568,12 @@ def train_and_evaluate(c: DictConfig):
         # Copy only the parameters, immediately before the donated training step.
         if should_collect_parameter_update_metrics or should_collect_final_norm_activation_grads:
             pre_update_model_state = _copy_model_state_for_metrics(opt_state.model)
+        frozen_lm_head_parameters = None
+        if lm_head_freeze_active:
+            frozen_lm_head_parameters = snapshot_lm_head_parameters(
+                opt_state.model,
+                model_graphdef,
+            )
 
         # Profile only warmed-up optimizer steps, excluding setup/compilation and
         # expensive optional diagnostics. The trace remains useful for both the
@@ -2799,11 +2849,17 @@ def train_and_evaluate(c: DictConfig):
                         need_step_grads,
                         collect_step_parameter_update_metrics,
                     )
-        if mean_amplification_active:
+        if mean_amplification_active and not lm_head_freeze_active:
             opt_state = amplify_lm_head_mean(
                 opt_state,
                 opt_graphdef,
                 mean_amplification_coefficient,
+            )
+        if lm_head_freeze_active:
+            opt_state = restore_lm_head_parameters(
+                opt_state,
+                opt_graphdef,
+                frozen_lm_head_parameters,
             )
         if profiler_active and step + 1 == profiling_start_step + profiling_num_steps:
             # Dispatches are asynchronous on GPU. Wait for the final profiled

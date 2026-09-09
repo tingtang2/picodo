@@ -93,6 +93,9 @@ opt:
     enabled: false
     start_step: 0 # zero-based optimizer step; amplification is applied after this step's update
     coefficient: 1.0 # E <- E + coefficient * mean_vocab(E)
+  lm_head_freeze:
+    enabled: false
+    start_step: 0 # first zero-based optimizer step whose LM-head update is suppressed
   lm_head_adaptive_tuc:
     enabled: false
     lambda_scale: 0.05
