@@ -78,6 +78,7 @@ opt:
   default_optimizer:
     type: adamw # one of: adamw, muon
     muon:
+      peak_lr: ${opt.peak_lr} # Muon-specific peak LR; defaults to the global optimizer peak LR
       beta: 0.95
       ns_steps: 5
       eps: ${opt.eps}

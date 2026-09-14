@@ -2214,8 +2214,14 @@ def train_and_evaluate(c: DictConfig):
         non_embedding_mask = utils.build_non_embedding_mask(model)
 
         muon_cfg = getattr(default_optimizer_cfg, "muon", None)
+        muon_peak_lr = float(getattr(muon_cfg, "peak_lr", c.opt.peak_lr))
+        muon_lr_schedule = lr_schedule
+        if not math.isclose(muon_peak_lr, float(c.opt.peak_lr)):
+            muon_lr_schedule = utils.build_learning_rate_schedule(
+                c.opt, muon_peak_lr, warmup_steps, num_opt_steps
+            )
         muon_tx = optax.contrib.muon(
-            learning_rate=lr_schedule,
+            learning_rate=muon_lr_schedule,
             beta=float(getattr(muon_cfg, "beta", 0.95)),
             ns_steps=int(getattr(muon_cfg, "ns_steps", 5)),
             eps=float(getattr(muon_cfg, "eps", c.opt.eps)),
@@ -2256,6 +2262,7 @@ def train_and_evaluate(c: DictConfig):
                 "split Muon optimizer enabled: "
                 f"default=muon_non_embeddings, input_embedding={input_embedding_optimizer_type}, "
                 f"lm_head={muon_lm_head_optimizer_type}, "
+                f"muon_peak_lr={muon_peak_lr}, "
                 f"muon_beta={float(getattr(muon_cfg, 'beta', 0.95))}, "
                 f"muon_nesterov={bool(getattr(muon_cfg, 'nesterov', True))}"
             )
