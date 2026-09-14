@@ -84,6 +84,21 @@ opt:
   adamc:
     enabled: false # LR-correct weight decay on transformer linear layers; LM head remains regular AdamW
   exclude_input_embedding_weight_decay: false
+  default_optimizer:
+    type: adamw # one of: adamw, muon
+    muon:
+      beta: 0.95
+      ns_steps: 5
+      eps: ${opt.eps}
+      weight_decay: ${opt.weight_decay}
+      mu_dtype: null
+      nesterov: true
+      adaptive: false
+      consistent_rms: null
+  input_embedding_optimizer:
+    type: adamw # one of: adamw, sgd_momentum
+    momentum: 0.9
+    nesterov: false
   lm_head_optimizer:
     type: adamw # one of: adamw, sgd_momentum, adamw_b1, row_oblique, column_oblique
     peak_lr: ${opt.peak_lr} # optional LM-head-specific peak LR; defaults to the global optimizer peak LR
