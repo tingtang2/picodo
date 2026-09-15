@@ -37,6 +37,7 @@ model:
   T: null # context/sequence length
   V: null # vocab size -> must match dataset tokenizer!
   activ_dtype: 'bfloat16'
+  lm_head_param_dtype: 'float32' # stored LM-head weight dtype; 'bfloat16' also makes dtype-following optimizer buffers BF16
   lm_head_input_grad_fp32: false # compute only the LM-head input-gradient matmul in FP32
   data_param_sharding: true # shard parameters over data (FSDP-like); false = replicated-parameter DP
   use_flash_attn: true

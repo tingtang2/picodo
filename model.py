@@ -202,6 +202,7 @@ def resolve_out_ln_use_scale(c: DictConfig) -> bool:
 class TransformerDecoder(nnx.Module):
     def __init__(self, c: DictConfig, rngs: nnx.Rngs):
         lm_head_dtype = getattr(c, "lm_head_dtype", c.activ_dtype)
+        lm_head_param_dtype = getattr(c, "lm_head_param_dtype", jnp.float32)
         self.lm_head_is_fp32 = jnp.dtype(lm_head_dtype) == jnp.dtype(jnp.float32)
         self.lm_head_matmul_precision = (
             jax.lax.Precision.HIGHEST if self.lm_head_is_fp32 else None
@@ -234,6 +235,7 @@ class TransformerDecoder(nnx.Module):
             num_embeddings=c.V,
             features=c.D,
             dtype=lm_head_dtype,
+            param_dtype=lm_head_param_dtype,
             **output_embedding_init,
             rngs=rngs,
         )
