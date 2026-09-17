@@ -1245,6 +1245,7 @@ def get_lm_head_diagnostic_metrics(model_state, model_graphdef, x): # [B, T]
         'model_graphdef',
         'collect_final_norm_channel_metrics',
         'collect_high_confidence_error_metrics',
+        'collect_lm_head_quantization_error_metrics',
     ),
 )
 def get_output_logit_and_optional_metrics(
@@ -1253,6 +1254,7 @@ def get_output_logit_and_optional_metrics(
     x,
     collect_final_norm_channel_metrics: bool,
     collect_high_confidence_error_metrics: bool,
+    collect_lm_head_quantization_error_metrics: bool,
 ):
     model = nnx.merge(model_graphdef, model_state)
     logits, final_norm_input = model(x, return_final_norm_input_with_logits=True)
@@ -1262,10 +1264,12 @@ def get_output_logit_and_optional_metrics(
     entropy = -jnp.mean(jnp.sum(probs * log_probs, axis=-1))
     output_stats = (logits.mean(), utils.get_l2_norm(logits), logits.std(), entropy)
 
-    gamma_abs = jnp.abs(jnp.asarray(model.out_ln.scale.value, dtype=jnp.float32))
-    top_k = min(10, gamma_abs.shape[0])
-    top_gamma_indices = jax.lax.top_k(gamma_abs, top_k)[1]
     metrics = {}
+    if collect_final_norm_channel_metrics or collect_high_confidence_error_metrics:
+        gamma_abs = jnp.abs(jnp.asarray(model.out_ln.scale.value, dtype=jnp.float32))
+        top_k = min(10, gamma_abs.shape[0])
+        top_gamma_indices = jax.lax.top_k(gamma_abs, top_k)[1]
+
     if collect_final_norm_channel_metrics:
         h_hat = model_lib._rmsnorm_operator_input(model.out_ln, final_norm_input)
         channel_energy = jnp.sum(jnp.square(h_hat), axis=tuple(range(h_hat.ndim - 1)))
@@ -1279,14 +1283,10 @@ def get_output_logit_and_optional_metrics(
             'final_norm/top_gamma_energy_frac': top_gamma_energy / total_energy,
         })
 
-    if collect_high_confidence_error_metrics:
-        predictions = jnp.argmax(logits, axis=-1)
-        confidence = jnp.take_along_axis(probs, predictions[..., None], axis=-1)[..., 0]
-        targets = x[:, 1:]
-        high_confidence_errors = (predictions != targets) & (confidence > 0.9)
-        error_mask = high_confidence_errors.astype(jnp.float32)
-        error_count = jnp.sum(error_mask)
-
+    lm_head_input = None
+    if collect_high_confidence_error_metrics or collect_lm_head_quantization_error_metrics:
+        # Reconstruct the exact activation consumed by the ordinary LM-head
+        # forward, then promote only the shadow copy to FP32.
         lm_head_input = model.out_ln(final_norm_input)
         if model.final_hidden_mean_centering:
             lm_head_input = lm_head_input - (
@@ -1298,6 +1298,59 @@ def get_output_logit_and_optional_metrics(
                 jnp.asarray(model.lm_head_oblique_target_rms_log.value, dtype=lm_head_input.dtype)
             )
             lm_head_input = lm_head_input * target_rms
+
+    if collect_lm_head_quantization_error_metrics:
+        shadow_input = jnp.asarray(lm_head_input[:, :-1], dtype=jnp.float32)
+        shadow_embedding = jnp.asarray(
+            model.token_embed_out.embedding.value, dtype=jnp.float32
+        )
+        shadow_logits = jnp.dot(
+            shadow_input,
+            shadow_embedding.T,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+
+        logit_difference = logits - shadow_logits
+        reference_l2 = jnp.sqrt(jnp.sum(jnp.square(shadow_logits), axis=-1))
+        difference_l2 = jnp.sqrt(jnp.sum(jnp.square(logit_difference), axis=-1))
+        relative_l2 = difference_l2 / jnp.maximum(
+            reference_l2, jnp.asarray(1e-30, dtype=jnp.float32)
+        )
+
+        reference_log_probs = jax.nn.log_softmax(shadow_logits, axis=-1)
+        reference_probs = jnp.exp(reference_log_probs)
+        kl_per_token = jnp.sum(
+            reference_probs * (reference_log_probs - log_probs), axis=-1
+        )
+
+        targets = x[:, 1:]
+        native_losses = -jnp.take_along_axis(
+            log_probs, targets[..., None], axis=-1
+        ).squeeze(-1)
+        reference_losses = -jnp.take_along_axis(
+            reference_log_probs, targets[..., None], axis=-1
+        ).squeeze(-1)
+
+        metrics.update({
+            'lm_head_quantization/mean_relative_logit_l2_error': jnp.mean(relative_l2),
+            'lm_head_quantization/logit_difference_rms': jnp.sqrt(
+                jnp.mean(jnp.square(logit_difference))
+            ),
+            'lm_head_quantization/kl_fp32_reference_to_native_mean': jnp.mean(kl_per_token),
+            'lm_head_quantization/cross_entropy_difference_native_minus_fp32': jnp.mean(
+                native_losses - reference_losses
+            ),
+        })
+
+    if collect_high_confidence_error_metrics:
+        predictions = jnp.argmax(logits, axis=-1)
+        confidence = jnp.take_along_axis(probs, predictions[..., None], axis=-1)[..., 0]
+        targets = x[:, 1:]
+        high_confidence_errors = (predictions != targets) & (confidence > 0.9)
+        error_mask = high_confidence_errors.astype(jnp.float32)
+        error_count = jnp.sum(error_mask)
+
         lm_head_input = lm_head_input[:, :-1].astype(jnp.float32)
 
         embedding = jnp.asarray(model.token_embed_out.embedding.value, dtype=jnp.float32)
@@ -2436,6 +2489,9 @@ def train_and_evaluate(c: DictConfig):
     log_lm_head_diagnostic_metrics = bool(
         getattr(c, "log_lm_head_diagnostic_metrics", False)
     )
+    log_lm_head_quantization_error_metrics = bool(
+        getattr(c, "log_lm_head_quantization_error_metrics", False)
+    )
     log_parameter_update_metrics = bool(getattr(c, "log_parameter_update_metrics", False))
     log_head_scale_metrics = bool(getattr(c, "log_head_scale_metrics", False))
     log_final_norm_channel_metrics = bool(getattr(c, "log_final_norm_channel_metrics", False))
@@ -2462,6 +2518,11 @@ def train_and_evaluate(c: DictConfig):
         print("final norm activation gradient metrics enabled on heavy logging steps")
     if log_lm_head_diagnostic_metrics and jax.process_index() == 0:
         print("LM-head diagnostic metrics enabled on heavy logging steps")
+    if log_lm_head_quantization_error_metrics and jax.process_index() == 0:
+        print(
+            "LM-head BF16/native versus FP32 shadow quantization-error metrics "
+            "enabled on heavy logging steps"
+        )
     collect_qkv_stats = bool(getattr(c.diagnostics, "collect_qkv_stats", True))
     loss_skip_cfg = getattr(c.opt, "loss_skip", None)
     loss_skip_enabled = bool(getattr(loss_skip_cfg, "enabled", False))
@@ -2636,7 +2697,9 @@ def train_and_evaluate(c: DictConfig):
         high_confidence_error_metrics = {}
         lm_head_diagnostic_metrics = {}
         if will_log_heavy_metrics and (
-            log_final_norm_channel_metrics or log_high_confidence_error_metrics
+            log_final_norm_channel_metrics
+            or log_high_confidence_error_metrics
+            or log_lm_head_quantization_error_metrics
         ):
             output_stats, optional_metrics = get_output_logit_and_optional_metrics(
                 opt_state.model,
@@ -2644,6 +2707,7 @@ def train_and_evaluate(c: DictConfig):
                 batch,
                 log_final_norm_channel_metrics,
                 log_high_confidence_error_metrics,
+                log_lm_head_quantization_error_metrics,
             )
             if log_final_norm_channel_metrics:
                 final_norm_channel_metrics = {
@@ -2653,6 +2717,12 @@ def train_and_evaluate(c: DictConfig):
                 high_confidence_error_metrics = {
                     name: value for name, value in optional_metrics.items() if name.startswith('high_conf_error/')
                 }
+            if log_lm_head_quantization_error_metrics:
+                lm_head_diagnostic_metrics.update({
+                    name: value
+                    for name, value in optional_metrics.items()
+                    if name.startswith('lm_head_quantization/')
+                })
             (
                 pre_output_logit_mean,
                 pre_output_logit_norm,
@@ -2673,8 +2743,8 @@ def train_and_evaluate(c: DictConfig):
         if log_logit_grad_scaling_stats:
             logit_grad_scaling_stats = get_logit_grad_scaling_stats(opt_state.model, model_graphdef, batch)
         if log_lm_head_diagnostic_metrics and will_log_heavy_metrics:
-            lm_head_diagnostic_metrics = get_lm_head_diagnostic_metrics(
-                opt_state.model, model_graphdef, batch
+            lm_head_diagnostic_metrics.update(
+                get_lm_head_diagnostic_metrics(opt_state.model, model_graphdef, batch)
             )
         loss_skip_stats = None
         gate_apply = False
