@@ -1333,6 +1333,7 @@ def get_output_logit_and_optional_metrics(
         ).squeeze(-1)
 
         metrics.update({
+            'lm_head_quantization/fp32_shadow_logit_std': jnp.std(shadow_logits),
             'lm_head_quantization/mean_relative_logit_l2_error': jnp.mean(relative_l2),
             'lm_head_quantization/logit_difference_rms': jnp.sqrt(
                 jnp.mean(jnp.square(logit_difference))
